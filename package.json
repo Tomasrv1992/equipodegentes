@@ -1,0 +1,30 @@
+{
+  "name": "equipodegentes",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Suite de agentes automatizados para PYMEs (control de facturación, cartera, etc.)",
+  "workspaces": [
+    "agentes/*",
+    "apps/*",
+    "shared/*"
+  ],
+  "scripts": {
+    "facturacion:procesar": "npx tsx --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/procesar-facturas.ts",
+    "facturacion:dry-run": "npx tsx --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/procesar-facturas.ts --dry-run",
+    "facturacion:diagnostico": "npx tsx --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/diagnostico-facturas.ts",
+    "facturacion:setup-oauth": "node --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/setup-oauth.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^5.2.0",
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.17",
+    "fast-xml-parser": "^5.7.1",
+    "googleapis": "^171.4.0"
+  }
+}

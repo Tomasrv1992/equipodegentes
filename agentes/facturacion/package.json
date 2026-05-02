@@ -1,0 +1,13 @@
+{
+  "name": "@equipodegentes/facturacion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agente: control automático de facturas DIAN (Gmail → Drive → Sheets)",
+  "main": "lib/pipeline.ts",
+  "scripts": {
+    "dry-run": "npx tsx --env-file=.env.local scripts/procesar-facturas.ts --dry-run",
+    "procesar": "npx tsx --env-file=.env.local scripts/procesar-facturas.ts",
+    "diagnostico": "npx tsx --env-file=.env.local scripts/diagnostico-facturas.ts",
+    "setup-oauth": "node --env-file=.env.local scripts/setup-oauth.mjs"
+  }
+}

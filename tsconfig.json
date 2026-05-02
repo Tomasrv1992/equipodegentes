@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  },
+  "include": [
+    "agentes/**/*.ts",
+    "agentes/**/*.mts",
+    "netlify/functions/**/*.ts",
+    "netlify/functions/**/*.mts",
+    "shared/**/*.ts",
+    "apps/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", "build", ".next", ".netlify"]
+}

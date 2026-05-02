@@ -1,0 +1,12 @@
+# Netlify config para el monorepo equipodegentes.
+# Las functions viven en netlify/functions/ (path estándar Netlify).
+# Cada agente expone funciones con prefijo: facturacion-*, cartera-*, etc.
+
+[build]
+  command = "npm install"
+  publish = "public"
+
+[functions]
+  node_bundler = "esbuild"
+  # Permite que las functions importen del workspace agentes/*
+  included_files = ["agentes/**/*.ts"]

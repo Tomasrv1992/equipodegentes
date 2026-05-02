@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Local env files (secrets — NUNCA commitear)
+.env
+.env.local
+.env.*.local
+
+# Build output
+.next/
+.netlify/
+dist/
+build/
+out/
+
+# Misc
+.DS_Store
+*.pem
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+
+# TypeScript
+*.tsbuildinfo
+
+# Claude / editor local
+.claude/*
+!.claude/commands/
+
+# Temp
+tmp/
+temp/

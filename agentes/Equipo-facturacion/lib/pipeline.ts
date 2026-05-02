@@ -149,7 +149,9 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const drive = google.drive({ version: "v3", auth });
   const sheets = google.sheets({ version: "v4", auth });
 
-  const tabRange = `'${g.sheetTab.replace(/'/g, "''")}'`;
+  // Tab base: si viene "Gastos 2026", se interpreta como prefix → derivamos por año del XML.
+  // Si viene solo "Gastos", también — concatenamos el año.
+  const baseTabName = deriveBaseTab(g.sheetTab);
   const xmlParser = new XMLParser({
     ignoreAttributes: false,
     removeNSPrefix: true,
@@ -182,16 +184,25 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     };
   }
 
-  // Caché del Sheet (se carga lazy + se actualiza tras cada append).
-  let sheetRowsCache: any[][] | null = null;
-  const loadSheetRows = async () => {
-    if (sheetRowsCache) return sheetRowsCache;
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: g.sheetId,
-      range: `${tabRange}!A:K`,
-    });
-    sheetRowsCache = res.data.values || [];
-    return sheetRowsCache;
+  // Caché de Sheet rows POR tab (key = nombre del tab, ej "Gastos 2026").
+  // Se carga lazy y se actualiza tras cada append. Soporta multi-año en una corrida.
+  const sheetRowsCache = new Map<string, any[][]>();
+  const loadSheetRows = async (tabName: string): Promise<any[][]> => {
+    if (sheetRowsCache.has(tabName)) return sheetRowsCache.get(tabName)!;
+    const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+    try {
+      const res = await sheets.spreadsheets.values.get({
+        spreadsheetId: g.sheetId,
+        range: `${tabRange}!A:K`,
+      });
+      const rows = res.data.values || [];
+      sheetRowsCache.set(tabName, rows);
+      return rows;
+    } catch {
+      // El tab puede no existir todavía — lo creará getOrCreateYearTab.
+      sheetRowsCache.set(tabName, []);
+      return [];
+    }
   };
 
   const result: PipelineResult = { procesadas: [], errores: [], saltadas: [] };
@@ -206,10 +217,11 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
         sheets,
         xmlParser,
         g,
-        tabRange,
+        baseTabName,
         loadSheetRows,
-        (newRow) => {
-          if (sheetRowsCache) sheetRowsCache.push(newRow);
+        (tabName, newRow) => {
+          const cached = sheetRowsCache.get(tabName);
+          if (cached) cached.push(newRow);
         }
       );
       if ("ok" in r && r.ok) {
@@ -225,6 +237,70 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   }
 
   return result;
+}
+
+/**
+ * Extrae el "prefix" del nombre del tab. Si tiene un año al final lo quita.
+ * "Gastos 2026" → "Gastos"; "Gastos" → "Gastos"; "Mis Gastos" → "Mis Gastos".
+ */
+function deriveBaseTab(configured: string): string {
+  return String(configured || "Gastos").replace(/\s*\d{4}\s*$/, "").trim() || "Gastos";
+}
+
+const SHEET_HEADERS = [
+  "Fecha", "Proveedor", "NIT", "N° Factura", "Subtotal", "IVA", "Total",
+  "Concepto", "Link PDF", "Categoría", "Cuenta PYG",
+];
+
+/**
+ * Devuelve el nombre del tab para un año dado (ej "Gastos 2027"). Si no existe,
+ * lo crea con headers + frozen + bold. Idempotente.
+ */
+async function getOrCreateYearTab(sheets: any, sheetId: string, baseName: string, year: number): Promise<string> {
+  const tabName = `${baseName} ${year}`;
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+  const existing = meta.data.sheets?.find((s: any) => s.properties?.title === tabName);
+  if (existing) return tabName;
+
+  // Crear tab + headers + formato
+  const created = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: sheetId,
+    requestBody: {
+      requests: [{
+        addSheet: {
+          properties: {
+            title: tabName,
+            gridProperties: { frozenRowCount: 1 },
+          },
+        },
+      }],
+    },
+  });
+  const newTabId = created.data.replies?.[0]?.addSheet?.properties?.sheetId;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `'${tabName}'!A1:K1`,
+    valueInputOption: "RAW",
+    requestBody: { values: [SHEET_HEADERS] },
+  });
+
+  if (newTabId != null) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [{
+          repeatCell: {
+            range: { sheetId: newTabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 11 },
+            cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 } } },
+            fields: "userEnteredFormat(textFormat,backgroundColor)",
+          },
+        }],
+      },
+    });
+  }
+
+  return tabName;
 }
 
 // ===== Gmail helpers =====
@@ -318,7 +394,7 @@ async function applyMonthLabel(gmail: any, messageId: string, year: number, mont
 
 // ===== ZIP & XML =====
 
-function extractZip(zipPath: string) {
+function extractZip(zipPath: string): { pdfPath: string | null; xmlPaths: string[]; allPaths: string[]; tmpDir: string } {
   const zip = new AdmZip(zipPath);
   const tmpDir = path.join(
     os.tmpdir(),
@@ -339,7 +415,22 @@ function extractZip(zipPath: string) {
     pdfPath: all.find((p) => /\.pdf$/i.test(p)) || null,
     xmlPaths: all.filter((p) => /\.xml$/i.test(p)),
     allPaths: all,
+    tmpDir,
   };
+}
+
+/** Best-effort cleanup de paths temporales — silencioso si falla. */
+function cleanupTmp(paths: string[]) {
+  for (const p of paths) {
+    if (!p) continue;
+    try {
+      const stat = fs.statSync(p);
+      if (stat.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
+      else fs.unlinkSync(p);
+    } catch {
+      /* archivo ya borrado o inaccesible — no es crítico */
+    }
+  }
 }
 
 function pick(obj: any, ...paths: string[]): any {
@@ -484,11 +575,16 @@ async function uploadFile(drive: any, localPath: string, parentId: string, name:
 
 function isDuplicate(rows: any[][], numero: string, nit: string): boolean {
   if (!numero) return false;
+  const numTrim = String(numero).trim();
   const nitNorm = String(nit || "").replace(/\D+/g, "");
+  // Match estricto: ambos NITs deben existir e igualar.
+  // Si NIT entrante vacío → no podemos verificar dup confiablemente → procesar.
+  // (La idempotencia primaria sigue siendo el label "Procesado" en Gmail.)
+  if (!nitNorm) return false;
   return rows.some((r) => {
     const rowNum = String(r[3] || "").trim();
     const rowNit = String(r[2] || "").replace(/\D+/g, "");
-    return rowNum === String(numero).trim() && (rowNit === nitNorm || !nitNorm || !rowNit);
+    return rowNum === numTrim && rowNit === nitNorm;
   });
 }
 
@@ -524,9 +620,9 @@ async function processOne(
   sheets: any,
   xmlParser: XMLParser,
   g: PipelineConfig["google"],
-  tabRange: string,
-  loadSheetRows: () => Promise<any[][]>,
-  pushToCache: (row: any[]) => void
+  baseTabName: string,
+  loadSheetRows: (tabName: string) => Promise<any[][]>,
+  pushToCache: (tabName: string, row: any[]) => void
 ): Promise<ProcessOneResult> {
   const msg = await getMessageFull(gmail, messageId);
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
@@ -534,70 +630,82 @@ async function processOne(
   const zips = findZipParts(msg.payload);
   if (!zips.length) return { skip: true, reason: "sin-zip", subject };
 
-  const z = zips[0];
-  const zipPath = await downloadAttachment(gmail, messageId, z.attachmentId, z.filename);
+  // Tracking de tmp paths para cleanup garantizado en finally.
+  const tmpPaths: string[] = [];
 
-  let extracted;
   try {
-    extracted = extractZip(zipPath);
-  } catch (e: any) {
-    // ZIPs con password / corruptos no son facturas DIAN procesables — skip silencioso
-    // (típicamente: HC clínica, documentos personales, archivos de otra naturaleza)
-    return { skip: true, reason: `zip-no-procesable: ${e.message}`, subject };
-  }
-  const { pdfPath, xmlPaths } = extracted;
-  if (!xmlPaths.length) {
-    // ZIP sin XML = no es factura electrónica DIAN — skip silencioso (no error)
-    return { skip: true, reason: "zip-sin-xml", subject };
-  }
+    const z = zips[0];
+    const zipPath = await downloadAttachment(gmail, messageId, z.attachmentId, z.filename);
+    tmpPaths.push(zipPath);
 
-  let data: InvoiceData | null = null;
-  for (const x of xmlPaths) {
+    let extracted;
     try {
-      const candidate = parseInvoiceXml(x, xmlParser);
-      if (candidate && (candidate.numero || candidate.cufe)) {
-        data = candidate;
-        break;
-      }
-    } catch {
-      /* probar el siguiente XML */
+      extracted = extractZip(zipPath);
+      tmpPaths.push(extracted.tmpDir);
+    } catch (e: any) {
+      // ZIPs con password / corruptos no son facturas DIAN procesables — skip silencioso
+      return { skip: true, reason: `zip-no-procesable: ${e.message}`, subject };
     }
-  }
-  if (!data) return { skip: true, reason: "no-es-factura-dian", subject };
+    const { pdfPath, xmlPaths } = extracted;
+    if (!xmlPaths.length) {
+      return { skip: true, reason: "zip-sin-xml", subject };
+    }
 
-  // Calcular year/month una sola vez — usado para Drive folder, Gmail label y dup-check return
-  const issue = data.fecha ? new Date(data.fecha) : new Date();
-  const year = issue.getFullYear();
-  const month = issue.getMonth() + 1;
+    let data: InvoiceData | null = null;
+    for (const x of xmlPaths) {
+      try {
+        const candidate = parseInvoiceXml(x, xmlParser);
+        if (candidate && (candidate.numero || candidate.cufe)) {
+          data = candidate;
+          break;
+        }
+      } catch {
+        /* probar el siguiente XML */
+      }
+    }
+    if (!data) return { skip: true, reason: "no-es-factura-dian", subject };
 
-  const sheetRows = await loadSheetRows();
-  if (isDuplicate(sheetRows, data.numero, data.nit)) {
+    // year/month derivados del IssueDate del XML (no del header del email).
+    const issue = data.fecha ? new Date(data.fecha) : new Date();
+    const year = issue.getFullYear();
+    const month = issue.getMonth() + 1;
+
+    // Tab dinámico por año — crea "Gastos {year}" si no existe (con headers).
+    const tabName = await getOrCreateYearTab(sheets, g.sheetId, baseTabName, year);
+    const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+
+    const sheetRows = await loadSheetRows(tabName);
+    if (isDuplicate(sheetRows, data.numero, data.nit)) {
+      await markEmailProcessed(gmail, messageId, labelId);
+      await applyMonthLabel(gmail, messageId, year, month);
+      return { dup: true, motivo: `${data.proveedor} ${data.numero} (ya en ${tabName})`, subject };
+    }
+
+    const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
+
+    let driveLink = "";
+    const baseName = `${data.fecha || "sin-fecha"}_${data.proveedor.slice(0, 40)}_${data.numero || data.cufe.slice(0, 8)}`
+      .replace(/[\\/:*?"<>|]/g, "-")
+      .replace(/\s+/g, "_");
+
+    if (pdfPath) {
+      const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
+      driveLink = uploaded.webViewLink || "";
+    }
+    for (const x of xmlPaths) {
+      await uploadFile(drive, x, folderId, `${baseName}__${path.basename(x)}`);
+    }
+
+    const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
+    const row: ProcessedRow = { ...data, driveLink, subject, categoria, cuentaPyg };
+    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, row);
+    pushToCache(tabName, newRow);
     await markEmailProcessed(gmail, messageId, labelId);
     await applyMonthLabel(gmail, messageId, year, month);
-    return { dup: true, motivo: `${data.proveedor} ${data.numero} (ya en Sheet)`, subject };
+
+    return { ok: true, ...row };
+  } finally {
+    // Cleanup garantizado de tmp paths (FIX: leak de /tmp en Netlify functions)
+    cleanupTmp(tmpPaths);
   }
-
-  const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
-
-  let driveLink = "";
-  const baseName = `${data.fecha || "sin-fecha"}_${data.proveedor.slice(0, 40)}_${data.numero || data.cufe.slice(0, 8)}`
-    .replace(/[\\/:*?"<>|]/g, "-")
-    .replace(/\s+/g, "_");
-
-  if (pdfPath) {
-    const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
-    driveLink = uploaded.webViewLink || "";
-  }
-  for (const x of xmlPaths) {
-    await uploadFile(drive, x, folderId, `${baseName}__${path.basename(x)}`);
-  }
-
-  const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
-  const row: ProcessedRow = { ...data, driveLink, subject, categoria, cuentaPyg };
-  const newRow = await appendToSheet(sheets, g.sheetId, tabRange, row);
-  pushToCache(newRow);
-  await markEmailProcessed(gmail, messageId, labelId);
-  await applyMonthLabel(gmail, messageId, year, month);
-
-  return { ok: true, ...row };
 }

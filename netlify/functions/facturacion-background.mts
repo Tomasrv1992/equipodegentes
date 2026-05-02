@@ -3,14 +3,14 @@
 // Background function (suffix `-background` → 15min timeout en cualquier plan).
 // Disparada por: facturacion-cron.mts, o POST manual con x-internal-secret.
 //
-// Thin Netlify wrapper — la lógica vive en agentes/facturacion/lib/pipeline.ts
+// Thin Netlify wrapper — la lógica vive en agentes/Equipo-facturacion/lib/pipeline.ts
 // (compartida con CLI local para evitar drift).
 //
 // Notificaciones: email diario (incondicional) vía Resend.
 // Env vars: RESEND_API_KEY, NOTIFY_EMAIL_TO, NOTIFY_EMAIL_FROM.
 
 import type { Config } from "@netlify/functions";
-import { run, type PipelineConfig, type PipelineResult } from "../../agentes/facturacion/lib/pipeline";
+import { run, type PipelineConfig, type PipelineResult } from "../../agentes/Equipo-facturacion/lib/pipeline";
 
 interface RequestBody {
   /** Forward-compat para SaaS multi-tenant (Proyecto B). */

@@ -1,10 +1,10 @@
 #!/usr/bin/env -S npx tsx
 // Thin CLI wrapper: importa el pipeline core y lo corre con .env.local.
-// La lógica vive en agentes/facturacion/lib/pipeline.ts
+// La lógica vive en agentes/Equipo-facturacion/lib/pipeline.ts
 // (compartida con la background fn de Netlify para evitar drift).
 //
 // Uso (desde la raíz del repo):
-//   npx tsx --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/procesar-facturas.ts
+//   npx tsx --env-file=agentes/Equipo-facturacion/.env.local agentes/Equipo-facturacion/scripts/procesar-facturas.ts
 //   ... --dry-run                 # solo lista
 //   ... --window 365d --limit 5   # backfill histórico, primeras 5
 

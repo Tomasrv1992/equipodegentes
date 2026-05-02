@@ -1,0 +1,86 @@
+{
+  "version": "1.0",
+  "actualizado": "2026-05-02",
+  "comentario": "Reglas de categorización para facturas DIAN. Mapping a PUC Colombia clase 5 (gastos). Lookup: 1) por NIT (preciso) → 2) por keyword en concepto (fallback) → 3) default 'Otros'. Para SaaS multi-tenant: este archivo se va a mover a Supabase per-customer y se podrá editar en UI.",
+
+  "default": {
+    "categoria": "Otros / sin clasificar",
+    "cuenta_pyg": "5195 - Diversos"
+  },
+
+  "reglas_por_nit": {
+    "900803892": { "proveedor": "PETROGREEN GROUP S.A.S", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+    "900356681": { "proveedor": "INVERSIONES TRUVE S.A.S.", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+    "800077848": { "proveedor": "SERVICENTRO PALMAS S.A.S", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+    "900219834": { "proveedor": "F2X S.A.S. (peajes)", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+
+    "94430074":  { "proveedor": "JORGE EDUARDO HURTADO (Restaurante Santo Olivo)", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "891408584": { "proveedor": "FRISBY S.A. BIC", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "901480183": { "proveedor": "BULGATTA SAS", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "901929929": { "proveedor": "NUDO & NODO SAS", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "901923962": { "proveedor": "SAVANNAH COUNTRY SIDE SAS", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "901315524": { "proveedor": "JALAPEÑO EL RETIRO SAS", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "901502473": { "proveedor": "DIVINA MIA SAS", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "800180330": { "proveedor": "CALCO Alimentos Colombianos", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    "901911352": { "proveedor": "INVERSIONES TORITTOS SAS", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+
+    "800242106": { "proveedor": "SODIMAC COLOMBIA S.A.", "categoria": "Insumos / ferretería", "cuenta_pyg": "5195 - Diversos (papelería)" },
+    "98617640":  { "proveedor": "ELIBERIO LORENZANA (madera)", "categoria": "Insumos / ferretería", "cuenta_pyg": "5195 - Diversos (papelería)" },
+    "901309383": { "proveedor": "IMPORTADORA AUTOPARTES SAS", "categoria": "Mantenimiento vehículos", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+    "901475794": { "proveedor": "AMG TECHNOLOGY SAS", "categoria": "Insumos / tecnología", "cuenta_pyg": "5195 - Diversos (papelería)" },
+    "900319753": { "proveedor": "PRICESMART COLOMBIA", "categoria": "Insumos / consumo masivo", "cuenta_pyg": "5195 - Diversos" },
+    "43753103":  { "proveedor": "PAOLA ESPINOSA (llantas)", "categoria": "Mantenimiento vehículos", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+    "8399250":   { "proveedor": "JUAN MANUEL RAMÍREZ (repuesto)", "categoria": "Mantenimiento vehículos", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+
+    "890922113": { "proveedor": "DROPOPULAR S.A.S (farmacia)", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+    "890941663": { "proveedor": "DISTRIBUIDORA PASTEUR (farmacia)", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+    "890901826": { "proveedor": "HOSPITAL PABLO TOBON URIBE", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+    "900033806": { "proveedor": "CLINICA DEL CAMPESTRE S.A.", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+    "70569545":  { "proveedor": "JAIME ARANGO SANCHEZ (copago)", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+    "98661611":  { "proveedor": "FELIPE FERNANDEZ LOPERA (copago)", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+    "901107716": { "proveedor": "GRUPO DE OBESIDAD S.A.S", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+
+    "890904996": { "proveedor": "EMPRESAS PUBLICAS DE MEDELLIN (EPM)", "categoria": "Servicios públicos", "cuenta_pyg": "5135 - Servicios públicos" },
+
+    "800236937": { "proveedor": "DISNEY (suscripción streaming)", "categoria": "Software / SaaS", "cuenta_pyg": "5135 - Servicios (software)" },
+    "830067394": { "proveedor": "MercadoLibre Colombia (suscripciones)", "categoria": "Software / SaaS", "cuenta_pyg": "5135 - Servicios (software)" },
+    "900843898": { "proveedor": "RAPPI S.A.S (servicios)", "categoria": "Software / SaaS", "cuenta_pyg": "5135 - Servicios" },
+
+    "890903790": { "proveedor": "SEGUROS DE VIDA SURAMERICANA", "categoria": "Seguros", "cuenta_pyg": "5130 - Seguros" },
+
+    "890924789": { "proveedor": "ACRECER S.A.S (canon arrendamiento)", "categoria": "Arrendamientos", "cuenta_pyg": "5120 - Arrendamientos" },
+    "890905005": { "proveedor": "Cooperativa Nacional Transportadores (admin)", "categoria": "Servicios", "cuenta_pyg": "5135 - Servicios (administración)" }
+  },
+
+  "reglas_por_keyword_concepto": [
+    { "patron": "(?i)\\bDIESEL\\b|\\bGASOLINA\\b|\\bACPM\\b|\\bCORRIENTE\\b", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+    { "patron": "(?i)\\bPEAJE\\b", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
+    { "patron": "(?i)\\bSEGURIDAD SOCIAL\\b|\\bAUTOLIQUIDAC|\\bAPORTES\\b|\\bPLANILLA\\b", "categoria": "Aportes seguridad social", "cuenta_pyg": "5105 - Personal (parafiscales)" },
+    { "patron": "(?i)\\bENERG[ÍI]A\\b|\\bAGUA\\b|\\bGAS\\b|\\bACUEDUCTO\\b", "categoria": "Servicios públicos", "cuenta_pyg": "5135 - Servicios públicos" },
+    { "patron": "(?i)\\bP[ÓO]LIZA\\b|\\bSEGURO\\b", "categoria": "Seguros", "cuenta_pyg": "5130 - Seguros" },
+    { "patron": "(?i)\\bDOMICILIO\\b|\\bRESTAURANTE\\b|\\bCERVEZA\\b|\\bVINO\\b", "categoria": "Alimentación / representación", "cuenta_pyg": "5145 - Gastos de representación" },
+    { "patron": "(?i)\\bMEDICAMENTO\\b|\\bTABLETA\\b|\\bCOPAGO\\b|\\bFRANQUICIA\\b", "categoria": "Salud / medicamentos", "cuenta_pyg": "5105 - Personal (auxilio médico)" },
+    { "patron": "(?i)\\bCANON\\b|\\bARRIENDO\\b|\\bARRENDAMIENTO\\b", "categoria": "Arrendamientos", "cuenta_pyg": "5120 - Arrendamientos" },
+    { "patron": "(?i)\\bSOFTWARE\\b|\\bSAAS\\b|\\bSUSCRIP|\\bPRIME\\b|\\bDISNEY\\b|\\bNETFLIX\\b|\\bSPOTIFY\\b", "categoria": "Software / SaaS", "cuenta_pyg": "5135 - Servicios (software)" }
+  ],
+
+  "categorias_disponibles": [
+    "Combustible y peajes",
+    "Alimentación / representación",
+    "Insumos / ferretería",
+    "Insumos / tecnología",
+    "Insumos / consumo masivo",
+    "Mantenimiento vehículos",
+    "Salud / medicamentos",
+    "Servicios públicos",
+    "Software / SaaS",
+    "Servicios",
+    "Arrendamientos",
+    "Seguros",
+    "Aportes seguridad social",
+    "Honorarios",
+    "Impuestos",
+    "Bancarios / financieros",
+    "Otros / sin clasificar"
+  ]
+}

@@ -1,0 +1,6 @@
+id,cliente_nombre,cliente_telefono,cliente_cedula,monto_capital,tasa_mes,fecha_desembolso,fecha_vencimiento,frecuencia,saldo_pendiente,estado,ultimo_contacto,ultimo_canal,consentimiento_cobro
+PR-DEMO-001,Juan Pérez Rodríguez,+573001234567,1010101010,1000000,0.025,2026-04-06,2026-05-06,mensual,1025000,vigente,,,TRUE
+PR-DEMO-002,María Gómez Castro,+573005551122,2020202020,750000,0.025,2026-04-02,2026-05-02,mensual,768750,vigente,,,TRUE
+PR-DEMO-003,Carlos Ramírez Mejía,+573009998877,3030303030,500000,0.030,2026-03-30,2026-04-29,mensual,515000,vencido,,,TRUE
+PR-DEMO-004,Laura Martínez Silva,+573007776655,4040404040,1500000,0.025,2026-03-22,2026-04-21,mensual,1590000,vencido,,,TRUE
+PR-DEMO-005,Andrés Quintero López,+573004443322,5050505050,2000000,0.030,2026-03-10,2026-04-09,mensual,2180000,vencido,,,FALSE

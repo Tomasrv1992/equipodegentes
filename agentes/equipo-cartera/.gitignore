@@ -1,0 +1,36 @@
+# Entorno virtual
+venv/
+.venv/
+
+# Variables de entorno y secretos
+.env
+.env.local
+.env.*.local
+
+# Credenciales de servicios externos
+credentials/*.json
+credentials/*.pem
+
+# Cache de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest y coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Build / packaging
+*.egg-info/
+build/
+dist/

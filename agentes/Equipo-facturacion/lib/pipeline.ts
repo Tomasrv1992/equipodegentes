@@ -139,8 +139,9 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const { google: g, options = {} } = cfg;
   const { dryRun = false, limit = null, window = "30d" } = options;
 
-  // DIAN Colombia no usa "factura" en el subject — detectamos por adjunto ZIP.
-  const searchQuery = `filename:zip -label:Procesado newer_than:${window}`;
+  // Query amplia: facturas DIAN (ZIP) + planillas SS (PDFs autoliquidaciones/comprobante).
+  // El processOne distingue qué tipo es y aplica el sub-pipeline correspondiente.
+  const searchQuery = `(filename:zip OR filename:autoliquidaciones OR filename:comprobante) -label:Procesado newer_than:${window}`;
 
   const auth = new google.auth.OAuth2(g.clientId, g.clientSecret);
   auth.setCredentials({ refresh_token: g.refreshToken });
@@ -149,9 +150,9 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const drive = google.drive({ version: "v3", auth });
   const sheets = google.sheets({ version: "v4", auth });
 
-  // Tab base: si viene "Gastos 2026", se interpreta como prefix → derivamos por año del XML.
-  // Si viene solo "Gastos", también — concatenamos el año.
-  const baseTabName = deriveBaseTab(g.sheetTab);
+  // Estructura nueva: 12 pestañas (Enero..Diciembre), una por mes, con N° consecutivo
+  // que reinicia cada mes. El env var INVOICES_SHEET_TAB ahora se ignora — los nombres
+  // de pestañas son fijos (estándar contable colombiano).
   const xmlParser = new XMLParser({
     ignoreAttributes: false,
     removeNSPrefix: true,
@@ -184,8 +185,8 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     };
   }
 
-  // Caché de Sheet rows POR tab (key = nombre del tab, ej "Gastos 2026").
-  // Se carga lazy y se actualiza tras cada append. Soporta multi-año en una corrida.
+  // Caché de Sheet rows POR pestaña-mes (key = "Enero", "Febrero"...).
+  // Se carga lazy y se actualiza tras cada append. Soporta multi-mes en una corrida.
   const sheetRowsCache = new Map<string, any[][]>();
   const loadSheetRows = async (tabName: string): Promise<any[][]> => {
     if (sheetRowsCache.has(tabName)) return sheetRowsCache.get(tabName)!;
@@ -193,13 +194,13 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     try {
       const res = await sheets.spreadsheets.values.get({
         spreadsheetId: g.sheetId,
-        range: `${tabRange}!A:K`,
+        range: `${tabRange}!A:L`, // 12 cols
       });
       const rows = res.data.values || [];
       sheetRowsCache.set(tabName, rows);
       return rows;
     } catch {
-      // El tab puede no existir todavía — lo creará getOrCreateYearTab.
+      // El tab puede no existir todavía — lo creará getOrCreateMonthTab.
       sheetRowsCache.set(tabName, []);
       return [];
     }
@@ -217,7 +218,6 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
         sheets,
         xmlParser,
         g,
-        baseTabName,
         loadSheetRows,
         (tabName, newRow) => {
           const cached = sheetRowsCache.get(tabName);
@@ -239,25 +239,26 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   return result;
 }
 
-/**
- * Extrae el "prefix" del nombre del tab. Si tiene un año al final lo quita.
- * "Gastos 2026" → "Gastos"; "Gastos" → "Gastos"; "Mis Gastos" → "Mis Gastos".
- */
-function deriveBaseTab(configured: string): string {
-  return String(configured || "Gastos").replace(/\s*\d{4}\s*$/, "").trim() || "Gastos";
-}
+// Nombres de las 12 pestañas (1 por mes), formato español.
+const MES_TABS = [
+  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+];
 
+// Headers nuevos: 12 columnas (col A = N° consecutivo del mes)
 const SHEET_HEADERS = [
-  "Fecha", "Proveedor", "NIT", "N° Factura", "Subtotal", "IVA", "Total",
-  "Concepto", "Link PDF", "Categoría", "Cuenta PYG",
+  "N°", "Fecha", "Proveedor", "NIT", "N° Factura", "Subtotal", "IVA",
+  "Total", "Concepto", "Link PDF", "Categoría", "Cuenta PYG",
 ];
 
 /**
- * Devuelve el nombre del tab para un año dado (ej "Gastos 2027"). Si no existe,
+ * Devuelve el nombre del tab del mes (ej "Enero", "Febrero"...). Si no existe,
  * lo crea con headers + frozen + bold. Idempotente.
  */
-async function getOrCreateYearTab(sheets: any, sheetId: string, baseName: string, year: number): Promise<string> {
-  const tabName = `${baseName} ${year}`;
+async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number): Promise<string> {
+  const tabName = MES_TABS[month - 1];
+  if (!tabName) throw new Error(`Mes inválido: ${month}`);
+
   const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
   const existing = meta.data.sheets?.find((s: any) => s.properties?.title === tabName);
   if (existing) return tabName;
@@ -270,7 +271,7 @@ async function getOrCreateYearTab(sheets: any, sheetId: string, baseName: string
         addSheet: {
           properties: {
             title: tabName,
-            gridProperties: { frozenRowCount: 1 },
+            gridProperties: { frozenRowCount: 1, columnCount: 12 },
           },
         },
       }],
@@ -280,7 +281,7 @@ async function getOrCreateYearTab(sheets: any, sheetId: string, baseName: string
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: sheetId,
-    range: `'${tabName}'!A1:K1`,
+    range: `'${tabName}'!A1:L1`,
     valueInputOption: "RAW",
     requestBody: { values: [SHEET_HEADERS] },
   });
@@ -291,7 +292,7 @@ async function getOrCreateYearTab(sheets: any, sheetId: string, baseName: string
       requestBody: {
         requests: [{
           repeatCell: {
-            range: { sheetId: newTabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 11 },
+            range: { sheetId: newTabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 12 },
             cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 } } },
             fields: "userEnteredFormat(textFormat,backgroundColor)",
           },
@@ -346,6 +347,26 @@ function findZipParts(payload: any) {
   function walk(part: any) {
     if (part.filename && /\.zip$/i.test(part.filename) && part.body?.attachmentId) {
       out.push({ filename: part.filename, attachmentId: part.body.attachmentId });
+    }
+    if (part.parts) part.parts.forEach(walk);
+  }
+  if (payload) walk(payload);
+  return out;
+}
+
+/**
+ * Detecta PDFs de planillas seguridad social (PILA Colombia).
+ * Filenames típicos: "Autoliquidaciones_84333812_Consolidado.pdf" o "Comprobante_Pago_84333812.pdf".
+ * Match laxo: contiene "autoliquidaci" o "comprobante" (case-insensitive).
+ */
+function findPlanillaPdfs(payload: any) {
+  const out: Array<{ filename: string; attachmentId: string }> = [];
+  function walk(part: any) {
+    if (part.filename && /\.pdf$/i.test(part.filename) && part.body?.attachmentId) {
+      const lower = part.filename.toLowerCase();
+      if (lower.includes("autoliquidaci") || lower.includes("comprobante")) {
+        out.push({ filename: part.filename, attachmentId: part.body.attachmentId });
+      }
     }
     if (part.parts) part.parts.forEach(walk);
   }
@@ -562,6 +583,22 @@ async function getOrCreateMonthFolder(drive: any, parentFolderId: string, year: 
   return created.data.id;
 }
 
+/**
+ * Find-or-create de una subcarpeta nombrada dentro de un padre Drive.
+ * Idempotente. Usado para la carpeta "Seguridad Social" del sub-pipeline planillas.
+ */
+async function getOrCreateNamedFolder(drive: any, parentFolderId: string, name: string): Promise<string> {
+  const safeName = name.replace(/'/g, "\\'");
+  const q = `name='${safeName}' and '${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const list = await drive.files.list({ q, fields: "files(id, name)", spaces: "drive" });
+  if (list.data.files?.length) return list.data.files[0].id;
+  const created = await drive.files.create({
+    requestBody: { name, mimeType: "application/vnd.google-apps.folder", parents: [parentFolderId] },
+    fields: "id",
+  });
+  return created.data.id;
+}
+
 async function uploadFile(drive: any, localPath: string, parentId: string, name: string) {
   const res = await drive.files.create({
     requestBody: { name, parents: [parentId] },
@@ -578,12 +615,12 @@ function isDuplicate(rows: any[][], numero: string, nit: string): boolean {
   const numTrim = String(numero).trim();
   const nitNorm = String(nit || "").replace(/\D+/g, "");
   // Match estricto: ambos NITs deben existir e igualar.
-  // Si NIT entrante vacío → no podemos verificar dup confiablemente → procesar.
   // (La idempotencia primaria sigue siendo el label "Procesado" en Gmail.)
   if (!nitNorm) return false;
+  // Cols nuevas (12): A=N°, B=Fecha, C=Proveedor, D=NIT, E=N°Factura, F..L resto
   return rows.some((r) => {
-    const rowNum = String(r[3] || "").trim();
-    const rowNit = String(r[2] || "").replace(/\D+/g, "");
+    const rowNum = String(r[4] || "").trim();
+    const rowNit = String(r[3] || "").replace(/\D+/g, "");
     return rowNum === numTrim && rowNit === nitNorm;
   });
 }
@@ -592,17 +629,22 @@ async function appendToSheet(
   sheets: any,
   sheetId: string,
   tabRange: string,
+  consecutivo: number,
   d: ProcessedRow
 ): Promise<any[]> {
+  // 12 cols: A=N°, B=Fecha, C=Proveedor, D=NIT, E=N°Factura, F=Subtotal,
+  //          G=IVA, H=Total, I=Concepto, J=Link PDF, K=Categoría, L=Cuenta PYG
+  const row = [
+    consecutivo, d.fecha, d.proveedor, d.nit, d.numero, d.subtotal,
+    d.iva, d.total, d.concepto, d.driveLink, d.categoria, d.cuentaPyg,
+  ];
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `${tabRange}!A:K`,
+    range: `${tabRange}!A:L`,
     valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [[d.fecha, d.proveedor, d.nit, d.numero, d.subtotal, d.iva, d.total, d.concepto, d.driveLink, d.categoria, d.cuentaPyg]],
-    },
+    requestBody: { values: [row] },
   });
-  return [d.fecha, d.proveedor, d.nit, d.numero, d.subtotal, d.iva, d.total, d.concepto, d.driveLink, d.categoria, d.cuentaPyg];
+  return row;
 }
 
 // ===== Pipeline per email =====
@@ -620,7 +662,6 @@ async function processOne(
   sheets: any,
   xmlParser: XMLParser,
   g: PipelineConfig["google"],
-  baseTabName: string,
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void
 ): Promise<ProcessOneResult> {
@@ -628,7 +669,15 @@ async function processOne(
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
 
   const zips = findZipParts(msg.payload);
-  if (!zips.length) return { skip: true, reason: "sin-zip", subject };
+  const planillas = findPlanillaPdfs(msg.payload);
+
+  // Sub-pipeline planillas: si NO hay ZIPs pero SÍ hay autoliquidaciones/comprobantes,
+  // tratar como planilla seguridad social (organizar en Drive + label, sin Sheet).
+  if (zips.length === 0 && planillas.length > 0) {
+    return await processPlanilla(messageId, labelId, gmail, drive, g, planillas, subject);
+  }
+
+  if (zips.length === 0) return { skip: true, reason: "sin-zip", subject };
 
   // Tracking de tmp paths para cleanup garantizado en finally.
   const tmpPaths: string[] = [];
@@ -670,8 +719,8 @@ async function processOne(
     const year = issue.getFullYear();
     const month = issue.getMonth() + 1;
 
-    // Tab dinámico por año — crea "Gastos {year}" si no existe (con headers).
-    const tabName = await getOrCreateYearTab(sheets, g.sheetId, baseTabName, year);
+    // Tab del mes (Enero, Febrero...). Se crea con headers si no existe.
+    const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
     const tabRange = `'${tabName.replace(/'/g, "''")}'`;
 
     const sheetRows = await loadSheetRows(tabName);
@@ -681,24 +730,29 @@ async function processOne(
       return { dup: true, motivo: `${data.proveedor} ${data.numero} (ya en ${tabName})`, subject };
     }
 
+    // Calcular N° consecutivo del mes: max(col A) + 1. Header en row 0 → data en row 1+.
+    let maxN = 0;
+    for (let i = 1; i < sheetRows.length; i++) {
+      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
+      if (!isNaN(v) && v > maxN) maxN = v;
+    }
+    const consecutivo = maxN + 1;
+
     const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
 
     let driveLink = "";
-    const baseName = `${data.fecha || "sin-fecha"}_${data.proveedor.slice(0, 40)}_${data.numero || data.cufe.slice(0, 8)}`
-      .replace(/[\\/:*?"<>|]/g, "-")
-      .replace(/\s+/g, "_");
-
+    // Naming nuevo: {N}.pdf, {N}.1.xml, {N}.2.xml... (1.3 reservado para comprobante pago futuro)
     if (pdfPath) {
-      const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
+      const uploaded = await uploadFile(drive, pdfPath, folderId, `${consecutivo}.pdf`);
       driveLink = uploaded.webViewLink || "";
     }
-    for (const x of xmlPaths) {
-      await uploadFile(drive, x, folderId, `${baseName}__${path.basename(x)}`);
+    for (let j = 0; j < xmlPaths.length; j++) {
+      await uploadFile(drive, xmlPaths[j], folderId, `${consecutivo}.${j + 1}.xml`);
     }
 
     const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
     const row: ProcessedRow = { ...data, driveLink, subject, categoria, cuentaPyg };
-    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, row);
+    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
     pushToCache(tabName, newRow);
     await markEmailProcessed(gmail, messageId, labelId);
     await applyMonthLabel(gmail, messageId, year, month);
@@ -706,6 +760,58 @@ async function processOne(
     return { ok: true, ...row };
   } finally {
     // Cleanup garantizado de tmp paths (FIX: leak de /tmp en Netlify functions)
+    cleanupTmp(tmpPaths);
+  }
+}
+
+/**
+ * Sub-pipeline planillas seguridad social (PILA Colombia).
+ * Sube los PDFs (autoliquidaciones + comprobantes) a la carpeta `Seguridad Social/`
+ * dentro del folder principal de facturas, etiqueta el correo y archiva.
+ *
+ * NO inserta fila en el Sheet (fase 2 cuando definamos cómo extraer monto del PDF).
+ * Mantiene los nombres originales del adjunto — Tomás puede renombrar manualmente
+ * para asignar el mes correspondiente (1-12).
+ */
+async function processPlanilla(
+  messageId: string,
+  labelProcesadoId: string,
+  gmail: any,
+  drive: any,
+  g: PipelineConfig["google"],
+  planillas: Array<{ filename: string; attachmentId: string }>,
+  subject: string,
+): Promise<ProcessOneResult> {
+  const tmpPaths: string[] = [];
+  try {
+    const folderId = await getOrCreateNamedFolder(drive, g.driveFolderId, "Seguridad Social");
+    let uploaded = 0;
+    for (const p of planillas) {
+      const tmpPath = await downloadAttachment(gmail, messageId, p.attachmentId, p.filename);
+      tmpPaths.push(tmpPath);
+      try {
+        await uploadFile(drive, tmpPath, folderId, p.filename);
+        uploaded++;
+      } catch (e: any) {
+        console.warn(`processPlanilla: upload "${p.filename}" failed: ${e.message}`);
+      }
+    }
+
+    // Etiquetar el correo con "Procesado" + "Seguridad Social" + archivar
+    await markEmailProcessed(gmail, messageId, labelProcesadoId);
+    const ssLabelId = await getOrCreateLabel(gmail, "Seguridad Social");
+    await gmail.users.messages.modify({
+      userId: "me",
+      id: messageId,
+      requestBody: { addLabelIds: [ssLabelId], removeLabelIds: ["INBOX"] },
+    });
+
+    return {
+      skip: true, // contabilizamos como "saltado" porque no entra al Sheet en fase 1
+      reason: `planilla-seguridad-social: ${uploaded}/${planillas.length} PDFs subidos a Drive/Seguridad Social/`,
+      subject,
+    };
+  } finally {
     cleanupTmp(tmpPaths);
   }
 }

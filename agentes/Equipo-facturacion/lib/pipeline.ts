@@ -247,16 +247,16 @@ const MES_TABS = [
 
 /**
  * Genera el nombre base de un archivo de factura para Drive.
+ * El mes NO se incluye porque ya está en la carpeta padre (YYYY-MM/).
  * Ejemplos:
- *   buildFileBaseName(2, 1, "SEGUROS DE VIDA SURAMERICANA")
- *     → "Febrero 1. Seguros De Vida Suramericana"
- *   buildFileBaseName(2, 1, "SEGUROS DE VIDA SURAMERICANA", 1)
- *     → "Febrero 1.1. Seguros De Vida Suramericana"  (XML idx 1)
- *   buildFileBaseName(2, 1, "SEGUROS DE VIDA SURAMERICANA", 3)
- *     → "Febrero 1.3. Seguros De Vida Suramericana"  (futuro: comprobante pago)
+ *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA")
+ *     → "1. Seguros De Vida Suramericana"
+ *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", 1)
+ *     → "1.1. Seguros De Vida Suramericana"  (XML idx 1)
+ *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", 3)
+ *     → "1.3. Seguros De Vida Suramericana"  (futuro: comprobante pago)
  */
-function buildFileBaseName(month: number, n: number, proveedor: string, subIdx?: number): string {
-  const mesName = MES_TABS[month - 1] ?? `Mes${month}`;
+function buildFileBaseName(n: number, proveedor: string, subIdx?: number): string {
   const N = subIdx != null ? `${n}.${subIdx}` : `${n}`;
   // Title-case proveedor (capitaliza primera letra de cada palabra), max 60 chars
   const provClean = String(proveedor || "Sin Proveedor")
@@ -265,7 +265,7 @@ function buildFileBaseName(month: number, n: number, proveedor: string, subIdx?:
     .replace(/[\\/:*?"<>|]/g, "-")
     .slice(0, 60)
     .trim();
-  return `${mesName} ${N}. ${provClean}`;
+  return `${N}. ${provClean}`;
 }
 
 // Headers nuevos: 12 columnas (col A = N° consecutivo del mes)
@@ -764,16 +764,17 @@ async function processOne(
     const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
 
     let driveLink = "";
-    // Naming: "{Mes} {N}. {Proveedor}.pdf" — ej "Febrero 1. Seguros de Vida Suramericana.pdf"
-    // XMLs: "{Mes} {N}.1. {Proveedor}.xml", "{Mes} {N}.2. {Proveedor}.xml"...
+    // Naming: "{N}. {Proveedor}.pdf" — ej "1. Seguros De Vida Suramericana.pdf"
+    // El mes está en la carpeta padre YYYY-MM/, no se repite en el filename.
+    // XMLs: "{N}.1. {Proveedor}.xml", "{N}.2. {Proveedor}.xml"...
     // {N}.3 reservado para comprobante de pago (futuro sub-pipeline).
-    const baseName = buildFileBaseName(month, consecutivo, data.proveedor);
+    const baseName = buildFileBaseName(consecutivo, data.proveedor);
     if (pdfPath) {
       const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
       driveLink = uploaded.webViewLink || "";
     }
     for (let j = 0; j < xmlPaths.length; j++) {
-      const xmlName = buildFileBaseName(month, consecutivo, data.proveedor, j + 1);
+      const xmlName = buildFileBaseName(consecutivo, data.proveedor, j + 1);
       await uploadFile(drive, xmlPaths[j], folderId, `${xmlName}.xml`);
     }
 

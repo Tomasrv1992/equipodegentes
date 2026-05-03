@@ -245,6 +245,29 @@ const MES_TABS = [
   "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ];
 
+/**
+ * Genera el nombre base de un archivo de factura para Drive.
+ * Ejemplos:
+ *   buildFileBaseName(2, 1, "SEGUROS DE VIDA SURAMERICANA")
+ *     → "Febrero 1. Seguros De Vida Suramericana"
+ *   buildFileBaseName(2, 1, "SEGUROS DE VIDA SURAMERICANA", 1)
+ *     → "Febrero 1.1. Seguros De Vida Suramericana"  (XML idx 1)
+ *   buildFileBaseName(2, 1, "SEGUROS DE VIDA SURAMERICANA", 3)
+ *     → "Febrero 1.3. Seguros De Vida Suramericana"  (futuro: comprobante pago)
+ */
+function buildFileBaseName(month: number, n: number, proveedor: string, subIdx?: number): string {
+  const mesName = MES_TABS[month - 1] ?? `Mes${month}`;
+  const N = subIdx != null ? `${n}.${subIdx}` : `${n}`;
+  // Title-case proveedor (capitaliza primera letra de cada palabra), max 60 chars
+  const provClean = String(proveedor || "Sin Proveedor")
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .slice(0, 60)
+    .trim();
+  return `${mesName} ${N}. ${provClean}`;
+}
+
 // Headers nuevos: 12 columnas (col A = N° consecutivo del mes)
 const SHEET_HEADERS = [
   "N°", "Fecha", "Proveedor", "NIT", "N° Factura", "Subtotal", "IVA",
@@ -741,13 +764,17 @@ async function processOne(
     const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
 
     let driveLink = "";
-    // Naming nuevo: {N}.pdf, {N}.1.xml, {N}.2.xml... (1.3 reservado para comprobante pago futuro)
+    // Naming: "{Mes} {N}. {Proveedor}.pdf" — ej "Febrero 1. Seguros de Vida Suramericana.pdf"
+    // XMLs: "{Mes} {N}.1. {Proveedor}.xml", "{Mes} {N}.2. {Proveedor}.xml"...
+    // {N}.3 reservado para comprobante de pago (futuro sub-pipeline).
+    const baseName = buildFileBaseName(month, consecutivo, data.proveedor);
     if (pdfPath) {
-      const uploaded = await uploadFile(drive, pdfPath, folderId, `${consecutivo}.pdf`);
+      const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
       driveLink = uploaded.webViewLink || "";
     }
     for (let j = 0; j < xmlPaths.length; j++) {
-      await uploadFile(drive, xmlPaths[j], folderId, `${consecutivo}.${j + 1}.xml`);
+      const xmlName = buildFileBaseName(month, consecutivo, data.proveedor, j + 1);
+      await uploadFile(drive, xmlPaths[j], folderId, `${xmlName}.xml`);
     }
 
     const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });

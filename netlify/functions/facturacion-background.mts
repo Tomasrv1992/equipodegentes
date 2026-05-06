@@ -11,6 +11,10 @@
 
 import type { Config } from "@netlify/functions";
 import { run, type PipelineConfig, type PipelineResult } from "../../agentes/Equipo-facturacion/lib/pipeline";
+import {
+  recordRunStart,
+  recordRunEnd,
+} from "../../shared/agents-runtime/src/record-run";
 
 interface RequestBody {
   /** Forward-compat para SaaS multi-tenant (Proyecto B). */
@@ -42,23 +46,52 @@ export default async (req: Request) => {
   // 3. Resolver config según customerId
   const cfg = await buildConfig(body);
 
-  // 4. Ejecutar pipeline
+  // 4. Ejecutar pipeline + registrar en agent_runs
   const startedAt = Date.now();
-  let result;
+  const clienteSlug = body.customerId ?? "owner";
+
+  let runId: string | null = null;
+  try {
+    runId = await recordRunStart({
+      clienteSlug,
+      agenteId: "facturacion",
+      triggeredBy: req.headers.get("x-trigger") === "rerun" ? "rerun" : "cron",
+    });
+  } catch (err: any) {
+    console.error("recordRunStart failed (no-fatal):", err.message);
+    // No bloqueamos el pipeline si Supabase está caído.
+  }
+
+  let result: PipelineResult;
   try {
     result = await run(cfg);
   } catch (err: any) {
-    // Log estructurado para que sea fácil grepear en Netlify logs
     console.error(JSON.stringify({
       level: "fatal",
-      customerId: body.customerId ?? "owner",
+      customerId: clienteSlug,
       error: err.message,
       stack: err.stack,
       hint: err.message?.includes("invalid_grant")
         ? "Refresh token expiró: corré scripts/setup-oauth.mjs local y actualizá GOOGLE_OAUTH_REFRESH_TOKEN en Netlify env vars"
         : undefined,
     }));
-    // Email de error fatal (no esperar — best effort)
+
+    if (runId) {
+      try {
+        await recordRunEnd({
+          runId,
+          status: "fail",
+          durationMs: Date.now() - startedAt,
+          error: err,
+          netlifyLogUrl: process.env.URL
+            ? `${process.env.URL}/.netlify/functions/facturacion-background`
+            : undefined,
+        });
+      } catch (e: any) {
+        console.error("recordRunEnd(fail) failed:", e.message);
+      }
+    }
+
     try {
       await notifyError(err, body.customerId);
     } catch {
@@ -70,7 +103,7 @@ export default async (req: Request) => {
   const durationMs = Date.now() - startedAt;
   console.log(JSON.stringify({
     level: "result",
-    customerId: body.customerId ?? "owner",
+    customerId: clienteSlug,
     durationMs,
     procesadas: result.procesadas.length,
     errores: result.errores.length,
@@ -78,16 +111,38 @@ export default async (req: Request) => {
     sample: result.procesadas.slice(0, 3),
   }));
 
+  // Registrar fin OK (o WARN si hubo errores parciales)
+  if (runId) {
+    try {
+      const status: "ok" | "warn" = result.errores.length > 0 ? "warn" : "ok";
+      const summary =
+        `${result.procesadas.length} procesadas` +
+        (result.errores.length ? ` · ${result.errores.length} errores` : "") +
+        (result.saltadas.length ? ` · ${result.saltadas.length} saltadas` : "");
+      await recordRunEnd({
+        runId,
+        status,
+        durationMs,
+        summary,
+        payload: {
+          procesadas: result.procesadas.length,
+          errores: result.errores.length,
+          saltadas: result.saltadas.length,
+        },
+      });
+    } catch (e: any) {
+      console.error("recordRunEnd(ok) failed:", e.message);
+    }
+  }
+
   // Email diario incondicional con resumen
   try {
     await notifyResult(result, body.customerId);
   } catch (err: any) {
     console.error("notify failed:", err.message);
-    /* no bloquear el flujo si email falla */
   }
 
-  // Background fn: respuesta vacía/202 al caller
-  return new Response(JSON.stringify({ ok: true, durationMs }), {
+  return new Response(JSON.stringify({ ok: true, durationMs, runId }), {
     headers: { "content-type": "application/json" },
   });
 };

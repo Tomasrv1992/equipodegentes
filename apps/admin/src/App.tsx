@@ -1,6 +1,7 @@
 import { Routes, Route } from "react-router-dom";
 import LoginGate from "./components/LoginGate";
 import Layout from "./components/Layout";
+import Home from "./routes/home";
 
 function Placeholder({ name }: { name: string }) {
   return <h2 className="font-serif text-2xl">{name}</h2>;
@@ -11,7 +12,7 @@ export default function App() {
     <LoginGate>
       <Layout>
         <Routes>
-          <Route path="/" element={<Placeholder name="Matriz (próxima task)" />} />
+          <Route path="/" element={<Home />} />
           <Route path="/feed" element={<Placeholder name="Feed (próxima task)" />} />
           <Route path="/run/:id" element={<Placeholder name="Run detail" />} />
           <Route path="/cliente/:slug" element={<Placeholder name="Cliente" />} />

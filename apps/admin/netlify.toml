@@ -2,6 +2,10 @@
   command = "npm install && npm run build"
   publish = "dist"
 
+[[edge_functions]]
+  function = "admin-trigger-rerun"
+  path = "/api/trigger-rerun"
+
 [[redirects]]
   from = "/*"
   to = "/index.html"

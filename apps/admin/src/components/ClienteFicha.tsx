@@ -19,6 +19,16 @@ import MonthlyBars from "./MonthlyBars";
 import { sparkRunsByDay } from "../lib/timeline";
 import type { Cliente, AgentRun, ClientAgent, Agente } from "../types";
 
+interface CredStatus {
+  agente_id: string;
+  google_oauth_status: "pending" | "connected" | "expired" | "revoked" | null;
+  google_email: string | null;
+  drive_folder_name: string | null;
+  sheet_name: string | null;
+  notify_email: string | null;
+  onboarded_at: string | null;
+}
+
 function useClienteBySlug(slug: string) {
   return useQuery({
     queryKey: ["cliente", slug],
@@ -27,6 +37,7 @@ function useClienteBySlug(slug: string) {
       cliente: Cliente;
       activaciones: ClientAgent[];
       runs: AgentRun[];
+      credentials: CredStatus[];
     }> => {
       const { data: cliente, error: e1 } = await supabase
         .from("clientes")
@@ -35,7 +46,11 @@ function useClienteBySlug(slug: string) {
         .single();
       if (e1 || !cliente) throw new Error(e1?.message ?? "cliente no encontrado");
 
-      const [{ data: activaciones, error: e2 }, { data: runs, error: e3 }] = await Promise.all([
+      const [
+        { data: activaciones, error: e2 },
+        { data: runs, error: e3 },
+        { data: creds, error: e4 },
+      ] = await Promise.all([
         supabase
           .from("client_agents")
           .select("*")
@@ -46,13 +61,22 @@ function useClienteBySlug(slug: string) {
           .eq("cliente_id", (cliente as Cliente).id)
           .order("started_at", { ascending: false })
           .limit(200),
+        supabase
+          .from("client_credentials")
+          .select("agente_id, google_oauth_status, google_email, drive_folder_name, sheet_name, notify_email, onboarded_at")
+          .eq("cliente_id", (cliente as Cliente).id),
       ]);
       if (e2) throw e2;
       if (e3) throw e3;
+      if (e4) {
+        // No fallar si client_credentials no existe (migración 0002 todavía no corrida)
+        console.warn("client_credentials query failed (no fatal):", e4.message);
+      }
       return {
         cliente: cliente as Cliente,
         activaciones: (activaciones as ClientAgent[]) ?? [],
         runs: (runs as AgentRun[]) ?? [],
+        credentials: (creds as CredStatus[]) ?? [],
       };
     },
   });
@@ -70,8 +94,9 @@ export default function ClienteFicha({ slug }: { slug: string }) {
     );
   }
 
-  const { cliente, activaciones, runs } = data;
+  const { cliente, activaciones, runs, credentials } = data;
   const agenteById = Object.fromEntries(agentes.map((a) => [a.id, a]));
+  const credByAgente = Object.fromEntries(credentials.map((c) => [c.agente_id, c]));
 
   // === KPIs del cliente ===
   const facturasMes = totalProcesadas(runsThisMonth(runs));
@@ -176,6 +201,7 @@ export default function ClienteFicha({ slug }: { slug: string }) {
                 activacion={act}
                 agente={agenteById[act.agente_id]}
                 runs={runs.filter((r) => r.agente_id === act.agente_id)}
+                cred={credByAgente[act.agente_id]}
                 slug={slug}
               />
             ))}
@@ -229,12 +255,16 @@ interface ActivacionCardProps {
   activacion: ClientAgent;
   agente: Agente | undefined;
   runs: AgentRun[];
+  cred: CredStatus | undefined;
   slug: string;
 }
 
-function ActivacionCard({ cliente, activacion, agente, runs, slug }: ActivacionCardProps) {
+function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: ActivacionCardProps) {
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
+  const [creatingLink, setCreatingLink] = useState(false);
+  const [createdLink, setCreatedLink] = useState<string | null>(null);
+  const [linkError, setLinkError] = useState<string | null>(null);
   const initialConfig = activacion.config as Record<string, string>;
   const [draft, setDraft] = useState({
     sheet_id: initialConfig.sheet_id ?? "",
@@ -245,6 +275,38 @@ function ActivacionCard({ cliente, activacion, agente, runs, slug }: ActivacionC
 
   const last = runs[0];
   const sparkPoints = sparkRunsByDay(runs, 14);
+
+  async function handleCreateOnboardingLink() {
+    setCreatingLink(true);
+    setLinkError(null);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("no session");
+
+      const resp = await fetch("/api/admin/create-onboarding-link", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          clienteId: cliente.id,
+          agenteId: activacion.agente_id,
+        }),
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      const { link } = (await resp.json()) as { link: string };
+      setCreatedLink(link);
+      // copiar al portapapeles
+      try {
+        await navigator.clipboard.writeText(link);
+      } catch {}
+    } catch (e: any) {
+      setLinkError(e.message ?? String(e));
+    } finally {
+      setCreatingLink(false);
+    }
+  }
 
   const togglePausa = useMutation({
     mutationFn: async () => {
@@ -299,6 +361,21 @@ function ActivacionCard({ cliente, activacion, agente, runs, slug }: ActivacionC
         {!activacion.activo && <span className="pill pill-off">Pausado</span>}
       </div>
 
+      {/* Status OAuth credentials */}
+      {cred && (
+        <div className="mb-3 -mt-1">
+          <CredentialStatusBadge status={cred.google_oauth_status} email={cred.google_email} onboardedAt={cred.onboarded_at} />
+        </div>
+      )}
+      {!cred && (
+        <div className="mb-3 -mt-1">
+          <span className="font-mono text-[10px] text-ink-3 tracking-[0.04em] inline-flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-ink-4" />
+            Sin credenciales OAuth · usar "Crear link de onboarding"
+          </span>
+        </div>
+      )}
+
       {sparkPoints.some((p) => p.value > 0) && (
         <div className="mb-3">
           <Sparkline points={sparkPoints} className="h-6" />
@@ -324,14 +401,27 @@ function ActivacionCard({ cliente, activacion, agente, runs, slug }: ActivacionC
         </div>
       )}
 
-      <div className="mt-4 pt-3 border-t border-edge-2 flex items-center gap-3 font-mono text-[11px]">
+      <div className="mt-4 pt-3 border-t border-edge-2 flex items-center gap-3 font-mono text-[11px] flex-wrap">
         {!editing ? (
           <>
             <button
-              onClick={() => setEditing(true)}
-              className="text-accent hover:underline tracking-[0.04em]"
+              onClick={handleCreateOnboardingLink}
+              disabled={creatingLink}
+              className="text-accent hover:underline tracking-[0.04em] font-semibold"
+              title="Genera un link único de 7 días para mandar al cliente"
             >
-              Editar config
+              {creatingLink
+                ? "Generando…"
+                : createdLink
+                ? "Link copiado ✓"
+                : "Crear link de onboarding"}
+            </button>
+            <span className="text-ink-4">·</span>
+            <button
+              onClick={() => setEditing(true)}
+              className="text-ink-3 hover:text-ink transition-colors tracking-[0.04em]"
+            >
+              Editar config manual
             </button>
             <span className="text-ink-4">·</span>
             <button
@@ -341,6 +431,18 @@ function ActivacionCard({ cliente, activacion, agente, runs, slug }: ActivacionC
             >
               {activacion.activo ? "Pausar" : "Reactivar"}
             </button>
+            {createdLink && (
+              <div className="w-full mt-2 p-2 bg-paper-sunken rounded border border-edge-2 text-[10px] break-all">
+                <span className="text-ink-3 mr-2 tracking-[0.04em]">link:</span>
+                <a href={createdLink} target="_blank" rel="noreferrer" className="text-accent">
+                  {createdLink}
+                </a>
+                <span className="text-ink-4 ml-2">(copiado al portapapeles · vence en 7d)</span>
+              </div>
+            )}
+            {linkError && (
+              <span className="text-fail w-full">Error: {linkError}</span>
+            )}
           </>
         ) : (
           <>
@@ -372,6 +474,40 @@ function ActivacionCard({ cliente, activacion, agente, runs, slug }: ActivacionC
         )}
       </div>
     </div>
+  );
+}
+
+function CredentialStatusBadge({
+  status,
+  email,
+  onboardedAt,
+}: {
+  status: CredStatus["google_oauth_status"];
+  email: string | null;
+  onboardedAt: string | null;
+}) {
+  const map = {
+    connected: { color: "text-ok", label: "Conectado", dotBg: "bg-ok" },
+    expired:   { color: "text-warn", label: "OAuth expirado · reconectar", dotBg: "bg-warn" },
+    revoked:   { color: "text-fail", label: "OAuth revocado por el cliente", dotBg: "bg-fail" },
+    pending:   { color: "text-ink-3", label: "Esperando que el cliente complete onboarding", dotBg: "bg-ink-4" },
+  } as const;
+
+  const cfg = status ? map[status] : map.pending;
+
+  return (
+    <span className={`font-mono text-[10px] tracking-[0.04em] inline-flex items-center gap-2 ${cfg.color}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${cfg.dotBg}`} />
+      {cfg.label}
+      {email && status === "connected" && (
+        <span className="text-ink-3">· {email}</span>
+      )}
+      {onboardedAt && (
+        <span className="text-ink-4">
+          · onboarded {new Date(onboardedAt).toLocaleDateString("es-CO", { month: "short", day: "2-digit" }).replace(".", "")}
+        </span>
+      )}
+    </span>
   );
 }
 

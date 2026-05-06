@@ -10,6 +10,10 @@ export {
   markOAuthStatus,
   saveResources,
 } from "./credentials";
+export {
+  loadCredentialsBySlug,
+  listActiveClientsForAgent,
+} from "./credentials-by-slug";
 export type {
   ClientCredentialsRow,
   GoogleOAuthStatus,

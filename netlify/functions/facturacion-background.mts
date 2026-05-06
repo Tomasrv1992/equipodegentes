@@ -15,6 +15,8 @@ import {
   recordRunStart,
   recordRunEnd,
 } from "../../shared/agents-runtime/src/record-run";
+import { markOAuthStatus } from "../../shared/agents-runtime/src/credentials";
+import { getServerClient } from "../../shared/agents-runtime/src/supabase-server";
 
 interface RequestBody {
   /** Forward-compat para SaaS multi-tenant (Proyecto B). */
@@ -92,6 +94,24 @@ export default async (req: Request) => {
       }
     }
 
+    // Si el error es invalid_grant en modo multi-tenant, marcar credenciales expiradas
+    if (body.customerId && err.message?.includes("invalid_grant")) {
+      try {
+        const supa = getServerClient();
+        const { data: cliente } = await supa
+          .from("clientes")
+          .select("id")
+          .eq("slug", body.customerId)
+          .single();
+        if (cliente) {
+          await markOAuthStatus((cliente as any).id, "facturacion", "expired");
+          console.log(`OAuth marked expired for cliente ${body.customerId}`);
+        }
+      } catch (e: any) {
+        console.error("mark oauth expired failed:", e.message);
+      }
+    }
+
     try {
       await notifyError(err, body.customerId);
     } catch {
@@ -154,16 +174,41 @@ export const config: Config = {
 // ===== Config builder =====
 
 async function buildConfig(body: RequestBody): Promise<PipelineConfig> {
-  // Single-tenant (hoy): credenciales del owner desde env vars del site.
-  if (!body.customerId) {
+  // === Multi-tenant: customerId es el SLUG del cliente en public.clientes ===
+  // Carga credenciales del cliente desde Supabase (refresh_token desencriptado
+  // con pgcrypto + recursos elegidos durante onboarding).
+  if (body.customerId) {
+    const { loadCredentialsBySlug } = await import("../../shared/agents-runtime/src/credentials-by-slug");
+    const cred = await loadCredentialsBySlug(body.customerId, "facturacion");
+    if (!cred) {
+      throw new Error(
+        `Cliente con slug "${body.customerId}" no tiene credenciales en client_credentials`,
+      );
+    }
+    if (cred.google_oauth_status !== "connected") {
+      throw new Error(
+        `Cliente "${body.customerId}" tiene OAuth en estado '${cred.google_oauth_status}'. Reconectar.`,
+      );
+    }
+    if (!cred.google_refresh_token) {
+      throw new Error(`Cliente "${body.customerId}" sin refresh_token`);
+    }
+    if (!cred.drive_folder_id || !cred.sheet_id) {
+      throw new Error(
+        `Cliente "${body.customerId}" no completó selección de Drive folder o Sheet`,
+      );
+    }
+
     return {
       google: {
-        clientId: requireEnv("GOOGLE_CLIENT_ID"),
-        clientSecret: requireEnv("GOOGLE_CLIENT_SECRET"),
-        refreshToken: requireEnv("GOOGLE_OAUTH_REFRESH_TOKEN"),
-        driveFolderId: requireEnv("INVOICES_DRIVE_FOLDER_ID"),
-        sheetId: requireEnv("INVOICES_SHEET_ID"),
-        sheetTab: process.env.INVOICES_SHEET_TAB || "Gastos 2026",
+        // Usamos el OAuth Web Client de Operatto (compartido entre todos los clientes).
+        // Cada cliente tiene su propio refresh_token autorizado contra ese client.
+        clientId: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_ID"),
+        clientSecret: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_SECRET"),
+        refreshToken: cred.google_refresh_token,
+        driveFolderId: cred.drive_folder_id,
+        sheetId: cred.sheet_id,
+        sheetTab: cred.sheet_tab,
       },
       options: {
         dryRun: body.dryRun ?? false,
@@ -172,9 +217,21 @@ async function buildConfig(body: RequestBody): Promise<PipelineConfig> {
     };
   }
 
-  // TODO Proyecto B: leer credenciales del customer desde Supabase
-  // por `body.customerId`. Por ahora throw — la rama no se ejecuta en single-tenant.
-  throw new Error("Multi-tenant aún no implementado (Proyecto B). Sacá customerId del body.");
+  // === Single-tenant (legacy): owner desde env vars del site ===
+  return {
+    google: {
+      clientId: requireEnv("GOOGLE_CLIENT_ID"),
+      clientSecret: requireEnv("GOOGLE_CLIENT_SECRET"),
+      refreshToken: requireEnv("GOOGLE_OAUTH_REFRESH_TOKEN"),
+      driveFolderId: requireEnv("INVOICES_DRIVE_FOLDER_ID"),
+      sheetId: requireEnv("INVOICES_SHEET_ID"),
+      sheetTab: process.env.INVOICES_SHEET_TAB || "Gastos 2026",
+    },
+    options: {
+      dryRun: body.dryRun ?? false,
+      window: body.window ?? "30d",
+    },
+  };
 }
 
 function requireEnv(name: string): string {

@@ -2,10 +2,40 @@
   command = "npm install && npm run build"
   publish = "dist"
 
+# === Edge functions ===
+
+# Acciones del panel admin
 [[edge_functions]]
   function = "admin-trigger-rerun"
   path = "/api/trigger-rerun"
 
+[[edge_functions]]
+  function = "admin-create-onboarding"
+  path = "/api/admin/create-onboarding-link"
+
+# OAuth flow del cliente (Fase 3)
+[[edge_functions]]
+  function = "auth-google-start"
+  path = "/api/auth/google/start"
+
+[[edge_functions]]
+  function = "auth-google-callback"
+  path = "/api/auth/google/callback"
+
+# Onboarding API (proxies a Drive/Sheets API)
+[[edge_functions]]
+  function = "onboarding-drive-list"
+  path = "/api/onboarding/drive-list"
+
+[[edge_functions]]
+  function = "onboarding-sheets-list"
+  path = "/api/onboarding/sheets-list"
+
+[[edge_functions]]
+  function = "onboarding-save-resources"
+  path = "/api/onboarding/save-resources"
+
+# SPA fallback — DEBE ir al final
 [[redirects]]
   from = "/*"
   to = "/index.html"

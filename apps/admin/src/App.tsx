@@ -6,6 +6,7 @@ import FeedRoute from "./routes/feed";
 import RunRoute from "./routes/run";
 import ClienteRoute from "./routes/cliente";
 import AgenteRoute from "./routes/agente";
+import AgentesList from "./routes/agentes";
 import NuevoCliente from "./routes/nuevo-cliente";
 
 function Placeholder({ name }: { name: string }) {
@@ -21,6 +22,7 @@ export default function App() {
           <Route path="/feed" element={<FeedRoute />} />
           <Route path="/run/:id" element={<RunRoute />} />
           <Route path="/cliente/:slug" element={<ClienteRoute />} />
+          <Route path="/agentes" element={<AgentesList />} />
           <Route path="/agente/:id" element={<AgenteRoute />} />
           <Route path="/nuevo-cliente" element={<NuevoCliente />} />
           <Route path="*" element={<Placeholder name="404" />} />

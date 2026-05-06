@@ -9,10 +9,12 @@ import {
   totalErrores,
   tiempoAhorradoHoras,
   formatHoras,
+  aggByMonth,
 } from "../lib/metrics";
 import Pill from "./Pill";
 import Kpis from "./Kpis";
 import EmptyState from "./EmptyState";
+import MonthlyBars from "./MonthlyBars";
 import type { Agente, AgentRun } from "../types";
 
 function useAgenteData(id: string) {
@@ -55,6 +57,7 @@ export default function AgenteFicha({ id }: { id: string }) {
   const horasMes = tiempoAhorradoHoras(facturasMes);
   const errores7d = totalErrores(runsLastDays(runs, 7));
   const clientesUnicos = new Set(runs.map((r) => r.cliente_id)).size;
+  const monthlyAgg = aggByMonth(runs, 12);
 
   return (
     <div>
@@ -126,6 +129,17 @@ export default function AgenteFicha({ id }: { id: string }) {
           },
         ]}
       />
+
+      {/* Histórico mensual del agente */}
+      <section className="card mb-9">
+        <div className="flex items-baseline justify-between mb-4">
+          <h2 className="section-title">Histórico · 12 meses</h2>
+          <span className="section-meta">
+            facturas procesadas · todos los clientes que usan {agente.nombre}
+          </span>
+        </div>
+        <MonthlyBars data={monthlyAgg} />
+      </section>
 
       <div className="flex items-baseline justify-between mb-4">
         <h2 className="section-title">Runs cross-cliente</h2>

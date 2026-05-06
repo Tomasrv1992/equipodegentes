@@ -20,6 +20,9 @@ export default function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/" end className={navClass}>
               Operación
             </NavLink>
+            <NavLink to="/agentes" className={navClass}>
+              Agentes
+            </NavLink>
             <NavLink to="/feed" className={navClass}>
               Feed
             </NavLink>

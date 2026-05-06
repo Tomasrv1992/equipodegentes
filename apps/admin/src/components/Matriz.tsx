@@ -8,13 +8,11 @@ import {
   totalErrores,
   tiempoAhorradoHoras,
   formatHoras,
-  aggByMonth,
 } from "../lib/metrics";
 import Hero from "./Hero";
 import Kpis from "./Kpis";
 import ClientCard from "./ClientCard";
 import EmptyState from "./EmptyState";
-import MonthlyBars from "./MonthlyBars";
 
 export default function Matriz() {
   const { data: clientes, isLoading: lc } = useClientes();
@@ -44,7 +42,6 @@ export default function Matriz() {
   const horasAhorradasAllTime = tiempoAhorradoHoras(facturasAllTime);
   const runsHoyN = runsToday(runs).length;
   const errores7d = totalErrores(runsLastDays(runs, 7));
-  const monthlyAggGlobal = aggByMonth(runs, 12);
   const lastFailRuns = runs
     .filter((r) => r.status === "fail")
     .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime());
@@ -130,25 +127,61 @@ export default function Matriz() {
         ]}
       />
 
-      {/* Histórico mensual global (todos los clientes, todos los agentes) */}
-      <section className="card mb-9">
-        <div className="flex items-baseline justify-between mb-4">
-          <h2 className="section-title">Histórico · 12 meses</h2>
-          <span className="section-meta">
-            facturas procesadas · todos los clientes
-          </span>
-        </div>
-        <MonthlyBars data={monthlyAggGlobal} />
-      </section>
+      {/* === Clientes en operación (PRIMERO) === */}
+      <div className="flex items-baseline justify-between mb-4">
+        <h2 className="section-title">Clientes en operación</h2>
+        <span className="section-meta">
+          {actsActivas.length === 0
+            ? "ninguno activado"
+            : `${actsActivas.length} activación${actsActivas.length === 1 ? "" : "es"} · ordenado por última actividad`}
+        </span>
+      </div>
 
-      {/* KPIs por agente */}
+      {clientes.length === 0 ? (
+        <EmptyState
+          title="Sin clientes todavía"
+          description="Cuando crees un cliente y actives Equipo-facturación, aparecerán acá con su timeline operacional."
+          cta={{ label: "Crear primer cliente", to: "/nuevo-cliente" }}
+        />
+      ) : actsActivas.length === 0 ? (
+        <EmptyState
+          title="Sin agentes activados"
+          description="Tenés clientes pero ninguno tiene un agente activado todavía. Editá un cliente para activar Equipo-facturación."
+          cta={null}
+        />
+      ) : (
+        <div className="grid grid-cols-1 gap-3 mb-9">
+          {actsActivas.map((act) => {
+            const cliente = clienteById[act.cliente_id];
+            if (!cliente) return null;
+            const agente = agenteById[act.agente_id];
+            const runsCA = runs.filter(
+              (r) => r.cliente_id === cliente.id && r.agente_id === act.agente_id,
+            );
+            return (
+              <ClientCard
+                key={`${act.cliente_id}-${act.agente_id}`}
+                cliente={cliente}
+                activacion={act}
+                agente={agente}
+                runs={runsCA}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {/* === Resumen por agente (DESPUÉS de clientes) === */}
       {actsActivas.length > 0 && (
-        <section className="mb-9">
+        <section>
           <div className="flex items-baseline justify-between mb-4">
-            <h2 className="section-title">Por agente</h2>
-            <span className="section-meta">
-              {agentesActivados} activo{agentesActivados === 1 ? "" : "s"}
-            </span>
+            <h2 className="section-title">Resumen por agente</h2>
+            <Link
+              to="/agentes"
+              className="font-mono text-[11px] text-accent hover:underline tracking-[0.04em]"
+            >
+              ver todos →
+            </Link>
           </div>
           <div className="grid grid-cols-2 gap-3">
             {Array.from(new Set(actsActivas.map((a) => a.agente_id))).map((agenteId) => {
@@ -176,16 +209,8 @@ export default function Matriz() {
                     </span>
                   </div>
                   <div className="grid grid-cols-3 gap-3">
-                    <KpiInline
-                      label="Mes"
-                      value={proc}
-                      unit="facts"
-                    />
-                    <KpiInline
-                      label="All-time"
-                      value={allTime}
-                      unit="facts"
-                    />
+                    <KpiInline label="Mes" value={proc} unit="facts" />
+                    <KpiInline label="All-time" value={allTime} unit="facts" />
                     <KpiInline
                       label="Ahorrado mes"
                       value={formatHoras(horas).replace(/[hm]/, "")}
@@ -197,49 +222,6 @@ export default function Matriz() {
             })}
           </div>
         </section>
-      )}
-
-      <div className="flex items-baseline justify-between mb-4">
-        <h2 className="section-title">Clientes en operación</h2>
-        <span className="section-meta">
-          {actsActivas.length === 0
-            ? "ninguno activado"
-            : `${actsActivas.length} activación${actsActivas.length === 1 ? "" : "es"} · ordenado por última actividad`}
-        </span>
-      </div>
-
-      {clientes.length === 0 ? (
-        <EmptyState
-          title="Sin clientes todavía"
-          description="Cuando crees un cliente y actives Equipo-facturación, aparecerán acá con su timeline operacional."
-          cta={{ label: "Crear primer cliente", to: "/nuevo-cliente" }}
-        />
-      ) : actsActivas.length === 0 ? (
-        <EmptyState
-          title="Sin agentes activados"
-          description="Tenés clientes pero ninguno tiene un agente activado todavía. Editá un cliente para activar Equipo-facturación."
-          cta={null}
-        />
-      ) : (
-        <div className="grid grid-cols-1 gap-3">
-          {actsActivas.map((act) => {
-            const cliente = clienteById[act.cliente_id];
-            if (!cliente) return null;
-            const agente = agenteById[act.agente_id];
-            const runsCA = runs.filter(
-              (r) => r.cliente_id === cliente.id && r.agente_id === act.agente_id,
-            );
-            return (
-              <ClientCard
-                key={`${act.cliente_id}-${act.agente_id}`}
-                cliente={cliente}
-                activacion={act}
-                agente={agente}
-                runs={runsCA}
-              />
-            );
-          })}
-        </div>
       )}
     </div>
   );

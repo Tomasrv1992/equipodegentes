@@ -1,0 +1,31 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-paper text-ink font-sans;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, h4 {
+    @apply font-serif;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-paper border border-edge rounded-md p-5;
+  }
+  .pill {
+    @apply inline-block text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded;
+  }
+  .pill-ok   { @apply bg-green-100 text-green-800; }
+  .pill-fail { @apply bg-red-100 text-red-800; }
+  .pill-warn { @apply bg-amber-100 text-amber-800; }
+  .pill-off  { @apply bg-stone-200 text-stone-600; }
+  .label {
+    @apply text-[10px] uppercase tracking-wider text-dim font-semibold;
+  }
+}

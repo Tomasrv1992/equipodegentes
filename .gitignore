@@ -31,6 +31,7 @@ npm-debug.log*
 # Claude / editor local
 .claude/*
 !.claude/commands/
+.superpowers/
 
 # Temp
 tmp/

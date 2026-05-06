@@ -29,9 +29,15 @@ export default function Layout({ children }: { children: ReactNode }) {
               Feed
             </NavLink>
           </nav>
+          <Link
+            to="/nuevo-cliente"
+            className="ml-auto bg-ink text-paper px-3 py-1.5 rounded text-[10px] uppercase tracking-wider font-semibold hover:bg-accent transition-colors"
+          >
+            + Nuevo cliente
+          </Link>
           <button
             onClick={() => signOut()}
-            className="ml-auto text-xs text-muted hover:text-ink"
+            className="text-xs text-muted hover:text-ink"
           >
             Salir
           </button>

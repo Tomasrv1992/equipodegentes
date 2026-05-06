@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "../lib/supabase";
 import { useAgentes } from "../lib/queries";
 import Pill from "./Pill";
@@ -40,6 +40,18 @@ function useClienteBySlug(slug: string) {
 export default function ClienteFicha({ slug }: { slug: string }) {
   const { data, isLoading } = useClienteBySlug(slug);
   const { data: agentes } = useAgentes();
+  const qc = useQueryClient();
+  const togglePausa = useMutation({
+    mutationFn: async (vars: { agenteId: string; activo: boolean }) => {
+      const { error } = await supabase
+        .from("client_agents")
+        .update({ activo: vars.activo })
+        .eq("cliente_id", data!.cliente.id)
+        .eq("agente_id", vars.agenteId);
+      if (error) throw error;
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cliente", slug] }),
+  });
 
   if (isLoading || !data || !agentes) return <p className="text-muted">Cargando…</p>;
   const { cliente, activaciones, runs } = data;
@@ -78,6 +90,13 @@ export default function ClienteFicha({ slug }: { slug: string }) {
                   ) : (
                     <span className="text-xs text-muted">sin runs</span>
                   )}
+                  <button
+                    onClick={() => togglePausa.mutate({ agenteId: act.agente_id, activo: !act.activo })}
+                    className="text-xs text-muted hover:text-fail"
+                    disabled={togglePausa.isPending}
+                  >
+                    {act.activo ? "Pausar" : "Reactivar"}
+                  </button>
                 </li>
               );
             })}

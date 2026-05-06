@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { useClientes, useAgentes, useLatestRuns, useClientAgents } from "../lib/queries";
 import {
   totalProcesadas,
@@ -7,11 +8,13 @@ import {
   totalErrores,
   tiempoAhorradoHoras,
   formatHoras,
+  aggByMonth,
 } from "../lib/metrics";
 import Hero from "./Hero";
 import Kpis from "./Kpis";
 import ClientCard from "./ClientCard";
 import EmptyState from "./EmptyState";
+import MonthlyBars from "./MonthlyBars";
 
 export default function Matriz() {
   const { data: clientes, isLoading: lc } = useClientes();
@@ -36,9 +39,12 @@ export default function Matriz() {
 
   // KPIs globales
   const facturasMes = totalProcesadas(runsThisMonth(runs));
+  const facturasAllTime = totalProcesadas(runs);
   const horasAhorradasMes = tiempoAhorradoHoras(facturasMes);
+  const horasAhorradasAllTime = tiempoAhorradoHoras(facturasAllTime);
   const runsHoyN = runsToday(runs).length;
   const errores7d = totalErrores(runsLastDays(runs, 7));
+  const monthlyAggGlobal = aggByMonth(runs, 12);
   const lastFailRuns = runs
     .filter((r) => r.status === "fail")
     .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime());
@@ -116,13 +122,82 @@ export default function Matriz() {
             meta: facturasMes > 0 ? <>≈ {formatHoras(horasAhorradasMes)} ahorradas</> : "—",
           },
           {
-            label: "Tiempo ahorrado",
-            value: formatHoras(horasAhorradasMes).replace("h", ""),
-            unit: formatHoras(horasAhorradasMes).endsWith("h") ? "h" : "min",
-            meta: "≈ 24 min · factura",
+            label: "All-time",
+            value: facturasAllTime,
+            unit: "facturas",
+            meta: facturasAllTime > 0 ? <>≈ {formatHoras(horasAhorradasAllTime)} ahorradas</> : "desde que arrancó Operatto",
           },
         ]}
       />
+
+      {/* Histórico mensual global (todos los clientes, todos los agentes) */}
+      <section className="card mb-9">
+        <div className="flex items-baseline justify-between mb-4">
+          <h2 className="section-title">Histórico · 12 meses</h2>
+          <span className="section-meta">
+            facturas procesadas · todos los clientes
+          </span>
+        </div>
+        <MonthlyBars data={monthlyAggGlobal} />
+      </section>
+
+      {/* KPIs por agente */}
+      {actsActivas.length > 0 && (
+        <section className="mb-9">
+          <div className="flex items-baseline justify-between mb-4">
+            <h2 className="section-title">Por agente</h2>
+            <span className="section-meta">
+              {agentesActivados} activo{agentesActivados === 1 ? "" : "s"}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {Array.from(new Set(actsActivas.map((a) => a.agente_id))).map((agenteId) => {
+              const a = agenteById[agenteId];
+              const runsAg = runs.filter((r) => r.agente_id === agenteId);
+              const proc = totalProcesadas(runsThisMonth(runsAg));
+              const horas = tiempoAhorradoHoras(proc);
+              const allTime = totalProcesadas(runsAg);
+              const clientesQ = new Set(
+                actsActivas.filter((act) => act.agente_id === agenteId).map((act) => act.cliente_id),
+              ).size;
+              return (
+                <Link
+                  key={agenteId}
+                  to={`/agente/${agenteId}`}
+                  className="card card-hover no-underline text-ink"
+                >
+                  <div className="flex items-center gap-2 mb-3">
+                    <span className="w-1.5 h-1.5 rounded-full bg-accent" />
+                    <span className="font-display text-base font-semibold tracking-tighter">
+                      {a?.nombre ?? agenteId}
+                    </span>
+                    <span className="ml-auto font-mono text-[10px] text-ink-3 tracking-[0.04em]">
+                      {clientesQ} cliente{clientesQ === 1 ? "" : "s"}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <KpiInline
+                      label="Mes"
+                      value={proc}
+                      unit="facts"
+                    />
+                    <KpiInline
+                      label="All-time"
+                      value={allTime}
+                      unit="facts"
+                    />
+                    <KpiInline
+                      label="Ahorrado mes"
+                      value={formatHoras(horas).replace(/[hm]/, "")}
+                      unit={formatHoras(horas).endsWith("h") ? "h" : "min"}
+                    />
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <div className="flex items-baseline justify-between mb-4">
         <h2 className="section-title">Clientes en operación</h2>
@@ -166,6 +241,26 @@ export default function Matriz() {
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+function KpiInline({ label, value, unit }: { label: string; value: number | string; unit?: string }) {
+  return (
+    <div>
+      <div className="font-mono text-[9px] uppercase tracking-[0.1em] text-ink-3 font-medium mb-0.5">
+        {label}
+      </div>
+      <div className="flex items-baseline gap-1">
+        <span className="font-display text-lg font-semibold tracking-tighter text-ink tabular-nums">
+          {value}
+        </span>
+        {unit && (
+          <span className="font-mono text-[9px] text-ink-3 tracking-[0.04em]">
+            {unit}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

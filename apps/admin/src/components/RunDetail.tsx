@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useRun, useClientes, useAgentes, useRunsByClienteAgente } from "../lib/queries";
 import { classifyError } from "../lib/classify-error";
+import { supabase } from "../lib/supabase";
 import Pill from "./Pill";
 
 export default function RunDetail({ runId }: { runId: string }) {
@@ -8,11 +10,40 @@ export default function RunDetail({ runId }: { runId: string }) {
   const { data: clientes } = useClientes();
   const { data: agentes } = useAgentes();
 
+  const [rerunStatus, setRerunStatus] = useState<"idle" | "dispatching" | "ok" | "fail">("idle");
+  const [rerunMsg, setRerunMsg] = useState("");
+
   if (isLoading || !run) return <p className="text-muted">Cargando run…</p>;
 
   const cliente = clientes?.find((c) => c.id === run.cliente_id);
   const agente  = agentes?.find((a) => a.id === run.agente_id);
   const errCls  = run.error_message ? classifyError(run.error_message) : null;
+
+  const runIdForRerun = run.id;
+  async function handleRerun() {
+    setRerunStatus("dispatching");
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("no session");
+
+      const resp = await fetch("/api/trigger-rerun", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ runId: runIdForRerun }),
+      });
+      if (!resp.ok) {
+        throw new Error(await resp.text());
+      }
+      setRerunStatus("ok");
+      setRerunMsg("Disparado. El nuevo run aparecerá en la matriz en ~30s.");
+    } catch (err: any) {
+      setRerunStatus("fail");
+      setRerunMsg(err.message ?? String(err));
+    }
+  }
 
   return (
     <div>
@@ -77,20 +108,33 @@ ${run.error_stack ?? ""}`}
         </section>
       </div>
 
-      <div className="mt-6 flex flex-wrap gap-2">
-        <button className="bg-accent text-paper px-4 py-2 rounded text-xs uppercase tracking-wider font-semibold">
-          Re-disparar run
+      <div className="mt-6 flex flex-wrap gap-2 items-center">
+        <button
+          onClick={handleRerun}
+          disabled={rerunStatus === "dispatching" || rerunStatus === "ok"}
+          className="bg-accent text-paper px-4 py-2 rounded text-xs uppercase tracking-wider font-semibold disabled:opacity-50"
+        >
+          {rerunStatus === "dispatching" ? "Disparando…" : rerunStatus === "ok" ? "Disparado ✓" : "Re-disparar run"}
         </button>
-        <button className="bg-ink text-paper px-4 py-2 rounded text-xs uppercase tracking-wider font-semibold">
+        <button className="bg-ink text-paper px-4 py-2 rounded text-xs uppercase tracking-wider font-semibold opacity-50 cursor-not-allowed" disabled>
           Pausar agente p/ este cliente
         </button>
-        <button className="border border-ink text-ink px-4 py-2 rounded text-xs uppercase tracking-wider font-semibold">
-          Ver logs Netlify
-        </button>
+        {run.netlify_log_url && (
+          <a
+            href={run.netlify_log_url}
+            target="_blank"
+            rel="noreferrer"
+            className="border border-ink text-ink px-4 py-2 rounded text-xs uppercase tracking-wider font-semibold"
+          >
+            Ver logs Netlify
+          </a>
+        )}
+        {rerunMsg && (
+          <span className={`text-xs ${rerunStatus === "fail" ? "text-fail" : "text-ok"}`}>
+            {rerunMsg}
+          </span>
+        )}
       </div>
-      <p className="text-[10px] text-muted mt-2">
-        (Acciones cableadas en Fase 3 — botones presentes pero no activos.)
-      </p>
     </div>
   );
 }

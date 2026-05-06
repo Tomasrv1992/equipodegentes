@@ -1,31 +1,139 @@
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&display=swap');
+/* === Fonts === */
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import url('https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600,700&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
   body {
     @apply bg-paper text-ink font-sans;
+    font-feature-settings: "ss01", "cv11";
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
+
+  /* Subtle grain overlay across the whole app */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.04 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    opacity: 0.5;
+  }
+
   h1, h2, h3, h4 {
-    @apply font-serif;
+    @apply font-display tracking-tighter;
+  }
+  h1 { font-weight: 500; }
+  h2 { font-weight: 500; }
+  h3 { font-weight: 600; }
+
+  code {
+    @apply font-mono text-[0.92em];
   }
 }
 
 @layer components {
-  .card {
-    @apply bg-paper border border-edge rounded-md p-5;
+  /* === Section heading === */
+  .section-title {
+    @apply font-display text-xl font-medium tracking-tighter text-ink;
   }
-  .pill {
-    @apply inline-block text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded;
+  .section-meta {
+    @apply font-mono text-[11px] text-ink-3;
+    letter-spacing: 0.05em;
   }
-  .pill-ok   { @apply bg-green-100 text-green-800; }
-  .pill-fail { @apply bg-red-100 text-red-800; }
-  .pill-warn { @apply bg-amber-100 text-amber-800; }
-  .pill-off  { @apply bg-stone-200 text-stone-600; }
+
+  /* === Labels (mono uppercase) === */
   .label {
-    @apply text-[10px] uppercase tracking-wider text-dim font-semibold;
+    @apply font-mono text-[10px] uppercase text-ink-3 font-medium block;
+    letter-spacing: 0.12em;
   }
+  .label-tight {
+    @apply font-mono text-[9px] uppercase text-ink-3 font-semibold;
+    letter-spacing: 0.15em;
+  }
+
+  /* === Buttons === */
+  .btn-primary {
+    @apply font-sans text-xs font-semibold bg-ink text-paper px-3.5 py-1.5 rounded-md
+           transition-all duration-150 ease-out-expo cursor-pointer
+           hover:bg-accent hover:-translate-y-px disabled:opacity-50 disabled:cursor-not-allowed;
+    letter-spacing: -0.005em;
+  }
+  .btn-accent {
+    @apply font-sans text-xs font-semibold bg-accent text-paper px-3.5 py-1.5 rounded-md
+           transition-all duration-150 ease-out-expo cursor-pointer
+           hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed;
+    letter-spacing: -0.005em;
+  }
+  .btn-ghost {
+    @apply font-sans text-xs font-medium text-ink-3 px-2.5 py-1.5 rounded-md
+           transition-colors hover:text-ink hover:bg-paper-sunken cursor-pointer;
+  }
+  .btn-outline {
+    @apply font-sans text-xs font-semibold text-ink border border-ink px-3.5 py-1.5 rounded-md
+           transition-colors hover:bg-ink hover:text-paper cursor-pointer;
+    letter-spacing: -0.005em;
+  }
+
+  /* === Status pills === */
+  .pill {
+    @apply inline-flex items-center gap-1.5 font-mono text-[10px] font-semibold uppercase
+           px-2 py-0.5 rounded;
+    letter-spacing: 0.06em;
+  }
+  .pill-ok    { @apply bg-ok-soft   text-ok; }
+  .pill-fail  { @apply bg-fail-soft text-fail; }
+  .pill-warn  { @apply bg-warn-soft text-warn; }
+  .pill-off   { @apply bg-paper-sunken text-ink-3; }
+
+  /* === Card === */
+  .card {
+    @apply bg-paper-2 border border-edge rounded-lg p-5;
+  }
+  .card-hover {
+    @apply transition-all duration-200 ease-out-expo;
+  }
+  .card-hover:hover {
+    border-color: oklch(0.78 0.022 80);
+    box-shadow: 0 4px 24px -4px oklch(0.18 0.012 60 / 0.08);
+  }
+
+  /* === Inputs === */
+  .input {
+    @apply w-full bg-paper border border-edge rounded-md px-3 py-2 text-sm font-sans
+           transition-colors focus:outline-none focus:border-ink-3
+           placeholder:text-ink-4;
+  }
+  .input-mono {
+    @apply font-mono text-xs;
+  }
+
+  /* === Terminal (logs / errores) === */
+  .terminal {
+    @apply bg-term-bg text-term-fg font-mono text-[11px] leading-relaxed
+           p-4 rounded-md overflow-auto;
+  }
+  .terminal-label { @apply text-term-accent font-semibold; }
+}
+
+@layer utilities {
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* App root above grain overlay */
+#root {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
 }

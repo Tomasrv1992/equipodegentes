@@ -4,17 +4,13 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "../lib/supabase";
 import { useAgentes } from "../lib/queries";
 import { slugify } from "../lib/slugify";
+import { enabledAgents, type FieldSpec } from "../lib/agent-config-schema";
 import type { Cliente } from "../types";
 
 interface ActivacionForm {
   agente_id: string;
   activo: boolean;
-  config: {
-    sheet_id: string;
-    drive_folder: string;
-    notify_email: string;
-    netlify_site: string;
-  };
+  config: Record<string, string>;
 }
 
 interface FormState {
@@ -25,17 +21,11 @@ interface FormState {
   activaciones: Record<string, ActivacionForm>;
 }
 
-const EMPTY_CONFIG = {
-  sheet_id: "",
-  drive_folder: "",
-  notify_email: "",
-  netlify_site: "",
-};
-
 export default function NuevoCliente() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const { data: agentes } = useAgentes();
+  const enabledSchemas = enabledAgents();
 
   const [form, setForm] = useState<FormState>({
     nombre: "",
@@ -45,22 +35,24 @@ export default function NuevoCliente() {
     activaciones: {},
   });
 
-  // Auto-actualizar slug desde nombre, hasta que el usuario lo edite manualmente
+  // Auto-slug desde nombre hasta que el user lo toque manualmente
   useEffect(() => {
     if (!form.slugTouched) {
       setForm((f) => ({ ...f, slug: slugify(f.nombre) }));
     }
   }, [form.nombre, form.slugTouched]);
 
-  // Inicializar activaciones cuando cargan los agentes
+  // Init activaciones cuando cargan los agentes
   useEffect(() => {
     if (agentes && Object.keys(form.activaciones).length === 0) {
       const init: Record<string, ActivacionForm> = {};
-      for (const a of agentes) {
-        init[a.id] = {
-          agente_id: a.id,
+      for (const schema of enabledSchemas) {
+        const config: Record<string, string> = {};
+        for (const f of schema.fields) config[f.key] = "";
+        init[schema.agente_id] = {
+          agente_id: schema.agente_id,
           activo: false,
-          config: { ...EMPTY_CONFIG },
+          config,
         };
       }
       setForm((f) => ({ ...f, activaciones: init }));
@@ -69,7 +61,6 @@ export default function NuevoCliente() {
 
   const crear = useMutation({
     mutationFn: async (): Promise<Cliente> => {
-      // 1. Insert cliente
       const { data: cliente, error: e1 } = await supabase
         .from("clientes")
         .insert({
@@ -82,7 +73,6 @@ export default function NuevoCliente() {
         .single();
       if (e1 || !cliente) throw new Error(e1?.message ?? "no cliente");
 
-      // 2. Insert client_agents para cada agente activado
       const activaciones = Object.values(form.activaciones).filter((a) => a.activo);
       if (activaciones.length > 0) {
         const rows = activaciones.map((a) => ({
@@ -94,98 +84,124 @@ export default function NuevoCliente() {
         const { error: e2 } = await supabase.from("client_agents").insert(rows);
         if (e2) throw new Error(e2.message);
       }
-
       return cliente as Cliente;
     },
     onSuccess: (cliente) => {
       qc.invalidateQueries({ queryKey: ["clientes"] });
+      qc.invalidateQueries({ queryKey: ["client-agents"] });
       qc.invalidateQueries({ queryKey: ["latest-runs"] });
       navigate(`/cliente/${cliente.slug}`);
     },
   });
 
   const canSubmit =
-    form.nombre.trim().length > 0 &&
-    form.slug.trim().length > 0 &&
-    !crear.isPending;
+    form.nombre.trim().length > 0 && form.slug.trim().length > 0 && !crear.isPending;
 
   return (
     <div className="max-w-3xl">
-      <div className="text-xs text-muted mb-2">
-        <Link to="/" className="text-accent">Panel</Link> · Nuevo cliente
+      {/* Breadcrumbs */}
+      <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase mb-3 flex items-center gap-1.5">
+        <Link to="/" className="hover:text-ink transition-colors">Operación</Link>
+        <span className="text-ink-4">/</span>
+        <span className="text-ink-2">Nuevo cliente</span>
       </div>
-      <h1 className="font-serif text-3xl mb-1">Nuevo cliente</h1>
-      <p className="text-xs text-dim mb-6">
-        Solo crea el registro en la base de datos. Las credenciales del agente
-        (Google OAuth, Drive, Sheet) van en env vars del sitio Netlify dedicado
-        del cliente — ver{" "}
-        <code className="text-ink">docs/MANUAL-AGREGAR-CLIENTE.md</code>.
-      </p>
+
+      {/* Header */}
+      <div className="border-b border-edge pb-7 mb-9">
+        <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-ink-3 font-medium mb-2">
+          Onboarding · proceso manual
+        </div>
+        <h1 className="font-display text-5xl font-medium tracking-tightest text-ink leading-none mb-4">
+          Nuevo cliente
+        </h1>
+        <p className="font-sans text-sm text-ink-3 max-w-[640px] leading-relaxed">
+          Solo crea el registro en la base de datos y activa los agentes que vas a correr.
+          Las credenciales (Google OAuth, Drive, Sheet) se configuran aparte en las env vars
+          del sitio Netlify dedicado del cliente — ver{" "}
+          <code className="text-ink">docs/MANUAL-AGREGAR-CLIENTE.md</code>.
+        </p>
+      </div>
 
       <form
         onSubmit={(e) => {
           e.preventDefault();
           if (canSubmit) crear.mutate();
         }}
-        className="space-y-5"
       >
-        <section className="card space-y-4">
-          <div>
-            <label className="label block mb-1">Nombre *</label>
+        {/* Datos del cliente */}
+        <section className="card mb-6 space-y-5">
+          <div className="flex items-baseline justify-between mb-1">
+            <h2 className="section-title">Datos del cliente</h2>
+            <span className="section-meta">requeridos: nombre, slug</span>
+          </div>
+
+          <Field
+            label="Nombre"
+            required
+            hint="Nombre comercial del cliente como aparece en facturas. Ej: 'Clínica San Lucas'."
+          >
             <input
               type="text"
               value={form.nombre}
               onChange={(e) => setForm({ ...form, nombre: e.target.value })}
-              className="w-full border border-edge rounded px-3 py-2 bg-white text-sm"
-              placeholder="Ej: Clínica San Lucas"
+              className="input"
+              placeholder="Clínica San Lucas"
               required
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="label block mb-1">Slug *</label>
+          <Field
+            label="Slug"
+            required
+            hint="Identificador URL-friendly. Auto-generado del nombre, editable. Aparece en la URL del cliente."
+          >
             <input
               type="text"
               value={form.slug}
-              onChange={(e) =>
-                setForm({ ...form, slug: e.target.value, slugTouched: true })
-              }
-              className="w-full border border-edge rounded px-3 py-2 bg-white text-sm font-mono"
+              onChange={(e) => setForm({ ...form, slug: e.target.value, slugTouched: true })}
+              className="input input-mono"
               placeholder="clinica-san-lucas"
               required
             />
-            <p className="text-[10px] text-muted mt-1">
-              Identificador URL-friendly. Auto-generado del nombre, editable.
-              Aparece en la URL del cliente (<code>/cliente/&lt;slug&gt;</code>).
-            </p>
-          </div>
+          </Field>
 
-          <div>
-            <label className="label block mb-1">Notas (opcional)</label>
+          <Field
+            label="Notas"
+            hint="Opcional. Contexto interno (ej: fecha onboarding, sitio Netlify del cron)."
+          >
             <textarea
               value={form.notas}
               onChange={(e) => setForm({ ...form, notas: e.target.value })}
-              className="w-full border border-edge rounded px-3 py-2 bg-white text-sm h-20"
-              placeholder="Ej: Onboarded 2026-05-06. Sitio Netlify: equipodegentes-cron-clinicaxyz."
+              className="input min-h-[80px] resize-y"
+              placeholder="Onboarded 2026-05-06. Sitio Netlify: equipodegentes-cron-clinicaxyz."
             />
-          </div>
+          </Field>
         </section>
 
-        <section className="card">
-          <div className="label mb-3">Agentes a activar</div>
-          {!agentes && (
-            <p className="text-xs text-muted">Cargando agentes…</p>
-          )}
-          {agentes &&
-            agentes.map((a) => {
-              const act = form.activaciones[a.id];
+        {/* Agentes */}
+        <section className="card mb-6">
+          <div className="flex items-baseline justify-between mb-3">
+            <h2 className="section-title">Agentes a activar</h2>
+            <span className="section-meta">
+              {enabledSchemas.length} disponible{enabledSchemas.length === 1 ? "" : "s"}
+            </span>
+          </div>
+
+          <div className="space-y-4">
+            {enabledSchemas.map((schema) => {
+              const a = agentes?.find((ag) => ag.id === schema.agente_id);
+              const act = form.activaciones[schema.agente_id];
               if (!act) return null;
               return (
                 <div
-                  key={a.id}
-                  className="border-b border-edge pb-3 mb-3 last:border-b-0 last:pb-0 last:mb-0"
+                  key={schema.agente_id}
+                  className={`border rounded-lg transition-all duration-150 ease-out-expo ${
+                    act.activo
+                      ? "border-edge bg-paper"
+                      : "border-edge-2 bg-paper-sunken/40"
+                  }`}
                 >
-                  <label className="flex items-center gap-2 cursor-pointer mb-2">
+                  <label className="flex items-center gap-3 p-4 cursor-pointer">
                     <input
                       type="checkbox"
                       checked={act.activo}
@@ -194,72 +210,61 @@ export default function NuevoCliente() {
                           ...form,
                           activaciones: {
                             ...form.activaciones,
-                            [a.id]: { ...act, activo: e.target.checked },
+                            [schema.agente_id]: { ...act, activo: e.target.checked },
                           },
                         })
                       }
+                      className="w-4 h-4 accent-accent"
                     />
-                    <span className="font-semibold">{a.nombre}</span>
-                    {a.descripcion && (
-                      <span className="text-xs text-muted">— {a.descripcion}</span>
-                    )}
+                    <div className="flex-1">
+                      <div className="font-display text-base font-semibold tracking-tighter text-ink flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-accent" />
+                        {a?.nombre ?? schema.agente_id}
+                      </div>
+                      {a?.descripcion && (
+                        <div className="font-sans text-xs text-ink-3 mt-1">
+                          {a.descripcion}
+                        </div>
+                      )}
+                    </div>
                   </label>
 
-                  {act.activo && (
-                    <div className="ml-6 grid grid-cols-2 gap-3 mt-2">
-                      <ConfigField
-                        label="Sheet ID (Google Sheets)"
-                        value={act.config.sheet_id}
-                        onChange={(v) =>
-                          updateConfig(form, setForm, a.id, "sheet_id", v)
-                        }
-                        placeholder="1aB2cD..."
-                      />
-                      <ConfigField
-                        label="Drive folder ID"
-                        value={act.config.drive_folder}
-                        onChange={(v) =>
-                          updateConfig(form, setForm, a.id, "drive_folder", v)
-                        }
-                        placeholder="1xY2zA..."
-                      />
-                      <ConfigField
-                        label="Email destino del resumen"
-                        value={act.config.notify_email}
-                        onChange={(v) =>
-                          updateConfig(form, setForm, a.id, "notify_email", v)
-                        }
-                        placeholder="cliente@empresa.co"
-                        type="email"
-                      />
-                      <ConfigField
-                        label="Sitio Netlify del cron"
-                        value={act.config.netlify_site}
-                        onChange={(v) =>
-                          updateConfig(form, setForm, a.id, "netlify_site", v)
-                        }
-                        placeholder="equipodegentes-cron-cliente"
-                      />
+                  {act.activo && schema.fields.length > 0 && (
+                    <div className="px-4 pb-4 pt-1 grid grid-cols-2 gap-x-4 gap-y-4 border-t border-edge-2">
+                      {schema.fields.map((f) => (
+                        <DynamicField
+                          key={f.key}
+                          spec={f}
+                          value={act.config[f.key] ?? ""}
+                          onChange={(v) =>
+                            updateConfig(form, setForm, schema.agente_id, f.key, v)
+                          }
+                        />
+                      ))}
                     </div>
                   )}
                 </div>
               );
             })}
+
+            {enabledSchemas.length === 0 && (
+              <p className="text-ink-3 text-sm">
+                Ningún agente disponible para activar todavía.
+              </p>
+            )}
+          </div>
         </section>
 
+        {/* Acciones */}
         <div className="flex items-center gap-3">
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="bg-accent text-paper px-5 py-2 rounded text-xs uppercase tracking-wider font-semibold disabled:opacity-50"
-          >
+          <button type="submit" disabled={!canSubmit} className="btn-accent">
             {crear.isPending ? "Creando…" : "Crear cliente"}
           </button>
-          <Link to="/" className="text-xs text-muted hover:text-ink">
+          <Link to="/" className="btn-ghost">
             Cancelar
           </Link>
           {crear.isError && (
-            <span className="text-xs text-fail">
+            <span className="font-mono text-[11px] text-fail tracking-[0.04em]">
               Error: {(crear.error as Error)?.message ?? "desconocido"}
             </span>
           )}
@@ -269,29 +274,58 @@ export default function NuevoCliente() {
   );
 }
 
-function ConfigField({
+function Field({
   label,
-  value,
-  onChange,
-  placeholder,
-  type = "text",
+  hint,
+  required,
+  children,
 }: {
   label: string;
-  value: string;
-  onChange: (v: string) => void;
-  placeholder?: string;
-  type?: string;
+  hint?: string;
+  required?: boolean;
+  children: React.ReactNode;
 }) {
   return (
     <div>
-      <label className="label block mb-1">{label}</label>
+      <span className="label mb-1.5">
+        {label} {required && <span className="text-accent">*</span>}
+      </span>
+      {children}
+      {hint && (
+        <p className="font-mono text-[10px] text-ink-3 mt-1.5 tracking-[0.04em] leading-relaxed">
+          {hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DynamicField({
+  spec,
+  value,
+  onChange,
+}: {
+  spec: FieldSpec;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div>
+      <span className="label-tight mb-1 block">
+        {spec.label} {spec.required && <span className="text-accent">*</span>}
+      </span>
       <input
-        type={type}
+        type={spec.type ?? "text"}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="w-full border border-edge rounded px-2 py-1 bg-white text-xs font-mono"
+        className="input input-mono"
+        placeholder={spec.placeholder}
       />
+      {spec.hint && (
+        <p className="font-mono text-[10px] text-ink-3 mt-1 tracking-[0.04em] leading-relaxed">
+          {spec.hint}
+        </p>
+      )}
     </div>
   );
 }
@@ -300,7 +334,7 @@ function updateConfig(
   form: FormState,
   setForm: (f: FormState) => void,
   agenteId: string,
-  field: keyof ActivacionForm["config"],
+  field: string,
   value: string,
 ) {
   const act = form.activaciones[agenteId];

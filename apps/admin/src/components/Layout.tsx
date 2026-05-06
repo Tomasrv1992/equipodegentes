@@ -1,49 +1,62 @@
 import { type ReactNode } from "react";
 import { Link, NavLink } from "react-router-dom";
 import { signOut } from "../lib/auth";
+import { ALLOWED_EMAIL } from "../lib/supabase";
 
 export default function Layout({ children }: { children: ReactNode }) {
   return (
     <div className="min-h-screen bg-paper text-ink">
-      <header className="border-b border-edge bg-paperalt">
-        <div className="max-w-7xl mx-auto px-6 py-3 flex items-center gap-6">
-          <Link to="/" className="font-serif text-lg font-semibold">
-            Equipo de Agentes
+      <header className="relative z-10 border-b border-edge bg-paper-2">
+        <div className="max-w-[1240px] mx-auto px-8 py-3.5 flex items-center gap-8">
+          <Link
+            to="/"
+            className="flex items-center gap-2 font-display text-base font-semibold tracking-tighter text-ink hover:text-accent transition-colors"
+          >
+            <span className="w-2 h-2 rounded-full bg-accent" />
+            Operatto
           </Link>
-          <nav className="flex gap-4 text-sm">
-            <NavLink
-              to="/"
-              end
-              className={({ isActive }) =>
-                isActive ? "text-accent font-semibold" : "text-dim hover:text-ink"
-              }
-            >
-              Matriz
+
+          <nav className="flex gap-1">
+            <NavLink to="/" end className={navClass}>
+              Operación
             </NavLink>
-            <NavLink
-              to="/feed"
-              className={({ isActive }) =>
-                isActive ? "text-accent font-semibold" : "text-dim hover:text-ink"
-              }
-            >
+            <NavLink to="/feed" className={navClass}>
               Feed
             </NavLink>
           </nav>
-          <Link
-            to="/nuevo-cliente"
-            className="ml-auto bg-ink text-paper px-3 py-1.5 rounded text-[10px] uppercase tracking-wider font-semibold hover:bg-accent transition-colors"
-          >
-            + Nuevo cliente
-          </Link>
-          <button
-            onClick={() => signOut()}
-            className="text-xs text-muted hover:text-ink"
-          >
-            Salir
-          </button>
+
+          <div className="ml-auto flex items-center gap-3">
+            <Link to="/nuevo-cliente" className="btn-primary">
+              + Nuevo cliente
+            </Link>
+            <button
+              onClick={() => signOut()}
+              className="font-mono text-[11px] text-ink-3 hover:text-ink transition-colors"
+              title={ALLOWED_EMAIL}
+            >
+              {shortEmail(ALLOWED_EMAIL)}
+            </button>
+          </div>
         </div>
       </header>
-      <main className="max-w-7xl mx-auto px-6 py-6">{children}</main>
+
+      <main className="relative z-10 max-w-[1240px] mx-auto px-8 py-12">
+        {children}
+      </main>
     </div>
   );
+}
+
+function navClass({ isActive }: { isActive: boolean }) {
+  const base =
+    "font-sans text-[13px] font-medium px-2.5 py-1.5 rounded-md transition-all duration-150 ease-out-expo";
+  if (isActive) {
+    return `${base} text-ink bg-paper-sunken`;
+  }
+  return `${base} text-ink-3 hover:text-ink hover:bg-paper-sunken`;
+}
+
+function shortEmail(email: string): string {
+  const [user] = email.split("@");
+  return `${user}@`;
 }

@@ -1,6 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "./supabase";
-import type { Cliente, Agente, AgentRun } from "../types";
+import type { Cliente, Agente, AgentRun, ClientAgent } from "../types";
+
+export function useClientAgents() {
+  return useQuery({
+    queryKey: ["client-agents"],
+    queryFn: async (): Promise<ClientAgent[]> => {
+      const { data, error } = await supabase
+        .from("client_agents")
+        .select("*");
+      if (error) throw error;
+      return data as ClientAgent[];
+    },
+  });
+}
 
 export function useClientes() {
   return useQuery({

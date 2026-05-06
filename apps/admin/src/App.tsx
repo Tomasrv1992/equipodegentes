@@ -5,6 +5,7 @@ import Home from "./routes/home";
 import FeedRoute from "./routes/feed";
 import RunRoute from "./routes/run";
 import ClienteRoute from "./routes/cliente";
+import AgenteRoute from "./routes/agente";
 
 function Placeholder({ name }: { name: string }) {
   return <h2 className="font-serif text-2xl">{name}</h2>;
@@ -19,7 +20,7 @@ export default function App() {
           <Route path="/feed" element={<FeedRoute />} />
           <Route path="/run/:id" element={<RunRoute />} />
           <Route path="/cliente/:slug" element={<ClienteRoute />} />
-          <Route path="/agente/:id" element={<Placeholder name="Agente" />} />
+          <Route path="/agente/:id" element={<AgenteRoute />} />
           <Route path="*" element={<Placeholder name="404" />} />
         </Routes>
       </Layout>

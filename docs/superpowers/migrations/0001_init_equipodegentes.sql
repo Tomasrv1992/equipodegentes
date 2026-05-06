@@ -1,11 +1,11 @@
 -- 0001_init_equipodegentes.sql
--- Crea todas las tablas del panel admin en el schema equipodegentes.
--- Asume que el schema ya existe (ver pre-tarea P1 del plan):
---   create schema if not exists equipodegentes;
+-- Crea las tablas del panel admin en el proyecto Supabase DEDICADO de equipodegentes.
+-- (Proyecto independiente, separado de consultoria-app — no se usa schema custom,
+-- todo vive en `public` del proyecto nuevo.)
 
 -- ===== Tablas =====
 
-create table equipodegentes.clientes (
+create table public.clientes (
   id uuid primary key default gen_random_uuid(),
   nombre text not null,
   slug text unique not null,
@@ -14,7 +14,7 @@ create table equipodegentes.clientes (
   created_at timestamptz not null default now()
 );
 
-create table equipodegentes.agentes (
+create table public.agentes (
   id text primary key,
   nombre text not null,
   descripcion text,
@@ -22,19 +22,19 @@ create table equipodegentes.agentes (
   activo boolean not null default true
 );
 
-create table equipodegentes.client_agents (
-  cliente_id uuid references equipodegentes.clientes(id) on delete cascade,
-  agente_id text references equipodegentes.agentes(id) on delete cascade,
+create table public.client_agents (
+  cliente_id uuid references public.clientes(id) on delete cascade,
+  agente_id text references public.agentes(id) on delete cascade,
   activo boolean not null default true,
   config jsonb not null default '{}',
   activated_at timestamptz not null default now(),
   primary key (cliente_id, agente_id)
 );
 
-create table equipodegentes.agent_runs (
+create table public.agent_runs (
   id uuid primary key default gen_random_uuid(),
-  cliente_id uuid not null references equipodegentes.clientes(id),
-  agente_id text not null references equipodegentes.agentes(id),
+  cliente_id uuid not null references public.clientes(id),
+  agente_id text not null references public.agentes(id),
   status text not null check (status in ('running','ok','fail','warn')),
   started_at timestamptz not null default now(),
   finished_at timestamptz,
@@ -48,51 +48,51 @@ create table equipodegentes.agent_runs (
 );
 
 create index agent_runs_started_at_idx
-  on equipodegentes.agent_runs (started_at desc);
+  on public.agent_runs (started_at desc);
 create index agent_runs_cliente_agente_started_idx
-  on equipodegentes.agent_runs (cliente_id, agente_id, started_at desc);
+  on public.agent_runs (cliente_id, agente_id, started_at desc);
 create index agent_runs_problem_idx
-  on equipodegentes.agent_runs (status)
+  on public.agent_runs (status)
   where status in ('fail','warn');
 
-create table equipodegentes.agent_events (
+create table public.agent_events (
   id uuid primary key default gen_random_uuid(),
-  run_id uuid not null references equipodegentes.agent_runs(id) on delete cascade,
-  cliente_id uuid not null references equipodegentes.clientes(id),
-  agente_id text not null references equipodegentes.agentes(id),
+  run_id uuid not null references public.agent_runs(id) on delete cascade,
+  cliente_id uuid not null references public.clientes(id),
+  agente_id text not null references public.agentes(id),
   tipo text not null,
   payload jsonb not null default '{}',
   created_at timestamptz not null default now()
 );
 
-create index agent_events_run_idx on equipodegentes.agent_events (run_id);
+create index agent_events_run_idx on public.agent_events (run_id);
 create index agent_events_cliente_agente_idx
-  on equipodegentes.agent_events (cliente_id, agente_id, created_at desc);
+  on public.agent_events (cliente_id, agente_id, created_at desc);
 
 -- ===== RLS =====
 
-alter table equipodegentes.clientes        enable row level security;
-alter table equipodegentes.agentes         enable row level security;
-alter table equipodegentes.client_agents   enable row level security;
-alter table equipodegentes.agent_runs      enable row level security;
-alter table equipodegentes.agent_events    enable row level security;
+alter table public.clientes        enable row level security;
+alter table public.agentes         enable row level security;
+alter table public.client_agents   enable row level security;
+alter table public.agent_runs      enable row level security;
+alter table public.agent_events    enable row level security;
 
 -- Policy única: solo el email whitelisted puede leer/escribir.
 -- Service role key (que usan los agentes desde Netlify) bypassea RLS.
-create policy "tomas_only" on equipodegentes.clientes
+create policy "tomas_only" on public.clientes
   for all using ((auth.jwt() ->> 'email') = 'tomasramirezvilla@gmail.com');
-create policy "tomas_only" on equipodegentes.agentes
+create policy "tomas_only" on public.agentes
   for all using ((auth.jwt() ->> 'email') = 'tomasramirezvilla@gmail.com');
-create policy "tomas_only" on equipodegentes.client_agents
+create policy "tomas_only" on public.client_agents
   for all using ((auth.jwt() ->> 'email') = 'tomasramirezvilla@gmail.com');
-create policy "tomas_only" on equipodegentes.agent_runs
+create policy "tomas_only" on public.agent_runs
   for all using ((auth.jwt() ->> 'email') = 'tomasramirezvilla@gmail.com');
-create policy "tomas_only" on equipodegentes.agent_events
+create policy "tomas_only" on public.agent_events
   for all using ((auth.jwt() ->> 'email') = 'tomasramirezvilla@gmail.com');
 
 -- ===== Seed de catálogo =====
 
-insert into equipodegentes.agentes (id, nombre, descripcion, cron_default, activo) values
+insert into public.agentes (id, nombre, descripcion, cron_default, activo) values
   ('facturacion', 'Equipo-facturación',
    'Pipeline DIAN: Gmail → Drive → Sheets',
    '0 12 * * *', true),
@@ -101,10 +101,10 @@ insert into equipodegentes.agentes (id, nombre, descripcion, cron_default, activ
    null, true);
 
 -- Seed de clientes mínimo (los reemplazas con UPDATE después).
-insert into equipodegentes.clientes (nombre, slug) values
+insert into public.clientes (nombre, slug) values
   ('Owner (Tomás)', 'owner');
 
 -- Activamos facturación para el owner (caso single-tenant actual).
-insert into equipodegentes.client_agents (cliente_id, agente_id, config)
+insert into public.client_agents (cliente_id, agente_id, config)
 select c.id, 'facturacion', '{"sheet_id":"placeholder","drive_folder":"placeholder"}'::jsonb
-from equipodegentes.clientes c where c.slug = 'owner';
+from public.clientes c where c.slug = 'owner';

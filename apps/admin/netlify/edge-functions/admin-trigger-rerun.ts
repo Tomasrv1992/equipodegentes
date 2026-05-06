@@ -37,7 +37,6 @@ export default async (request: Request, _context: Context) => {
       headers: {
         apikey: serviceKey,
         Authorization: `Bearer ${serviceKey}`,
-        "Accept-Profile": "equipodegentes",
       },
     }
   );
@@ -52,7 +51,6 @@ export default async (request: Request, _context: Context) => {
       headers: {
         apikey: serviceKey,
         Authorization: `Bearer ${serviceKey}`,
-        "Accept-Profile": "equipodegentes",
       },
     }
   );

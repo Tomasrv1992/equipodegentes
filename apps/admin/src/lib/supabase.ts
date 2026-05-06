@@ -12,7 +12,6 @@ export const supabase = createClient(url, anonKey, {
     autoRefreshToken: true,
     detectSessionInUrl: true,
   },
-  db: { schema: "equipodegentes" },
 });
 
 export const ALLOWED_EMAIL =

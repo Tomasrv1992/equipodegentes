@@ -941,9 +941,13 @@ async function processOne(
   const planillas = findPlanillaPdfs(msg.payload);
 
   // Sub-pipeline planillas: si NO hay ZIPs pero SÍ hay autoliquidaciones/comprobantes,
-  // tratar como planilla seguridad social (organizar en Drive + label, sin Sheet).
+  // tratar como planilla seguridad social. Va al folder del mes con fila en Sheet
+  // (categoría "Seguridad Social", total=0 — Tomás edita manual).
   if (zips.length === 0 && planillas.length > 0) {
-    return await processPlanilla(messageId, labelId, gmail, drive, g, planillas, subject);
+    return await processPlanilla(
+      messageId, labelId, gmail, drive, sheets, g, planillas, subject, msg,
+      loadSheetRows, pushToCache,
+    );
   }
 
   if (zips.length === 0) return { skip: true, reason: "sin-zip", subject };
@@ -1040,51 +1044,119 @@ async function processOne(
 
 /**
  * Sub-pipeline planillas seguridad social (PILA Colombia).
- * Sube los PDFs (autoliquidaciones + comprobantes) a la carpeta `Seguridad Social/`
- * dentro del folder principal de facturas, etiqueta el correo y archiva.
  *
- * NO inserta fila en el Sheet (fase 2 cuando definamos cómo extraer monto del PDF).
- * Mantiene los nombres originales del adjunto — Tomás puede renombrar manualmente
- * para asignar el mes correspondiente (1-12).
+ * Refactor 2026-05-07: las planillas ya NO van a una subcarpeta `Seguridad Social/`,
+ * sino al folder del mes regular (`YYYY-MM/`) e insertan UNA fila en el Sheet con
+ * categoría "Seguridad Social" y total=0 (Tomás edita manual el monto).
+ *
+ * Razón: que cliente vea TODOS los gastos del mes en un solo lugar (Drive + Sheet),
+ * no en silos separados. Más simple para conciliar.
+ *
+ * Sin OCR del PDF — el monto queda 0 hasta que Tomás lo edite. Los archivos
+ * conservan el nombre `{N}. Planilla Seguridad Social.pdf` (autoliquidación) y
+ * `{N}.1. Planilla Seguridad Social.pdf` (comprobante) para que se vea ordenado
+ * en Drive.
  */
 async function processPlanilla(
   messageId: string,
   labelProcesadoId: string,
   gmail: any,
   drive: any,
+  sheets: any,
   g: PipelineConfig["google"],
   planillas: Array<{ filename: string; attachmentId: string }>,
   subject: string,
+  msg: any,
+  loadSheetRows: (tabName: string) => Promise<any[][]>,
+  pushToCache: (tabName: string, row: any[]) => void,
 ): Promise<ProcessOneResult> {
   const tmpPaths: string[] = [];
   try {
-    const folderId = await getOrCreateNamedFolder(drive, g.driveFolderId, "Seguridad Social");
-    let uploaded = 0;
+    // 1. Fecha del email → year/month (las planillas no tienen XML con IssueDate,
+    //    así que usamos la fecha de recepción como aproximación).
+    const dateHeader = getHeader(msg, "Date") || new Date().toISOString();
+    const emailDate = new Date(dateHeader);
+    const year = emailDate.getFullYear();
+    const month = emailDate.getMonth() + 1;
+    const fechaIso = `${year}-${String(month).padStart(2, "0")}-${String(emailDate.getDate()).padStart(2, "0")}`;
+
+    // 2. Tab del mes + folder del mes
+    const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
+    const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+    const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
+
+    // 3. Calcular consecutivo
+    const sheetRows = await loadSheetRows(tabName);
+    let maxN = 0;
+    for (let i = 1; i < sheetRows.length; i++) {
+      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
+      if (!isNaN(v) && v > maxN) maxN = v;
+    }
+    const consecutivo = maxN + 1;
+
+    // 4. Proveedor: derivar del sender, o "Planilla Seguridad Social" como fallback
+    const sender = getHeader(msg, "From") || "";
+    let proveedor = "Planilla Seguridad Social";
+    const senderMatch = sender.match(/^"?([^"<]+?)"?\s*<?[^>]*>?$/);
+    if (senderMatch && senderMatch[1].trim() && !senderMatch[1].includes("@")) {
+      proveedor = senderMatch[1].trim();
+    }
+
+    // 5. N° planilla del filename (típicamente "Autoliquidaciones_84333812_..." → 84333812)
+    const numeroPlanilla = (() => {
+      for (const p of planillas) {
+        const m = p.filename.match(/(\d{6,})/);
+        if (m) return m[1];
+      }
+      return "";
+    })();
+
+    // 6. Subir PDFs al folder del mes con naming "{N}. Planilla SS" + sub-índices
+    const baseName = buildFileBaseName(consecutivo, proveedor);
+    let driveLink = "";
+    let n = 0;
     for (const p of planillas) {
       const tmpPath = await downloadAttachment(gmail, messageId, p.attachmentId, p.filename);
       tmpPaths.push(tmpPath);
       try {
-        await uploadFile(drive, tmpPath, folderId, p.filename);
-        uploaded++;
+        const fileName = n === 0
+          ? `${baseName}.pdf`
+          : `${buildFileBaseName(consecutivo, proveedor, n + 1)}.pdf`;
+        const uploaded = await uploadFile(drive, tmpPath, folderId, fileName);
+        if (n === 0) driveLink = uploaded.webViewLink || "";
+        n++;
       } catch (e: any) {
         console.warn(`processPlanilla: upload "${p.filename}" failed: ${e.message}`);
       }
     }
 
-    // Etiquetar el correo con "Procesado" + "Seguridad Social" + archivar
-    await markEmailProcessed(gmail, messageId, labelProcesadoId);
-    const ssLabelId = await getOrCreateLabel(gmail, "Seguridad Social");
-    await gmail.users.messages.modify({
-      userId: "me",
-      id: messageId,
-      requestBody: { addLabelIds: [ssLabelId], removeLabelIds: ["INBOX"] },
-    });
-
-    return {
-      skip: true, // contabilizamos como "saltado" porque no entra al Sheet en fase 1
-      reason: `planilla-seguridad-social: ${uploaded}/${planillas.length} PDFs subidos a Drive/Seguridad Social/`,
-      subject,
+    // 7. Construir ProcessedRow + insertar fila en el Sheet
+    const data: InvoiceData = {
+      fecha: fechaIso,
+      proveedor,
+      nit: "",
+      numero: numeroPlanilla,
+      cufe: "",
+      subtotal: 0,
+      iva: 0,
+      total: 0,
+      concepto: "Planilla Seguridad Social",
     };
+    const row: ProcessedRow = {
+      ...data,
+      driveLink,
+      subject,
+      categoria: "Seguridad Social",
+      cuentaPyg: "5202 - Seguridad social",
+    };
+    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
+    pushToCache(tabName, newRow);
+
+    // 8. Labels: Procesado + Facturas/YYYY-MM (mismo flujo que facturas DIAN)
+    await markEmailProcessed(gmail, messageId, labelProcesadoId);
+    await applyMonthLabel(gmail, messageId, year, month);
+
+    return { ok: true, ...row };
   } finally {
     cleanupTmp(tmpPaths);
   }

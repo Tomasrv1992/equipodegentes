@@ -389,19 +389,32 @@ function StepResources({
 function StepDone({ cliente }: { cliente: OnboardingInfo }) {
   return (
     <section className="card mt-10 text-center">
-      <div className="w-12 h-12 rounded-full bg-ok-soft text-ok flex items-center justify-center mx-auto mb-4 font-display text-2xl">
-        ✓
+      <div className="relative w-12 h-12 mx-auto mb-4">
+        <div className="absolute inset-0 rounded-full bg-accent/20 animate-ping" />
+        <div className="relative w-12 h-12 rounded-full bg-ok-soft text-ok flex items-center justify-center font-display text-2xl">
+          ✓
+        </div>
       </div>
       <h2 className="font-display text-3xl font-semibold tracking-tighter mb-2">
-        ¡Listo!
+        ¡Listo! Ya estamos procesando.
       </h2>
-      <p className="font-sans text-base text-ink-3 leading-relaxed mb-1 max-w-md mx-auto">
-        El agente de <strong>{cliente.agente_nombre}</strong> arranca mañana a las
-        7am Bogotá y empezará a procesar tus facturas.
+      <p className="font-sans text-base text-ink-3 leading-relaxed mb-3 max-w-md mx-auto">
+        El agente de <strong>{cliente.agente_nombre}</strong> arrancó ahora mismo.
+        Va a procesar todas tus facturas DIAN del año en curso (puede tardar
+        5–15 minutos según volumen).
       </p>
-      <p className="font-mono text-[11px] text-ink-3 tracking-[0.04em] mt-6">
-        Vas a recibir un email cuando se procesen las primeras facturas. Cualquier
-        cosa, escribime.
+      <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase mt-4 mb-2">
+        Lo que está pasando ahora
+      </div>
+      <ul className="font-sans text-sm text-ink-2 max-w-md mx-auto text-left space-y-1.5 mb-6">
+        <li>· Buscando facturas en tu Gmail desde 1° de enero</li>
+        <li>· Creando carpetas mensuales en tu Drive</li>
+        <li>· Llenando tu Sheet con cada factura categorizada</li>
+        <li>· Armando un Dashboard con métricas vivas</li>
+      </ul>
+      <p className="font-mono text-[11px] text-ink-3 tracking-[0.04em]">
+        Vas a recibir un email cuando termine. Después corre solo, todos los
+        días a las 7am Bogotá.
       </p>
     </section>
   );

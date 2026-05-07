@@ -1,0 +1,160 @@
+# Roadmap Operatto
+
+> Lista viva de pendientes técnicos y features. Se actualiza cada vez que descubrimos algo nuevo o priorizamos. Ordenado por urgencia + impacto.
+
+---
+
+## ✅ Hecho (Mayo 2026)
+
+- ✅ Panel admin Operatto con Hero + KPIs + ClientCards + Timeline 24h + Sparkline
+- ✅ Cron de facturación migrado a sitio dedicado (`equipodegentes-cron`) con escritura a Supabase
+- ✅ Sistema de runs con instrumentación end-to-end (recordRunStart/End)
+- ✅ Drill-down de runs con classify-error + acciones (re-disparar)
+- ✅ Cliente ficha con mini-KPIs + bar chart 6 meses
+- ✅ Agente ficha con KPIs cross-cliente + histórico 12 meses
+- ✅ Multi-tenant Fase 3: OAuth flow web del cliente + onboarding token + cron iterativo
+
+---
+
+## 🔴 Próximo (P0) — bloqueante para vender al primer cliente externo
+
+### 1. **Email mensual automático del resumen al cliente**
+
+**Por qué**: el cliente paga por el agente — necesita ver valor entregado cada mes.
+
+**Spec del email** (template Resend HTML):
+```
+Asunto: Resumen mensual Equipo de Facturación — {Mes Año}
+
+Hola {cliente.nombre},
+
+Acá el resumen del mes:
+
+- Facturas procesadas: {N}
+- Total registrado: ${monto_total formateado COP}
+- Top 3 proveedores: {A}, {B}, {C}
+- Categorías más usadas: {top_3_categorias}
+- Errores resueltos: {N}
+- Tiempo ahorrado estimado: {X horas} (≈ 24 min/factura)
+
+Link al dashboard: {client_credentials.sheet_id → URL del Sheet}
+
+Avisame si querés que ajustemos algo.
+```
+
+**Implementación**:
+- Nueva Netlify scheduled function `facturacion-monthly-report` que corre el día 1 de cada mes a las 9am
+- Itera sobre `client_credentials` activos del agente facturacion
+- Para cada uno:
+  1. Lee `agent_runs` + `agent_events` del mes anterior agrupado por cliente
+  2. Calcula: total facturas (sum payload.procesadas), monto (necesita parsear payload extendido), top proveedores (necesita guardar más detalle en agent_events)
+  3. Renderiza HTML del email
+  4. Envía via Resend a `client_credentials.notify_email`
+- Guardar log del envío como `agent_runs` con `agente_id='facturacion'` y `triggered_by='monthly_report'`
+
+**Pre-requisito de datos**: hoy `agent_runs.payload` solo tiene `{procesadas, errores, saltadas}`. Para el email rico necesitamos:
+- Que `pipeline.ts` devuelva en cada `ProcessedRow` los campos necesarios (proveedor, categoria, total) — ya los devuelve
+- Que el background fn los guarde como `agent_events` por cada factura procesada (uno por factura) o que extienda `payload` con array de procesadas
+
+**Estimado**: 1 sesión (~3-4h). Bloquea: que `pipeline.ts` cargue los detalles a `agent_events` o `payload` extendido.
+
+### 2. **Reglas de categorización por cliente**
+
+**Por qué**: hoy `agentes/Equipo-facturacion/lib/categorizacion-reglas.json` es UN archivo compartido. Cada cliente tiene su propio plan de cuentas (cliente clínica vs cliente retail tienen categorías totalmente distintas).
+
+**Spec**:
+- Agregar columna `categorization_rules` jsonb a `client_credentials`
+- En `pipeline.ts` `categorizar()`, primero consultar las reglas del cliente, fallback al archivo compartido como default
+- En el panel admin: pantalla "Reglas de categorización" en ficha del cliente — editor JSON con preview
+
+**Estimado**: 1 sesión (~3h)
+
+---
+
+## 🟠 Importante (P1) — robustez y experiencia
+
+### 3. **Onboarding link via email automático (no copy-paste manual)**
+
+Hoy: Tomás click "Crear link" → copia y manda por WhatsApp.
+Ideal: cliente recibe email automático con el link.
+
+**Implementación**:
+- Edge function `admin-create-onboarding` envía email via Resend al `cliente.email` (campo nuevo)
+- Template: "Hola {cliente}, soy Tomás de Operatto. Para activar tu agente de facturación, click acá: {link}"
+- En el form Nuevo cliente: campo `email` requerido para que el botón "Enviar onboarding" funcione
+
+**Estimado**: 1 sesión (~2h)
+
+### 4. **Dashboard de métricas de negocio**
+
+Hoy: panel ops (¿está corriendo?). Falta: dashboard "cuánto valor he generado".
+
+**Spec**:
+- Sección global "Operatto en cifras" en home: total facturas all-time, $$ procesado, horas ahorradas, # clientes activos
+- Por cliente: histórico de procesadas + tiempo ahorrado mes a mes
+- Exportar PDF mensual del cliente para la facturación de Operatto al cliente
+
+**Estimado**: 1 sesión (~3h)
+
+### 5. **Notificaciones a Tomás cuando algo falla**
+
+Hoy: si el cron de un cliente falla, Tomás se entera entrando al panel.
+Ideal: Slack/email a Tomás cuando un cliente entra en estado `fail` o `expired`.
+
+**Implementación**:
+- En `recordRunEnd` con status fail+ tener un mecanismo de webhook
+- O scheduled fn cada hora que mira `agent_runs` con status fail/warn de la última hora y manda alertas
+
+**Estimado**: medio día
+
+---
+
+## 🟡 Nice-to-have (P2) — pulido y escalabilidad
+
+### 6. **Verificación oficial Google Cloud**
+
+Hoy: Modo Testing limitado a 100 test users.
+Cuando: al llegar a 50+ clientes.
+
+**Trabajo**:
+- App review formal de Google (formulario + revisión de seguridad)
+- Privacy Policy URL pública
+- Domain verification
+- 2-6 semanas de espera
+
+### 7. **Multi-agente — Equipo-cartera production-ready**
+
+Hoy: cartera está en MVP local Python.
+Para producción multi-tenant: replicar el patrón de facturación (cron Netlify, Supabase, OAuth, etc).
+
+### 8. **Realtime updates en panel**
+
+Supabase Realtime → matriz se actualiza sola cuando el cron escribe.
+
+### 9. **Audit log de acciones**
+
+Tabla `audit_events` que registra: re-disparar, pausar agente, editar config, etc.
+
+### 10. **Historial extendido (>12 meses)**
+
+Hoy: `aggByMonth` muestra 12 meses. Para multi-año: vista "All-time" con datos agregados por año.
+
+### 11. **Backup automático de Sheets**
+
+Cada mes copiar el Sheet del cliente a un Drive de respaldo Operatto.
+
+---
+
+## 🔵 Decisiones diferidas
+
+- **Pricing y facturación de Operatto al cliente**: cómo cobramos? Mensual fijo? Por factura procesada? Decisión de negocio fuera de scope técnico.
+- **Branding cliente**: ¿el cliente ve "Operatto" en sus emails y panel, o whitelabel?
+- **App propia (mobile)**: hoy es web-only; ¿vale la pena nativa?
+
+---
+
+## 🟢 Operacional / housekeeping
+
+- Apagar cron viejo en `consultoria-ea` cuando confirmemos que el nuevo corre OK por 1 semana (Bloque E del [MIGRAR-CRON-A-EQUIPODEGENTES.md](MIGRAR-CRON-A-EQUIPODEGENTES.md))
+- Mergear `feat/admin-panel` a `main` cuando todo esté validado
+- Cambiar Production branch en Netlify de `feat/admin-panel` → `main`

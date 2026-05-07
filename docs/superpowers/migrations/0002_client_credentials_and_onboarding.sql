@@ -147,6 +147,8 @@ grant execute on function public.onboarding_token_lookup(text) to anon, authenti
 -- pasar la key en el SELECT/UPDATE plano. La key viaja como parámetro y
 -- queda dentro del plan de query (no se persiste).
 
+-- Nota: en Supabase, pgcrypto vive en el schema 'extensions'.
+-- search_path incluye 'extensions' para resolver pgp_sym_encrypt/decrypt sin prefix.
 create or replace function public.client_credentials_save_oauth(
   p_cliente_id uuid,
   p_agente_id text,
@@ -158,7 +160,7 @@ create or replace function public.client_credentials_save_oauth(
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
 begin
   insert into public.client_credentials (
@@ -169,7 +171,7 @@ begin
     last_oauth_refresh
   ) values (
     p_cliente_id, p_agente_id,
-    pgp_sym_encrypt(p_refresh_token, p_vault_key),
+    extensions.pgp_sym_encrypt(p_refresh_token, p_vault_key),
     'connected',
     p_google_email, p_scopes,
     now()
@@ -208,14 +210,14 @@ returns table (
 )
 language sql
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
   select
     cc.cliente_id,
     cc.agente_id,
     case
       when cc.google_refresh_token_encrypted is null then null
-      else pgp_sym_decrypt(cc.google_refresh_token_encrypted, p_vault_key)::text
+      else extensions.pgp_sym_decrypt(cc.google_refresh_token_encrypted, p_vault_key)::text
     end as google_refresh_token,
     cc.google_oauth_status,
     cc.google_email,

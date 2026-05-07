@@ -352,7 +352,10 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
   //   - Top 5 proveedores (cross-mes)
   //   - Top 5 categorías (cross-mes)
 
-  const monthChooseStr = MES_TABS.map((m) => `"${m}"`).join(",");
+  // OJO: Sheet locale es es_CO → separador de argumentos de funciones es `;`, no `,`.
+  // Los `,` solo se usan dentro del lenguaje QUERY (en el SQL string) que tiene su
+  // propia sintaxis SQL. Las funciones nativas (CHOOSE, TEXT, ROUND, SUM, etc) van con `;`.
+  const monthChooseStr = MES_TABS.map((m) => `"${m}"`).join(";");
   // Rangos consolidados de las 12 pestañas (para QUERY)
   const allMonthsRange = MES_TABS.map((m) => `'${m}'!A2:L`).join(";");
 
@@ -364,13 +367,13 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     // Row 3: header sección
     ["MES ACTUAL", "", "", "", "", ""],
     // Row 4: Mes
-    ["Mes", `=PROPER(TEXT(TODAY(),"mmmm yyyy"))`, "", "", "", ""],
+    ["Mes", `=PROPER(TEXT(TODAY();"mmmm yyyy"))`, "", "", "", ""],
     // Row 5: Facturas
-    ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY()),${monthChooseStr})&"!A2:A1000"))`, "", "", "", ""],
+    ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!A2:A1000"))`, "", "", "", ""],
     // Row 6: Monto
-    ["Monto total (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY()),${monthChooseStr})&"!H2:H1000"))`, "", "", "", ""],
+    ["Monto total (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!H2:H1000"))`, "", "", "", ""],
     // Row 7: Tiempo
-    ["Tiempo ahorrado", `=ROUND(B5*10/60,1)&" h (10 min/factura)"`, "", "", "", ""],
+    ["Tiempo ahorrado", `=ROUND(B5*10/60;1)&" h (10 min/factura)"`, "", "", "", ""],
     // Row 8: vacío
     ["", "", "", "", "", ""],
     // Row 9: header sección

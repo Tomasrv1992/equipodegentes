@@ -8,38 +8,33 @@
 --
 -- Asume que la migración 0001 (init) ya corrió y existen public.clientes /
 -- public.agentes / public.client_agents.
+--
+-- IDEMPOTENTE: se puede correr varias veces sin problema.
 
 -- ===== Extension pgcrypto =====
 -- Necesaria para pgp_sym_encrypt / pgp_sym_decrypt (cifrado simétrico de
--- refresh tokens). Supabase ya viene con pgcrypto disponible.
-create extension if not exists pgcrypto;
+-- refresh tokens). En Supabase pgcrypto vive en el schema 'extensions'.
+create extension if not exists pgcrypto with schema extensions;
 
 -- ===== Tabla: client_credentials =====
--- Una fila por (cliente, agente). Guarda el refresh_token de Google
--- encriptado + los recursos que el cliente eligió durante onboarding.
-
-create table public.client_credentials (
+create table if not exists public.client_credentials (
   cliente_id uuid not null references public.clientes(id) on delete cascade,
   agente_id text not null references public.agentes(id),
 
-  -- Google OAuth (refresh_token encriptado con pgcrypto + key en env var)
   google_refresh_token_encrypted bytea,
   google_oauth_status text not null default 'pending'
     check (google_oauth_status in ('pending', 'connected', 'expired', 'revoked')),
-  google_email text,                  -- email Google del cliente (info; no auth)
-  google_scopes text[],               -- scopes autorizados (para verificar)
+  google_email text,
+  google_scopes text[],
 
-  -- Recursos elegidos por el cliente durante onboarding
   drive_folder_id text,
-  drive_folder_name text,             -- ej "Facturas 2026"
+  drive_folder_name text,
   sheet_id text,
-  sheet_name text,                    -- nombre legible del Sheet
+  sheet_name text,
   sheet_tab text not null default 'Gastos 2026',
 
-  -- Notificaciones (a dónde llega el resumen diario)
   notify_email text,
 
-  -- Timestamps
   onboarded_at timestamptz,
   last_oauth_refresh timestamptz,
   created_at timestamptz not null default now(),
@@ -48,7 +43,7 @@ create table public.client_credentials (
   primary key (cliente_id, agente_id)
 );
 
-create index client_credentials_status_idx
+create index if not exists client_credentials_status_idx
   on public.client_credentials (google_oauth_status)
   where google_oauth_status in ('expired', 'revoked');
 
@@ -61,20 +56,17 @@ begin
 end;
 $$;
 
+drop trigger if exists client_credentials_touch_updated_at on public.client_credentials;
 create trigger client_credentials_touch_updated_at
   before update on public.client_credentials
   for each row execute function public.touch_updated_at();
 
 -- ===== Tabla: onboarding_tokens =====
--- Tokens únicos URL-safe que Tomás manda al cliente para que complete
--- el onboarding sin tener que loguear con Supabase.
-
-create table public.onboarding_tokens (
-  token text primary key,            -- 32 chars random URL-safe
+create table if not exists public.onboarding_tokens (
+  token text primary key,
   cliente_id uuid not null references public.clientes(id) on delete cascade,
   agente_id text not null references public.agentes(id),
 
-  -- Estado del flujo de onboarding
   step text not null default 'pending'
     check (step in ('pending', 'oauth_done', 'resources_done', 'completed', 'expired')),
 
@@ -82,23 +74,22 @@ create table public.onboarding_tokens (
   expires_at timestamptz not null default (now() + interval '7 days'),
   completed_at timestamptz,
 
-  -- Quién lo creó (Tomás siempre, pero queda registro)
   created_by text
 );
 
-create index onboarding_tokens_cliente_idx
+create index if not exists onboarding_tokens_cliente_idx
   on public.onboarding_tokens (cliente_id, agente_id);
 
-create index onboarding_tokens_expires_idx
+create index if not exists onboarding_tokens_expires_idx
   on public.onboarding_tokens (expires_at)
   where step != 'completed';
 
 -- ===== RLS =====
--- Lectura/escritura solo para Tomás. Service role bypassea (lo usan las
--- edge functions de OAuth callback y el cron).
-
 alter table public.client_credentials enable row level security;
 alter table public.onboarding_tokens  enable row level security;
+
+drop policy if exists "tomas_only" on public.client_credentials;
+drop policy if exists "tomas_only" on public.onboarding_tokens;
 
 create policy "tomas_only" on public.client_credentials
   for all using ((auth.jwt() ->> 'email') = 'tomasramirezvilla@gmail.com');
@@ -106,9 +97,6 @@ create policy "tomas_only" on public.onboarding_tokens
   for all using ((auth.jwt() ->> 'email') = 'tomasramirezvilla@gmail.com');
 
 -- ===== Helper RPC: validar token público (sin RLS) =====
--- Las edge functions del flujo de onboarding usan este RPC con anon key
--- para validar tokens sin exponer el resto de la tabla.
-
 create or replace function public.onboarding_token_lookup(p_token text)
 returns table (
   cliente_id uuid,
@@ -139,16 +127,11 @@ as $$
     and ot.step != 'completed';
 $$;
 
--- Permitir que el rol anon llame al RPC (sin exponer la tabla completa)
 grant execute on function public.onboarding_token_lookup(text) to anon, authenticated;
 
--- ===== RPCs internos: cifrado/descifrado de refresh_token =====
--- Encapsulan pgp_sym_encrypt/decrypt para que el código TS no tenga que
--- pasar la key en el SELECT/UPDATE plano. La key viaja como parámetro y
--- queda dentro del plan de query (no se persiste).
+-- ===== RPCs cifrado/descifrado refresh_token =====
+-- Usan extensions.pgp_sym_encrypt/decrypt (Supabase tiene pgcrypto en schema 'extensions')
 
--- Nota: en Supabase, pgcrypto vive en el schema 'extensions'.
--- search_path incluye 'extensions' para resolver pgp_sym_encrypt/decrypt sin prefix.
 create or replace function public.client_credentials_save_oauth(
   p_cliente_id uuid,
   p_agente_id text,
@@ -238,7 +221,5 @@ as $$
   limit 1;
 $$;
 
--- Estos RPCs solo los puede llamar service_role (el código TS server-side
--- los invoca con esa key). NO los exponemos a anon/authenticated.
 revoke execute on function public.client_credentials_save_oauth(uuid, text, text, text, text[], text) from public, anon, authenticated;
 revoke execute on function public.client_credentials_load(uuid, text, text) from public, anon, authenticated;

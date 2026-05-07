@@ -321,12 +321,23 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     });
   }
 
-  // 3. Crear pestaña Dashboard si no existe
+  // 3. SIEMPRE regenerar Dashboard (delete + recreate). Idempotente y permite que
+  //    futuros cambios al template (fórmulas, formato) se propaguen sin que el
+  //    cliente tenga que borrar la pestaña manualmente.
   const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
   const existingDashboard = meta.data.sheets?.find(
     (s: any) => s.properties?.title === DASHBOARD_TAB,
   );
-  if (existingDashboard) return;
+  if (existingDashboard) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [{
+          deleteSheet: { sheetId: existingDashboard.properties.sheetId },
+        }],
+      },
+    });
+  }
 
   // Crear Dashboard como PRIMERA pestaña (index: 0)
   const created = await sheets.spreadsheets.batchUpdate({
@@ -479,7 +490,8 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat(textFormat,backgroundColor)",
             },
           },
-          // Formato moneda COP en columnas Monto (B7 mes actual, C11:C23 histórico)
+          // Formato moneda COP — todas las celdas de monto del Dashboard
+          // B6 (mes actual monto), C11:C23 (histórico), C27:C31 (top proveedores), C34:C38 (top categorías)
           {
             repeatCell: {
               range: { sheetId: dashSheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 1, endColumnIndex: 2 },
@@ -494,19 +506,46 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat.numberFormat",
             },
           },
-          // Ancho columna A (labels): más ancho
+          // Top proveedores — col C (monto)
           {
-            updateDimensionProperties: {
-              range: { sheetId: dashSheetId, dimension: "COLUMNS", startIndex: 0, endIndex: 1 },
-              properties: { pixelSize: 250 },
-              fields: "pixelSize",
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 26, endRowIndex: 32, startColumnIndex: 2, endColumnIndex: 3 },
+              cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } } },
+              fields: "userEnteredFormat.numberFormat",
             },
           },
+          // Top categorías — col C (monto)
           {
-            updateDimensionProperties: {
-              range: { sheetId: dashSheetId, dimension: "COLUMNS", startIndex: 1, endIndex: 4 },
-              properties: { pixelSize: 160 },
-              fields: "pixelSize",
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 33, endRowIndex: 39, startColumnIndex: 2, endColumnIndex: 3 },
+              cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } } },
+              fields: "userEnteredFormat.numberFormat",
+            },
+          },
+          // Centrar columnas numéricas (B y C) en todas las secciones de data
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 3, endRowIndex: 39, startColumnIndex: 1, endColumnIndex: 3 },
+              cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } },
+              fields: "userEnteredFormat.horizontalAlignment",
+            },
+          },
+          // Bordes en todas las celdas con data (rows 3-38, cols A-C)
+          {
+            updateBorders: {
+              range: { sheetId: dashSheetId, startRowIndex: 2, endRowIndex: 39, startColumnIndex: 0, endColumnIndex: 3 },
+              top:    { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
+              bottom: { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
+              left:   { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
+              right:  { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
+              innerHorizontal: { style: "SOLID", width: 1, color: { red: 0.85, green: 0.85, blue: 0.88 } },
+              innerVertical:   { style: "SOLID", width: 1, color: { red: 0.85, green: 0.85, blue: 0.88 } },
+            },
+          },
+          // Auto-resize columnas A, B, C según contenido (no se corta el texto)
+          {
+            autoResizeDimensions: {
+              dimensions: { sheetId: dashSheetId, dimension: "COLUMNS", startIndex: 0, endIndex: 3 },
             },
           },
           // Altura row 1 (título)

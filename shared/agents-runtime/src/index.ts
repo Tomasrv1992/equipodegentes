@@ -3,6 +3,10 @@ export { slugify } from "./slugify";
 export { getServerClient } from "./supabase-server";
 export type { RecordRunStartInput, RecordRunEndInput } from "./record-run";
 
+// Agent events granulares (factura por factura, etc.)
+export { emitFacturaEvents, clienteIdBySlug } from "./agent-events";
+export type { FacturaEventPayload, EmitFacturaEventsInput } from "./agent-events";
+
 // Multi-tenant credentials (Fase 3)
 export {
   saveOAuthTokens,

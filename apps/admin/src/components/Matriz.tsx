@@ -1,13 +1,13 @@
 import { Link } from "react-router-dom";
-import { useClientes, useAgentes, useLatestRuns, useClientAgents } from "../lib/queries";
+import { useClientes, useAgentes, useLatestRuns, useClientAgents, useAllFacturas } from "../lib/queries";
 import {
-  totalProcesadas,
-  runsThisMonth,
   runsToday,
   runsLastDays,
   totalErrores,
   tiempoAhorradoHoras,
   formatHoras,
+  totalFacturas,
+  facturasThisMonth,
 } from "../lib/metrics";
 import Hero from "./Hero";
 import Kpis from "./Kpis";
@@ -19,15 +19,16 @@ export default function Matriz() {
   const { data: agentes, isLoading: la } = useAgentes();
   const { data: runs, isLoading: lr } = useLatestRuns();
   const { data: activaciones, isLoading: lac } = useClientAgents();
+  const { data: facturas, isLoading: lf } = useAllFacturas();
 
-  if (lc || la || lr || lac) {
+  if (lc || la || lr || lac || lf) {
     return (
       <div className="font-mono text-[11px] text-ink-3 tracking-[0.05em] uppercase">
         Cargando…
       </div>
     );
   }
-  if (!clientes || !agentes || !runs || !activaciones) return null;
+  if (!clientes || !agentes || !runs || !activaciones || !facturas) return null;
 
   const agenteById = Object.fromEntries(agentes.map((a) => [a.id, a]));
   const clienteById = Object.fromEntries(clientes.map((c) => [c.id, c]));
@@ -35,11 +36,12 @@ export default function Matriz() {
   // Solo activaciones activas
   const actsActivas = activaciones.filter((a) => a.activo);
 
-  // KPIs globales
-  const facturasMes = totalProcesadas(runsThisMonth(runs));
-  const facturasAllTime = totalProcesadas(runs);
+  // KPIs globales — usan agent_events (fuente de verdad por FECHA REAL)
+  const facturasMes = totalFacturas(facturasThisMonth(facturas));
+  const facturasAllTime = totalFacturas(facturas);
   const horasAhorradasMes = tiempoAhorradoHoras(facturasMes);
   const horasAhorradasAllTime = tiempoAhorradoHoras(facturasAllTime);
+  // Runs hoy / errores siguen usando agent_runs (info técnica del cron)
   const runsHoyN = runsToday(runs).length;
   const errores7d = totalErrores(runsLastDays(runs, 7));
   const lastFailRuns = runs
@@ -186,10 +188,11 @@ export default function Matriz() {
           <div className="grid grid-cols-2 gap-3">
             {Array.from(new Set(actsActivas.map((a) => a.agente_id))).map((agenteId) => {
               const a = agenteById[agenteId];
-              const runsAg = runs.filter((r) => r.agente_id === agenteId);
-              const proc = totalProcesadas(runsThisMonth(runsAg));
+              // Métricas por fecha REAL de la factura (agent_events)
+              const facturasAg = facturas.filter((ev) => ev.agente_id === agenteId);
+              const proc = totalFacturas(facturasThisMonth(facturasAg));
               const horas = tiempoAhorradoHoras(proc);
-              const allTime = totalProcesadas(runsAg);
+              const allTime = totalFacturas(facturasAg);
               const clientesQ = new Set(
                 actsActivas.filter((act) => act.agente_id === agenteId).map((act) => act.cliente_id),
               ).size;

@@ -17,6 +17,11 @@ import {
 } from "../../shared/agents-runtime/src/record-run";
 import { markOAuthStatus } from "../../shared/agents-runtime/src/credentials";
 import { getServerClient } from "../../shared/agents-runtime/src/supabase-server";
+import {
+  emitFacturaEvents,
+  clienteIdBySlug,
+  type FacturaEventPayload,
+} from "../../shared/agents-runtime/src/agent-events";
 
 interface RequestBody {
   /** Forward-compat para SaaS multi-tenant (Proyecto B). */
@@ -155,24 +160,48 @@ export default async (req: Request) => {
     }
   }
 
-  // Marcar first_run_done si era el primer run del cliente y terminó OK
-  if (body.customerId && result.errores.length === 0) {
+  // Marcar first_run_done + emitir agent_events (uno por factura procesada)
+  if (body.customerId) {
     try {
-      const supa = getServerClient();
-      const { data: cliente } = await supa
-        .from("clientes")
-        .select("id")
-        .eq("slug", body.customerId)
-        .single();
-      if (cliente) {
-        await supa.rpc("client_credentials_mark_first_run_done", {
-          p_cliente_id: (cliente as any).id,
-          p_agente_id: "facturacion",
-        });
-        console.log(`[backfill] cliente ${body.customerId} first_run_done=true`);
+      const clienteUuid = await clienteIdBySlug(body.customerId);
+      if (clienteUuid && runId) {
+        // 1. Emit agent_events granulares (1 por factura procesada con su fecha REAL)
+        if (result.procesadas.length > 0) {
+          const facturas: FacturaEventPayload[] = result.procesadas.map((p) => ({
+            fecha: p.fecha,           // YYYY-MM-DD de la factura, NO del run
+            proveedor: p.proveedor,
+            nit: p.nit,
+            numero: p.numero,
+            cufe: p.cufe,
+            subtotal: p.subtotal,
+            iva: p.iva,
+            total: p.total,
+            concepto: p.concepto,
+            categoria: p.categoria,
+            cuentaPyg: p.cuentaPyg,
+            driveLink: p.driveLink,
+          }));
+          await emitFacturaEvents({
+            runId,
+            clienteId: clienteUuid,
+            agenteId: "facturacion",
+            facturas,
+          });
+          console.log(`[events] cliente ${body.customerId}: ${facturas.length} facturas → agent_events`);
+        }
+
+        // 2. Marcar first_run_done si terminó sin errores
+        if (result.errores.length === 0) {
+          const supa = getServerClient();
+          await supa.rpc("client_credentials_mark_first_run_done", {
+            p_cliente_id: clienteUuid,
+            p_agente_id: "facturacion",
+          });
+          console.log(`[backfill] cliente ${body.customerId} first_run_done=true`);
+        }
       }
     } catch (e: any) {
-      console.error("mark first_run_done failed (no-fatal):", e.message);
+      console.error("post-run hooks failed (no-fatal):", e.message);
     }
   }
 

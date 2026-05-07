@@ -1,15 +1,15 @@
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "../lib/supabase";
-import { useClientes } from "../lib/queries";
+import { useClientes, useFacturasByAgente } from "../lib/queries";
 import {
-  totalProcesadas,
-  runsThisMonth,
   runsLastDays,
   totalErrores,
   tiempoAhorradoHoras,
   formatHoras,
-  aggByMonth,
+  totalFacturas,
+  facturasThisMonth,
+  aggFacturasByMonth,
 } from "../lib/metrics";
 import Pill from "./Pill";
 import Kpis from "./Kpis";
@@ -41,6 +41,7 @@ function useAgenteData(id: string) {
 export default function AgenteFicha({ id }: { id: string }) {
   const { data, isLoading } = useAgenteData(id);
   const { data: clientes } = useClientes();
+  const { data: facturas } = useFacturasByAgente(id);
 
   if (isLoading || !data || !clientes) {
     return (
@@ -52,12 +53,15 @@ export default function AgenteFicha({ id }: { id: string }) {
 
   const { agente, runs } = data;
   const clienteById = Object.fromEntries(clientes.map((c) => [c.id, c]));
+  const facturasArr = facturas ?? [];
 
-  const facturasMes = totalProcesadas(runsThisMonth(runs));
+  // Métricas por fecha REAL de la factura (agent_events)
+  const facturasMes = totalFacturas(facturasThisMonth(facturasArr));
   const horasMes = tiempoAhorradoHoras(facturasMes);
+  // Errores y clientes únicos siguen usando runs (info técnica)
   const errores7d = totalErrores(runsLastDays(runs, 7));
   const clientesUnicos = new Set(runs.map((r) => r.cliente_id)).size;
-  const monthlyAgg = aggByMonth(runs, 12);
+  const monthlyAgg = aggFacturasByMonth(facturasArr, 12);
 
   return (
     <div>

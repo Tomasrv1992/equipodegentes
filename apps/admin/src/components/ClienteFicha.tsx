@@ -2,15 +2,16 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "../lib/supabase";
-import { useAgentes } from "../lib/queries";
+import { useAgentes, useFacturasByCliente } from "../lib/queries";
 import {
-  totalProcesadas,
-  runsThisMonth,
   runsLastDays,
   tiempoAhorradoHoras,
   formatHoras,
-  aggByMonth,
   totalErrores,
+  totalFacturas,
+  facturasThisMonth,
+  facturasLastDays,
+  aggFacturasByMonth,
 } from "../lib/metrics";
 import Pill from "./Pill";
 import Sparkline from "./Sparkline";
@@ -85,6 +86,8 @@ function useClienteBySlug(slug: string) {
 export default function ClienteFicha({ slug }: { slug: string }) {
   const { data, isLoading } = useClienteBySlug(slug);
   const { data: agentes } = useAgentes();
+  const clienteId = data?.cliente.id ?? "";
+  const { data: facturas } = useFacturasByCliente(clienteId);
 
   if (isLoading || !data || !agentes) {
     return (
@@ -98,12 +101,14 @@ export default function ClienteFicha({ slug }: { slug: string }) {
   const agenteById = Object.fromEntries(agentes.map((a) => [a.id, a]));
   const credByAgente = Object.fromEntries(credentials.map((c) => [c.agente_id, c]));
 
-  // === KPIs del cliente ===
-  const facturasMes = totalProcesadas(runsThisMonth(runs));
-  const facturas7d = totalProcesadas(runsLastDays(runs, 7));
+  // === KPIs del cliente — agent_events (fecha REAL de la factura) ===
+  const facturasArr = facturas ?? [];
+  const facturasMes = totalFacturas(facturasThisMonth(facturasArr));
+  const facturas7d = totalFacturas(facturasLastDays(facturasArr, 7));
   const horasMes = tiempoAhorradoHoras(facturasMes);
+  // Errores siguen viniendo de agent_runs (info técnica del cron)
   const errores30d = totalErrores(runsLastDays(runs, 30));
-  const monthlyAgg = aggByMonth(runs, 6);
+  const monthlyAgg = aggFacturasByMonth(facturasArr, 6);
 
   return (
     <div>

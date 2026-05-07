@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "./supabase";
-import type { Cliente, Agente, AgentRun, ClientAgent } from "../types";
+import type { Cliente, Agente, AgentRun, ClientAgent, AgentEvent } from "../types";
 
 export function useClientAgents() {
   return useQuery({
@@ -72,6 +72,71 @@ export function useRun(id: string) {
         .single();
       if (error) throw error;
       return data as AgentRun;
+    },
+  });
+}
+
+/**
+ * Trae todos los agent_events tipo 'factura_procesada' del cliente.
+ * Estos events son la fuente de verdad para conteos por fecha real
+ * (no por fecha del run).
+ */
+export function useFacturasByCliente(clienteId: string, limit = 1000) {
+  return useQuery({
+    queryKey: ["facturas-cliente", clienteId, limit],
+    enabled: !!clienteId,
+    queryFn: async (): Promise<AgentEvent[]> => {
+      const { data, error } = await supabase
+        .from("agent_events")
+        .select("*")
+        .eq("cliente_id", clienteId)
+        .eq("tipo", "factura_procesada")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (error) throw error;
+      return data as AgentEvent[];
+    },
+  });
+}
+
+/**
+ * Trae todos los agent_events tipo 'factura_procesada' del agente cross-cliente.
+ * Útil para vista global del agente.
+ */
+export function useFacturasByAgente(agenteId: string, limit = 1000) {
+  return useQuery({
+    queryKey: ["facturas-agente", agenteId, limit],
+    enabled: !!agenteId,
+    queryFn: async (): Promise<AgentEvent[]> => {
+      const { data, error } = await supabase
+        .from("agent_events")
+        .select("*")
+        .eq("agente_id", agenteId)
+        .eq("tipo", "factura_procesada")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (error) throw error;
+      return data as AgentEvent[];
+    },
+  });
+}
+
+/**
+ * Trae todos los agent_events globales (todos los clientes, todos los agentes).
+ * Para KPIs globales de la home Operatto.
+ */
+export function useAllFacturas(limit = 2000) {
+  return useQuery({
+    queryKey: ["facturas-all", limit],
+    queryFn: async (): Promise<AgentEvent[]> => {
+      const { data, error } = await supabase
+        .from("agent_events")
+        .select("*")
+        .eq("tipo", "factura_procesada")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      if (error) throw error;
+      return data as AgentEvent[];
     },
   });
 }

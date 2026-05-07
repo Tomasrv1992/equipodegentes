@@ -18,6 +18,27 @@
 
 ## 🔴 Próximo (P0) — bloqueante para vender al primer cliente externo
 
+### CRÍTICO. **Conteos por mes basados en fecha REAL de la factura, no del run**
+
+**Problema detectado** (2026-05-07): después del backfill de tomas92 con 32 facturas, el panel admin muestra todas en "Mayo" (cuando se procesaron) — pero las facturas son de Enero, Febrero, Marzo, Abril y Mayo. Drive las separa correctamente en carpetas `2026-01`, `2026-02`, etc. Pero el panel agrupa por `agent_runs.started_at` (fecha del run = mayo).
+
+**Resultado**: panel admin NO coincide con Drive, NI con Sheet, NI con email del resumen.
+
+**Solución**:
+1. Crear filas en `public.agent_events` (ya existe la tabla) — una por cada factura procesada con:
+   - `tipo = 'factura_procesada'`
+   - `payload = { fecha, proveedor, nit, numero, total, categoria, drive_link }`
+   - `created_at = now()` (cuándo se registró) + indexar por fecha de factura
+2. En `pipeline.ts` después de cada `processOne` exitoso, insertar agent_event
+3. Modificar `aggByMonth` (lib/metrics.ts) para usar `payload->fecha` (fecha real factura) en vez de `started_at`
+4. Modificar KPIs "Procesadas mes / 7 días / all-time" para contar agent_events por su fecha
+5. **Resultado**: bar chart Operatto coincide exactamente con Drive y Sheet
+
+**Estimado**: 2-3h (refactor mediano). **Bloquea**: ningún feature pero es un bug de coherencia visible para el cliente.
+
+---
+
+
 ### 1. **Email mensual automático del resumen al cliente**
 
 **Por qué**: el cliente paga por el agente — necesita ver valor entregado cada mes.

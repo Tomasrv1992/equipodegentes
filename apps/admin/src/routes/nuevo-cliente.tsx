@@ -109,16 +109,16 @@ export default function NuevoCliente() {
       {/* Header */}
       <div className="border-b border-edge pb-7 mb-9">
         <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-ink-3 font-medium mb-2">
-          Onboarding · proceso manual
+          Onboarding · OAuth flow
         </div>
         <h1 className="font-display text-5xl font-medium tracking-tightest text-ink leading-none mb-4">
           Nuevo cliente
         </h1>
         <p className="font-sans text-sm text-ink-3 max-w-[640px] leading-relaxed">
-          Solo crea el registro en la base de datos y activa los agentes que vas a correr.
-          Las credenciales (Google OAuth, Drive, Sheet) se configuran aparte en las env vars
-          del sitio Netlify dedicado del cliente — ver{" "}
-          <code className="text-ink">docs/MANUAL-AGREGAR-CLIENTE.md</code>.
+          Solo necesitás <strong className="text-ink">nombre + slug</strong>. Activá el agente
+          y dejá los campos técnicos (Sheet, Drive folder, etc.) <strong className="text-ink">vacíos</strong> —
+          después de crear el cliente, click "Crear link de onboarding" en su ficha y mandale el link al
+          cliente. El cliente conecta su Google solo y elige sus recursos durante ese flow.
         </p>
       </div>
 

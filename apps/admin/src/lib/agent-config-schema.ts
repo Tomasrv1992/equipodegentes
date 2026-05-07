@@ -4,6 +4,12 @@
  *
  * Solo los agentes listados acá aparecen como activables en el form de nuevo cliente.
  * Esto permite tener agentes en la DB pero todavía sin form (ej: cartera mientras se diseña).
+ *
+ * IMPORTANTE: en Fase 3 (multi-tenant OAuth), todos los campos son OPCIONALES.
+ * El cliente los llena durante el flujo `/onboarding/:token` después de conectar
+ * su Google. Tomás solo crea el cliente con nombre + slug y manda el link de
+ * onboarding. Los campos manuales solo se llenan si Tomás quiere hacer setup
+ * legacy single-tenant (sin OAuth flow).
  */
 
 export interface FieldSpec {
@@ -26,44 +32,41 @@ export const AGENT_SCHEMAS: Record<string, AgentSchema> = {
     agente_id: "facturacion",
     enabledForOnboarding: true,
     fields: [
+      // Todos opcionales — el cliente los llena vía OAuth flow.
       {
         key: "sheet_id",
         label: "Sheet ID",
-        placeholder: "1aB2cD…",
-        hint: "ID del Google Sheet de control. Está en la URL: /spreadsheets/d/<aquí>/edit",
-        required: true,
+        placeholder: "(se llena en onboarding del cliente)",
+        hint: "Solo si querés setup manual sin OAuth flow. Lo normal: dejar vacío y mandar link de onboarding.",
       },
       {
         key: "drive_folder",
         label: "Drive folder ID",
-        placeholder: "1xY2zA…",
-        hint: "ID de la carpeta Drive donde se guardan las facturas. Está en la URL: /folders/<aquí>",
-        required: true,
+        placeholder: "(se llena en onboarding del cliente)",
+        hint: "Solo si querés setup manual sin OAuth flow.",
       },
       {
         key: "notify_email",
         label: "Email del resumen",
         placeholder: "cliente@empresa.co",
         type: "email",
-        hint: "A dónde llega el correo diario con el resumen de facturas procesadas.",
-        required: true,
+        hint: "A dónde llega el correo diario con el resumen. El cliente lo confirma durante onboarding.",
       },
       {
         key: "netlify_site",
-        label: "Sitio Netlify del cron",
-        placeholder: "equipodegentes-cron-cliente",
-        hint: "Slug del sitio Netlify dedicado al cron de este cliente (sin .netlify.app).",
+        label: "Sitio Netlify del cron (legacy)",
+        placeholder: "(no aplica en Fase 3)",
+        hint: "Solo aplica al modo legacy single-tenant. En Fase 3 todos los clientes corren desde equipodegentes-cron.",
       },
     ],
   },
   cartera: {
     agente_id: "cartera",
-    enabledForOnboarding: false, // todavía no listo para onboarding desde panel
+    enabledForOnboarding: false,
     fields: [],
   },
 };
 
-/** Devuelve los agentes habilitados para activar en el form de nuevo cliente. */
 export function enabledAgents(): AgentSchema[] {
   return Object.values(AGENT_SCHEMAS).filter((s) => s.enabledForOnboarding);
 }

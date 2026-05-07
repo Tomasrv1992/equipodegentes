@@ -19,7 +19,7 @@
 import type { AgentRun, AgentEvent } from "../types";
 
 /** Minutos que tarda un humano en procesar manualmente una factura DIAN. */
-export const MINUTES_PER_FACTURA = 24;
+export const MINUTES_PER_FACTURA = 10;
 
 export interface RunPayloadFacturacion {
   procesadas?: number;

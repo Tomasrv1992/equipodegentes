@@ -19,7 +19,8 @@ comment on column public.client_credentials.first_run_done is
   'false → próximo run usa window=365d (backfill). true → window=30d normal. Se marca true tras primer run OK.';
 
 -- Asegurar que el RPC client_credentials_load devuelve también este campo.
--- Re-creamos la función (or replace) con la columna nueva.
+-- Postgres no permite cambiar return type con OR REPLACE → drop primero.
+drop function if exists public.client_credentials_load(uuid, text, text);
 
 create or replace function public.client_credentials_load(
   p_cliente_id uuid,

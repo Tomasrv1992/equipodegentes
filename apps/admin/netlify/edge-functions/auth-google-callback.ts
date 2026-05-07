@@ -142,8 +142,111 @@ export default async (request: Request, _context: Context) => {
     );
   }
 
-  // 5. Avanzar el step del onboarding token a 'oauth_done'
-  const advResp = await fetch(
+  // 5. AUTO-CREAR carpeta Drive + Sheet (skip paso 2 manual)
+  //    Operatto crea la carpeta y el Sheet a nombre del cliente, sin fricción.
+  //    El cliente sofisticado podrá editarlo desde el panel admin después
+  //    si lo necesita.
+  let folderId: string | null = null;
+  let folderName: string | null = null;
+  let sheetId: string | null = null;
+  let sheetName: string | null = null;
+
+  try {
+    // Get cliente nombre para naming
+    const cliResp = await fetch(
+      `${supabaseUrl}/rest/v1/clientes?id=eq.${onboarding.cliente_id}&select=nombre`,
+      { headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` } },
+    );
+    const cliRows = (await cliResp.json()) as Array<{ nombre: string }>;
+    const clienteNombre = cliRows[0]?.nombre || onboarding.cliente_slug;
+
+    folderName = `Facturas ${clienteNombre} - Operatto`;
+    sheetName = `Control Facturas ${clienteNombre}`;
+
+    // 5a. Crear carpeta en Drive root
+    const folderResp = await fetch("https://www.googleapis.com/drive/v3/files", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokens.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: folderName,
+        mimeType: "application/vnd.google-apps.folder",
+        parents: ["root"],
+      }),
+    });
+    if (!folderResp.ok) {
+      throw new Error(`drive folder create: ${await folderResp.text()}`);
+    }
+    folderId = ((await folderResp.json()) as { id: string }).id;
+
+    // 5b. Crear Sheet dentro de la carpeta
+    const sheetResp = await fetch("https://www.googleapis.com/drive/v3/files", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokens.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: sheetName,
+        mimeType: "application/vnd.google-apps.spreadsheet",
+        parents: [folderId],
+      }),
+    });
+    if (!sheetResp.ok) {
+      throw new Error(`sheet create: ${await sheetResp.text()}`);
+    }
+    sheetId = ((await sheetResp.json()) as { id: string }).id;
+  } catch (e: any) {
+    console.error("auto-create resources failed:", e.message);
+    // Si falla la auto-creación, redirigir al paso 2 manual (fallback)
+    await fetch(
+      `${supabaseUrl}/rest/v1/onboarding_tokens?token=eq.${encodeURIComponent(state)}`,
+      {
+        method: "PATCH",
+        headers: {
+          apikey: serviceKey,
+          Authorization: `Bearer ${serviceKey}`,
+          "content-type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({ step: "oauth_done" }),
+      },
+    );
+    return Response.redirect(
+      `${adminUrl}/onboarding/${state}?oauth=ok&autocreate_failed=1`,
+      302,
+    );
+  }
+
+  // 6. Update client_credentials con los recursos auto-creados
+  const upResp = await fetch(
+    `${supabaseUrl}/rest/v1/client_credentials?cliente_id=eq.${onboarding.cliente_id}&agente_id=eq.${onboarding.agente_id}`,
+    {
+      method: "PATCH",
+      headers: {
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        "content-type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        drive_folder_id: folderId,
+        drive_folder_name: folderName,
+        sheet_id: sheetId,
+        sheet_name: sheetName,
+        notify_email: userInfo.email ?? null,
+        onboarded_at: new Date().toISOString(),
+      }),
+    },
+  );
+  if (!upResp.ok) {
+    console.warn("update client_credentials failed:", await upResp.text());
+  }
+
+  // 7. Marcar onboarding token como COMPLETED (skip paso 2)
+  await fetch(
     `${supabaseUrl}/rest/v1/onboarding_tokens?token=eq.${encodeURIComponent(state)}`,
     {
       method: "PATCH",
@@ -153,14 +256,28 @@ export default async (request: Request, _context: Context) => {
         "content-type": "application/json",
         Prefer: "return=minimal",
       },
-      body: JSON.stringify({ step: "oauth_done" }),
+      body: JSON.stringify({
+        step: "completed",
+        completed_at: new Date().toISOString(),
+      }),
     },
   );
-  if (!advResp.ok) {
-    console.warn("advance step failed:", await advResp.text());
-    // no-fatal, redirect anyway
+
+  // 8. Disparar el primer run en background (mismo que save-resources hace)
+  const mainSiteUrl = Netlify.env.get("MAIN_SITE_URL");
+  const internalSecret = Netlify.env.get("FACTURACION_INTERNAL_SECRET");
+  if (mainSiteUrl && internalSecret && onboarding.agente_id === "facturacion") {
+    fetch(`${mainSiteUrl}/.netlify/functions/facturacion-background`, {
+      method: "POST",
+      headers: {
+        "x-internal-secret": internalSecret,
+        "x-trigger": "onboarding",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ customerId: onboarding.cliente_slug }),
+    }).catch((e) => console.warn("first-run dispatch failed (no-fatal):", e));
   }
 
-  // 6. Redirigir al user al paso 2 del onboarding (selección de Drive + Sheet)
-  return Response.redirect(`${adminUrl}/onboarding/${state}?oauth=ok`, 302);
+  // 9. Redirect — el frontend detecta step='completed' y muestra StepDone
+  return Response.redirect(`${adminUrl}/onboarding/${state}?oauth=ok&completed=1`, 302);
 };

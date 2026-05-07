@@ -73,6 +73,23 @@ Avisame si querés que ajustemos algo.
 
 ## 🟠 Importante (P1) — robustez y experiencia
 
+### NEW. **Operatto crea Sheet + carpeta automáticamente durante onboarding**
+
+**Por qué**: hoy el cliente tiene que tener pre-creados un Sheet y una carpeta Drive antes del onboarding. Fricción innecesaria.
+
+**Spec**:
+- Durante `/auth/google/callback` (después de guardar el refresh_token), llamar Drive API:
+  1. Crear carpeta: `Facturas {cliente.nombre} - Operatto` en root del Drive del cliente
+  2. Crear Sheet: `Control Facturas {cliente.nombre}` dentro de esa carpeta (no en root)
+  3. Inicializar headers en pestaña "Gastos 2026": `Fecha · Proveedor · NIT · N° factura · Subtotal · IVA · Total · Concepto · Categoría · Cuenta PYG · Drive link`
+- Pre-llenar `client_credentials.drive_folder_id` y `sheet_id` con los recién creados
+- En `/onboarding` paso 2, mostrar "Ya creamos esto para vos: [Sheet] [Carpeta]" con opción "Quiero usar otros" (para flexibilidad)
+
+**Estimado**: 2h. Aumenta calidad de onboarding 10x.
+
+### Reordenado: lo que sigue mantiene su orden previo
+
+
 ### 3. **Onboarding link via email automático (no copy-paste manual)**
 
 Hoy: Tomás click "Crear link" → copia y manda por WhatsApp.

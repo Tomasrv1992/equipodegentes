@@ -9,7 +9,7 @@ import {
   formatHoras,
   totalFacturas,
   facturasThisMonth,
-  aggFacturasByMonth,
+  aggFacturasByCurrentYear,
 } from "../lib/metrics";
 import Pill from "./Pill";
 import Kpis from "./Kpis";
@@ -61,7 +61,7 @@ export default function AgenteFicha({ id }: { id: string }) {
   // Errores y clientes únicos siguen usando runs (info técnica)
   const errores7d = totalErrores(runsLastDays(runs, 7));
   const clientesUnicos = new Set(runs.map((r) => r.cliente_id)).size;
-  const monthlyAgg = aggFacturasByMonth(facturasArr, 12);
+  const monthlyAgg = aggFacturasByCurrentYear(facturasArr);
 
   return (
     <div>
@@ -137,7 +137,7 @@ export default function AgenteFicha({ id }: { id: string }) {
       {/* Histórico mensual del agente */}
       <section className="card mb-9">
         <div className="flex items-baseline justify-between mb-4">
-          <h2 className="section-title">Histórico · 12 meses</h2>
+          <h2 className="section-title">Histórico · {new Date().getFullYear()}</h2>
           <span className="section-meta">
             facturas procesadas · todos los clientes que usan {agente.nombre}
           </span>

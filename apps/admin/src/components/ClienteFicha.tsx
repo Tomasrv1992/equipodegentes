@@ -11,7 +11,7 @@ import {
   totalFacturas,
   facturasThisMonth,
   facturasLastDays,
-  aggFacturasByMonth,
+  aggFacturasByCurrentYear,
 } from "../lib/metrics";
 import Pill from "./Pill";
 import Sparkline from "./Sparkline";
@@ -24,7 +24,9 @@ interface CredStatus {
   agente_id: string;
   google_oauth_status: "pending" | "connected" | "expired" | "revoked" | null;
   google_email: string | null;
+  drive_folder_id: string | null;
   drive_folder_name: string | null;
+  sheet_id: string | null;
   sheet_name: string | null;
   notify_email: string | null;
   onboarded_at: string | null;
@@ -64,7 +66,7 @@ function useClienteBySlug(slug: string) {
           .limit(200),
         supabase
           .from("client_credentials")
-          .select("agente_id, google_oauth_status, google_email, drive_folder_name, sheet_name, notify_email, onboarded_at")
+          .select("agente_id, google_oauth_status, google_email, drive_folder_id, drive_folder_name, sheet_id, sheet_name, notify_email, onboarded_at")
           .eq("cliente_id", (cliente as Cliente).id),
       ]);
       if (e2) throw e2;
@@ -108,7 +110,7 @@ export default function ClienteFicha({ slug }: { slug: string }) {
   const horasMes = tiempoAhorradoHoras(facturasMes);
   // Errores siguen viniendo de agent_runs (info técnica del cron)
   const errores30d = totalErrores(runsLastDays(runs, 30));
-  const monthlyAgg = aggFacturasByMonth(facturasArr, 6);
+  const monthlyAgg = aggFacturasByCurrentYear(facturasArr);
 
   return (
     <div>
@@ -180,7 +182,7 @@ export default function ClienteFicha({ slug }: { slug: string }) {
       {/* === Mini-chart: facturas por mes (siempre visible para mostrar histórico mensual) === */}
       <section className="card mb-9">
         <div className="flex items-baseline justify-between mb-4">
-          <h2 className="section-title">Facturas procesadas · 6 meses</h2>
+          <h2 className="section-title">Facturas procesadas · {new Date().getFullYear()}</h2>
           <span className="section-meta">
             total {monthlyAgg.reduce((a, m) => a + m.procesadas, 0)} facturas
           </span>
@@ -392,9 +394,19 @@ function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: Activ
 
       {!editing ? (
         <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px] py-1">
-          <ConfigRow label="Sheet ID" value={initialConfig.sheet_id} />
-          <ConfigRow label="Drive folder" value={initialConfig.drive_folder} />
-          <ConfigRow label="Notify email" value={initialConfig.notify_email} />
+          {/* Lee primero de client_credentials (multi-tenant OAuth) y fallback al config_json legacy */}
+          <ConfigRow
+            label="Sheet"
+            value={cred?.sheet_name || cred?.sheet_id || initialConfig.sheet_id}
+          />
+          <ConfigRow
+            label="Drive folder"
+            value={cred?.drive_folder_name || cred?.drive_folder_id || initialConfig.drive_folder}
+          />
+          <ConfigRow
+            label="Notify email"
+            value={cred?.notify_email || initialConfig.notify_email}
+          />
           <ConfigRow label="Netlify site" value={initialConfig.netlify_site} />
         </div>
       ) : (

@@ -207,6 +207,38 @@ export function aggFacturasByMonth(
   return meses;
 }
 
+/**
+ * Agrupa facturas por mes para el año en curso, desde Enero hasta el mes actual.
+ * Útil para gráficos "año actual" sin barras vacías de meses futuros ni ruido
+ * de meses del año pasado.
+ */
+export function aggFacturasByCurrentYear(
+  events: AgentEvent[],
+  reference: Date = new Date(),
+): MesAgg[] {
+  const year = reference.getFullYear();
+  const currentMonth = reference.getMonth() + 1; // 1..12
+
+  const meses: MesAgg[] = [];
+  for (let m = 1; m <= currentMonth; m++) {
+    const d = new Date(year, m - 1, 1);
+    const key = `${year}-${String(m).padStart(2, "0")}`;
+    const label = d.toLocaleDateString("es-CO", { month: "short" }).replace(".", "");
+    meses.push({ key, label, procesadas: 0, errores: 0, runs: 0 });
+  }
+
+  for (const ev of events) {
+    const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
+    if (!fecha) continue;
+    const key = fecha.slice(0, 7);
+    const target = meses.find((m) => m.key === key);
+    if (!target) continue;
+    target.procesadas++;
+  }
+
+  return meses;
+}
+
 /** Top N proveedores por cantidad de facturas. */
 export interface ProveedorAgg {
   proveedor: string;

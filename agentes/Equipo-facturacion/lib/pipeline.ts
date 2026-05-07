@@ -168,6 +168,10 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
 
   const labelId = await getOrCreateLabel(gmail, PROCESSED_LABEL);
 
+  // Setup del Sheet: garantizar 12 pestañas mensuales + Dashboard.
+  // Idempotente: si ya existen, no hace nada.
+  await ensureSheetSetup(sheets, g.sheetId);
+
   let emails = await findInvoiceEmails(gmail, searchQuery);
   if (limit != null && limit > 0) emails = emails.slice(0, limit);
 
@@ -279,6 +283,242 @@ const SHEET_HEADERS = [
   "N°", "Fecha", "Proveedor", "NIT", "N° Factura", "Subtotal", "IVA",
   "Total", "Concepto", "Link PDF", "Categoría", "Cuenta PYG",
 ];
+
+const DASHBOARD_TAB = "Dashboard";
+
+/**
+ * Garantiza que el Sheet del cliente tiene la estructura completa:
+ *   1. 12 pestañas mensuales (Enero..Diciembre) con headers
+ *   2. Pestaña "Dashboard" como primera pestaña con métricas vivas
+ *
+ * Idempotente: si ya existen, no hace nada.
+ * Llamada al inicio de cada `run()` — primer run de cliente nuevo arma todo,
+ * runs subsiguientes son no-op (chequeos baratos).
+ */
+async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
+  // 1. Crear las 12 pestañas mensuales si no existen (las fórmulas del Dashboard
+  //    referencian todas, así que deben existir aunque vacías).
+  for (let month = 1; month <= 12; month++) {
+    await getOrCreateMonthTab(sheets, sheetId, month);
+  }
+
+  // 2. Setear locale es-CO + zona horaria Bogotá (idempotente — no-op si ya está).
+  //    Necesario para que las fórmulas con separador `;` funcionen, y para que los
+  //    formatos de moneda/fecha sean coherentes con Colombia.
+  const metaForLocale = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+  const currentLocale = metaForLocale.data.properties?.locale;
+  if (currentLocale !== "es_CO") {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [{
+          updateSpreadsheetProperties: {
+            properties: { locale: "es_CO", timeZone: "America/Bogota" },
+            fields: "locale,timeZone",
+          },
+        }],
+      },
+    });
+  }
+
+  // 3. Crear pestaña Dashboard si no existe
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+  const existingDashboard = meta.data.sheets?.find(
+    (s: any) => s.properties?.title === DASHBOARD_TAB,
+  );
+  if (existingDashboard) return;
+
+  // Crear Dashboard como PRIMERA pestaña (index: 0)
+  const created = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: sheetId,
+    requestBody: {
+      requests: [{
+        addSheet: {
+          properties: {
+            title: DASHBOARD_TAB,
+            index: 0,
+            gridProperties: { rowCount: 50, columnCount: 6 },
+          },
+        },
+      }],
+    },
+  });
+  const dashSheetId = created.data.replies?.[0]?.addSheet?.properties?.sheetId;
+
+  // 3. Llenar el contenido (fórmulas vivas — leen de las 12 pestañas mensuales)
+  // Spec del MVP:
+  //   - Mes actual: facturas, monto, tiempo ahorrado
+  //   - Histórico 2026: 12 meses + total
+  //   - Top 5 proveedores (cross-mes)
+  //   - Top 5 categorías (cross-mes)
+
+  const monthChooseStr = MES_TABS.map((m) => `"${m}"`).join(",");
+  // Rangos consolidados de las 12 pestañas (para QUERY)
+  const allMonthsRange = MES_TABS.map((m) => `'${m}'!A2:L`).join(";");
+
+  const content: any[][] = [
+    // Row 1: título grande
+    ["TABLERO RESUMEN — Equipo de Facturación", "", "", "", "", ""],
+    // Row 2: vacío
+    ["", "", "", "", "", ""],
+    // Row 3: header sección
+    ["MES ACTUAL", "", "", "", "", ""],
+    // Row 4: Mes
+    ["Mes", `=PROPER(TEXT(TODAY(),"mmmm yyyy"))`, "", "", "", ""],
+    // Row 5: Facturas
+    ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY()),${monthChooseStr})&"!A2:A1000"))`, "", "", "", ""],
+    // Row 6: Monto
+    ["Monto total (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY()),${monthChooseStr})&"!H2:H1000"))`, "", "", "", ""],
+    // Row 7: Tiempo
+    ["Tiempo ahorrado", `=ROUND(B5*10/60,1)&" h (10 min/factura)"`, "", "", "", ""],
+    // Row 8: vacío
+    ["", "", "", "", "", ""],
+    // Row 9: header sección
+    ["HISTÓRICO 2026", "", "", "", "", ""],
+    // Row 10: headers
+    ["Mes", "Facturas", "Monto (COP)", "", "", ""],
+    // Row 11-22: 12 meses
+    ...MES_TABS.map((m) => [
+      m,
+      `=COUNTA('${m}'!A2:A1000)`,
+      `=SUM('${m}'!H2:H1000)`,
+      "", "", "",
+    ]),
+    // Row 23: Total
+    ["TOTAL", `=SUM(B11:B22)`, `=SUM(C11:C22)`, "", "", ""],
+    // Row 24: vacío
+    ["", "", "", "", "", ""],
+    // Row 25: header sección
+    ["TOP 5 PROVEEDORES (todo el año)", "", "", "", "", ""],
+    // Row 26: QUERY (se expande hacia abajo automáticamente con 5 filas + header)
+    [
+      `=QUERY({${allMonthsRange}};"select Col3, count(Col3), sum(Col8) where Col3 is not null and Col3 <> '' group by Col3 order by count(Col3) desc limit 5 label Col3 'Proveedor', count(Col3) 'Facturas', sum(Col8) 'Monto'";0)`,
+      "", "", "", "", "",
+    ],
+    // Rows 27-31 reservadas para el resultado del QUERY (5 filas)
+    [], [], [], [], [],
+    // Row 32: vacío
+    ["", "", "", "", "", ""],
+    // Row 33: header sección
+    ["TOP 5 CATEGORÍAS (todo el año)", "", "", "", "", ""],
+    // Row 34: QUERY
+    [
+      `=QUERY({${allMonthsRange}};"select Col11, count(Col11), sum(Col8) where Col11 is not null and Col11 <> '' group by Col11 order by count(Col11) desc limit 5 label Col11 'Categoría', count(Col11) 'Facturas', sum(Col8) 'Monto'";0)`,
+      "", "", "", "", "",
+    ],
+  ];
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `'${DASHBOARD_TAB}'!A1:F${content.length}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: content },
+  });
+
+  // 4. Formato visual
+  if (dashSheetId != null) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [
+          // Título row 1: merged + bold + fondo + texto blanco
+          {
+            mergeCells: {
+              range: { sheetId: dashSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 },
+              mergeType: "MERGE_ALL",
+            },
+          },
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 },
+              cell: {
+                userEnteredFormat: {
+                  textFormat: { bold: true, fontSize: 14, foregroundColor: { red: 1, green: 1, blue: 1 } },
+                  horizontalAlignment: "CENTER",
+                  verticalAlignment: "MIDDLE",
+                  backgroundColor: { red: 0.15, green: 0.25, blue: 0.4 },
+                },
+              },
+              fields: "userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment,backgroundColor)",
+            },
+          },
+          // Headers de sección (rows 3, 9, 25, 33): bold con fondo claro
+          ...[2, 8, 24, 32].map((rowIdx) => ({
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: rowIdx, endRowIndex: rowIdx + 1, startColumnIndex: 0, endColumnIndex: 6 },
+              cell: {
+                userEnteredFormat: {
+                  textFormat: { bold: true, fontSize: 11 },
+                  backgroundColor: { red: 0.92, green: 0.92, blue: 0.95 },
+                },
+              },
+              fields: "userEnteredFormat(textFormat,backgroundColor)",
+            },
+          })),
+          // Header tabla histórico (row 10): bold
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 9, endRowIndex: 10, startColumnIndex: 0, endColumnIndex: 3 },
+              cell: { userEnteredFormat: { textFormat: { bold: true } } },
+              fields: "userEnteredFormat.textFormat",
+            },
+          },
+          // TOTAL row (23): bold + fondo
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 22, endRowIndex: 23, startColumnIndex: 0, endColumnIndex: 3 },
+              cell: {
+                userEnteredFormat: {
+                  textFormat: { bold: true },
+                  backgroundColor: { red: 0.98, green: 0.95, blue: 0.85 },
+                },
+              },
+              fields: "userEnteredFormat(textFormat,backgroundColor)",
+            },
+          },
+          // Formato moneda COP en columnas Monto (B7 mes actual, C11:C23 histórico)
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 1, endColumnIndex: 2 },
+              cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } } },
+              fields: "userEnteredFormat.numberFormat",
+            },
+          },
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 10, endRowIndex: 23, startColumnIndex: 2, endColumnIndex: 3 },
+              cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } } },
+              fields: "userEnteredFormat.numberFormat",
+            },
+          },
+          // Ancho columna A (labels): más ancho
+          {
+            updateDimensionProperties: {
+              range: { sheetId: dashSheetId, dimension: "COLUMNS", startIndex: 0, endIndex: 1 },
+              properties: { pixelSize: 250 },
+              fields: "pixelSize",
+            },
+          },
+          {
+            updateDimensionProperties: {
+              range: { sheetId: dashSheetId, dimension: "COLUMNS", startIndex: 1, endIndex: 4 },
+              properties: { pixelSize: 160 },
+              fields: "pixelSize",
+            },
+          },
+          // Altura row 1 (título)
+          {
+            updateDimensionProperties: {
+              range: { sheetId: dashSheetId, dimension: "ROWS", startIndex: 0, endIndex: 1 },
+              properties: { pixelSize: 40 },
+              fields: "pixelSize",
+            },
+          },
+        ],
+      },
+    });
+  }
+}
 
 /**
  * Devuelve el nombre del tab del mes (ej "Enero", "Febrero"...). Si no existe,

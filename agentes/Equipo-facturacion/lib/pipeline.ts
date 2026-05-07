@@ -141,7 +141,13 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
 
   // Query amplia: facturas DIAN (ZIP) + planillas SS (PDFs autoliquidaciones/comprobante).
   // El processOne distingue qué tipo es y aplica el sub-pipeline correspondiente.
-  const searchQuery = `(filename:zip OR filename:autoliquidaciones OR filename:comprobante) -label:Procesado newer_than:${window}`;
+  //
+  // El parámetro `window` acepta dos formatos:
+  //   - "30d" / "365d" → newer_than:Nd (rolling, último N días)
+  //   - "2026/01/01"   → after:YYYY/MM/DD (fecha absoluta, ideal para backfill anual)
+  const isAbsoluteDate = /^\d{4}\/\d{2}\/\d{2}$/.test(window);
+  const dateFilter = isAbsoluteDate ? `after:${window}` : `newer_than:${window}`;
+  const searchQuery = `(filename:zip OR filename:autoliquidaciones OR filename:comprobante) -label:Procesado ${dateFilter}`;
 
   const auth = new google.auth.OAuth2(g.clientId, g.clientSecret);
   auth.setCredentials({ refresh_token: g.refreshToken });

@@ -155,6 +155,27 @@ export default async (req: Request) => {
     }
   }
 
+  // Marcar first_run_done si era el primer run del cliente y terminó OK
+  if (body.customerId && result.errores.length === 0) {
+    try {
+      const supa = getServerClient();
+      const { data: cliente } = await supa
+        .from("clientes")
+        .select("id")
+        .eq("slug", body.customerId)
+        .single();
+      if (cliente) {
+        await supa.rpc("client_credentials_mark_first_run_done", {
+          p_cliente_id: (cliente as any).id,
+          p_agente_id: "facturacion",
+        });
+        console.log(`[backfill] cliente ${body.customerId} first_run_done=true`);
+      }
+    } catch (e: any) {
+      console.error("mark first_run_done failed (no-fatal):", e.message);
+    }
+  }
+
   // Email diario incondicional con resumen
   try {
     await notifyResult(result, body.customerId);
@@ -199,6 +220,24 @@ async function buildConfig(body: RequestBody): Promise<PipelineConfig> {
       );
     }
 
+    // Backfill rule: si es el primer run del cliente (first_run_done = false),
+    // procesa todo el año calendario actual (after:YYYY/01/01) en vez del rolling 30d.
+    // El primer run después de onboarding entrega valor inmediato al cliente.
+    let resolvedWindow: string;
+    if (body.window) {
+      resolvedWindow = body.window;  // override explícito desde el body
+    } else if (!cred.first_run_done) {
+      // First run → backfill desde 1° de enero del año actual
+      const yearStart = new Date(new Date().getFullYear(), 0, 1);
+      const yyyy = yearStart.getFullYear();
+      const mm = String(yearStart.getMonth() + 1).padStart(2, "0");
+      const dd = String(yearStart.getDate()).padStart(2, "0");
+      resolvedWindow = `${yyyy}/${mm}/${dd}`;
+      console.log(`[backfill] cliente ${body.customerId} first_run_done=false → window=${resolvedWindow}`);
+    } else {
+      resolvedWindow = "30d";
+    }
+
     return {
       google: {
         // Usamos el OAuth Web Client de Operatto (compartido entre todos los clientes).
@@ -212,7 +251,7 @@ async function buildConfig(body: RequestBody): Promise<PipelineConfig> {
       },
       options: {
         dryRun: body.dryRun ?? false,
-        window: body.window ?? "30d",
+        window: resolvedWindow,
       },
     };
   }

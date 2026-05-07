@@ -46,6 +46,7 @@ export interface ClientCredentialsRow {
   last_oauth_refresh: string | null;
   created_at: string;
   updated_at: string;
+  first_run_done: boolean;
 }
 
 export interface SaveOAuthTokensInput {

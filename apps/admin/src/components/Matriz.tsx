@@ -107,7 +107,7 @@ export default function Matriz() {
             meta: runsHoyN > 0 ? <>último: <span className="text-ok">{lastRunGlobal ? timeAgo(lastRunGlobal.started_at) : ""}</span></> : "esperando primer cron",
           },
           {
-            label: "Errores 7d",
+            label: "Errores 7 días",
             value: errores7d,
             alert: errores7d > 0,
             meta: lastFailWhen ? `último: ${lastFailWhen}` : "ninguno",

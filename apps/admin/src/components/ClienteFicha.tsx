@@ -166,7 +166,7 @@ export default function ClienteFicha({ slug }: { slug: string }) {
       <Kpis
         items={[
           { label: "Procesadas mes", value: facturasMes, unit: "facturas", meta: facturasMes > 0 ? `≈ ${formatHoras(horasMes)} ahorradas` : "—" },
-          { label: "Procesadas 7d", value: facturas7d, unit: "facturas" },
+          { label: "Procesadas 7 días", value: facturas7d, unit: "facturas" },
           { label: "Errores 30d", value: errores30d, alert: errores30d > 0 },
           { label: "Tiempo ahorrado", value: formatHoras(horasMes).replace(/[hm]/, ""), unit: formatHoras(horasMes).endsWith("h") ? "h" : "min", meta: "este mes" },
         ]}

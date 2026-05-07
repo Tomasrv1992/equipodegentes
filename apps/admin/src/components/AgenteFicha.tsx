@@ -115,7 +115,7 @@ export default function AgenteFicha({ id }: { id: string }) {
             unit: "facturas",
             meta: facturasMes > 0 ? `≈ ${formatHoras(horasMes)} ahorradas` : "—",
           },
-          { label: "Errores 7d", value: errores7d, alert: errores7d > 0 },
+          { label: "Errores 7 días", value: errores7d, alert: errores7d > 0 },
           { label: "Clientes activos", value: clientesUnicos },
           {
             label: "Runs totales",

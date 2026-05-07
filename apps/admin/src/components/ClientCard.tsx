@@ -104,7 +104,7 @@ export default function ClientCard({ cliente, activacion, agente, runs }: Client
       <div className="p-6 flex flex-col justify-between gap-2">
         <div className="flex items-baseline justify-between">
           <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-ink-3 font-medium">
-            Procesadas · 7d
+            Procesadas · últ 7 días
           </span>
           <span className="font-display text-xl font-semibold tracking-tighter text-ink">
             {facturas7d}

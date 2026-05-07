@@ -63,10 +63,17 @@ export default async (req: Request) => {
     );
   }
 
-  const auth = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-  );
+  // Multi-tenant: usar el OAuth Web Client (con el que se firmó el refresh_token
+  // durante el onboarding del cliente). NO usar GOOGLE_CLIENT_ID legacy.
+  const webClientId = process.env.GOOGLE_OAUTH_WEB_CLIENT_ID;
+  const webClientSecret = process.env.GOOGLE_OAUTH_WEB_CLIENT_SECRET;
+  if (!webClientId || !webClientSecret) {
+    return new Response(
+      JSON.stringify({ error: "missing GOOGLE_OAUTH_WEB_CLIENT_ID / SECRET env vars" }),
+      { status: 500, headers: { "content-type": "application/json" } },
+    );
+  }
+  const auth = new google.auth.OAuth2(webClientId, webClientSecret);
   auth.setCredentials({ refresh_token: cred.google_refresh_token });
   const sheets = google.sheets({ version: "v4", auth });
 

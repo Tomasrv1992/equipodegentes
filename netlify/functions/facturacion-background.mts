@@ -162,6 +162,10 @@ export default async (req: Request) => {
           procesadas: result.procesadas.length,
           errores: result.errores.length,
           saltadas: result.saltadas.length,
+          // Tracking de uso LLM para visibilidad de costo por cliente/run
+          llm_calls: result.llmStats?.calls ?? 0,
+          llm_cost_usd: result.llmStats?.estimatedCostUsd ?? 0,
+          llm_pre_filtered: result.llmStats?.preFilteredOut ?? 0,
         },
       });
     } catch (e: any) {

@@ -117,6 +117,18 @@ export interface PipelineResult {
   procesadas: ProcessedRow[];
   errores: ErrorRow[];
   saltadas: SkippedRow[];
+  /**
+   * Estadísticas de uso del LLM en este run.
+   * Permite trackear el costo por cliente desde el panel admin.
+   */
+  llmStats?: {
+    /** Total de llamadas a Claude que se hicieron en este run. */
+    calls: number;
+    /** Costo estimado en USD (calls * costo unitario). */
+    estimatedCostUsd: number;
+    /** Cuántas veces se evitó una llamada por pre-filter (sender/subject/texto). */
+    preFilteredOut: number;
+  };
   /** Solo presente si options.dryRun. */
   dryRun?: {
     query: string;
@@ -129,6 +141,15 @@ export interface PipelineResult {
       zips: string[];
     }>;
   };
+}
+
+/**
+ * Tracker mutable que se pasa por referencia a los sub-pipelines que llaman LLM.
+ * Cada sub-pipeline incrementa el contador correspondiente.
+ */
+interface LlmTracker {
+  calls: number;
+  preFilteredOut: number;
 }
 
 const PROCESSED_LABEL = "Procesado";
@@ -217,6 +238,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   };
 
   const result: PipelineResult = { procesadas: [], errores: [], saltadas: [] };
+  const llmTracker: LlmTracker = { calls: 0, preFilteredOut: 0 };
 
   for (const e of emails) {
     try {
@@ -232,7 +254,8 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
         (tabName, newRow) => {
           const cached = sheetRowsCache.get(tabName);
           if (cached) cached.push(newRow);
-        }
+        },
+        llmTracker,
       );
       if ("ok" in r && r.ok) {
         result.procesadas.push(r);
@@ -245,6 +268,13 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
       result.errores.push({ messageId: e.id!, error: err.message });
     }
   }
+
+  // Adjuntar stats LLM al result (importante: aunque sea 0 si nunca llamó)
+  result.llmStats = {
+    calls: llmTracker.calls,
+    estimatedCostUsd: Math.round(llmTracker.calls * 0.001 * 10000) / 10000,
+    preFilteredOut: llmTracker.preFilteredOut,
+  };
 
   return result;
 }
@@ -702,6 +732,27 @@ function findDocxParts(payload: any) {
 }
 
 /**
+ * Quick check: hay algún PDF que NO sea planilla SS?
+ * Usado para decidir si aplicar pre-filtros antes de descargar.
+ */
+function hasNonPlanillaPdf(payload: any, planillas: Array<{ filename: string }>): boolean {
+  const planillaNames = new Set(planillas.map((p) => p.filename));
+  let found = false;
+  function walk(part: any) {
+    if (found) return;
+    if (part.filename && /\.pdf$/i.test(part.filename) && part.body?.attachmentId) {
+      if (!planillaNames.has(part.filename)) {
+        found = true;
+        return;
+      }
+    }
+    if (part.parts) part.parts.forEach(walk);
+  }
+  if (payload) walk(payload);
+  return found;
+}
+
+/**
  * Detecta PDFs adjuntos genéricos (no DIAN ZIP, no planilla SS).
  * Usado para recibos internacionales (Stripe, AWS) y servicios locales no-DIAN.
  */
@@ -1009,10 +1060,12 @@ async function processOne(
   xmlParser: XMLParser,
   g: PipelineConfig["google"],
   loadSheetRows: (tabName: string) => Promise<any[][]>,
-  pushToCache: (tabName: string, row: any[]) => void
+  pushToCache: (tabName: string, row: any[]) => void,
+  llmTracker: LlmTracker,
 ): Promise<ProcessOneResult> {
   const msg = await getMessageFull(gmail, messageId);
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
+  const sender = getHeader(msg, "From") || "";
 
   const zips = findZipParts(msg.payload);
   const planillas = findPlanillaPdfs(msg.payload);
@@ -1028,12 +1081,36 @@ async function processOne(
     );
   }
 
+  // PRE-FILTRO A+B (sender/subject) — aplica a flows que llaman LLM (.docx + PDF).
+  // Si el sender o subject indican que NO es factura, skip sin cargar el adjunto.
+  if (zips.length === 0 && (docxs.length > 0 || hasNonPlanillaPdf(msg.payload, planillas))) {
+    const { isLikelyNonInvoiceSender, isLikelyNonInvoiceSubject } = await import("./llm-pre-filters");
+    if (isLikelyNonInvoiceSender(sender)) {
+      llmTracker.preFilteredOut++;
+      await markEmailProcessed(gmail, messageId, labelId);
+      return {
+        skip: true,
+        reason: `pre-filter-sender (${sender.slice(0, 60)})`,
+        subject,
+      };
+    }
+    if (isLikelyNonInvoiceSubject(subject)) {
+      llmTracker.preFilteredOut++;
+      await markEmailProcessed(gmail, messageId, labelId);
+      return {
+        skip: true,
+        reason: `pre-filter-subject (${subject.slice(0, 60)})`,
+        subject,
+      };
+    }
+  }
+
   // Sub-pipeline cuenta de cobro Word: si NO hay ZIPs ni planillas, pero SÍ hay .docx,
   // tratar como cuenta de cobro. Extrae texto con mammoth + LLM Claude para datos.
   if (zips.length === 0 && docxs.length > 0) {
     return await processCuentaCobroDocx(
       messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
-      loadSheetRows, pushToCache,
+      loadSheetRows, pushToCache, llmTracker,
     );
   }
 
@@ -1045,7 +1122,7 @@ async function processOne(
     if (genericPdfs.length > 0) {
       return await processGenericPdf(
         messageId, labelId, gmail, drive, sheets, g, genericPdfs, subject, msg,
-        loadSheetRows, pushToCache,
+        loadSheetRows, pushToCache, llmTracker,
       );
     }
   }
@@ -1297,6 +1374,7 @@ async function processCuentaCobroDocx(
   msg: any,
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void,
+  llmTracker: LlmTracker,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -1320,10 +1398,24 @@ async function processCuentaCobroDocx(
       return { skip: true, reason: "docx-sin-texto-extraible", subject };
     }
 
+    // PRE-FILTRO C: el texto debe tener indicadores de factura. Sino, no
+    // gastamos una llamada LLM en algo que claramente no lo es.
+    const { hasInvoiceIndicators } = await import("./llm-pre-filters");
+    if (!hasInvoiceIndicators(text)) {
+      llmTracker.preFilteredOut++;
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      return {
+        skip: true,
+        reason: "docx-sin-indicadores-factura",
+        subject,
+      };
+    }
+
     // 3. Llamar al LLM para extraer campos estructurados
     const { extractInvoiceFromText } = await import("./llm-extractor");
     const sender = getHeader(msg, "From") || "";
     const dateHeader = getHeader(msg, "Date") || "";
+    llmTracker.calls++;
     const extracted = await extractInvoiceFromText({
       text,
       presumedType: "cuenta_cobro",
@@ -1449,6 +1541,7 @@ async function processGenericPdf(
   msg: any,
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void,
+  llmTracker: LlmTracker,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -1475,6 +1568,18 @@ async function processGenericPdf(
       return { skip: true, reason: "pdf-sin-texto-extraible", subject };
     }
 
+    // PRE-FILTRO C: indicadores de factura en el texto. Skip si no los hay.
+    const { hasInvoiceIndicators } = await import("./llm-pre-filters");
+    if (!hasInvoiceIndicators(text)) {
+      llmTracker.preFilteredOut++;
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      return {
+        skip: true,
+        reason: "pdf-sin-indicadores-factura",
+        subject,
+      };
+    }
+
     // 3. Determinar tipo presumido
     const presumedType = isLikelyInternationalSender(sender)
       ? "recibo_internacional"
@@ -1482,6 +1587,7 @@ async function processGenericPdf(
 
     // 4. LLM
     const { extractInvoiceFromText } = await import("./llm-extractor");
+    llmTracker.calls++;
     const extracted = await extractInvoiceFromText({
       text,
       presumedType,

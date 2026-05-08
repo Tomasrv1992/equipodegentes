@@ -39,6 +39,74 @@
 ---
 
 
+### -1. **Procesar documentos NO-DIAN (cuentas de cobro Word + recibos internacionales)**
+
+**Por qué**: hoy el agente solo procesa facturas DIAN en formato ZIP (con XML estructurado).
+Pero un % significativo de los gastos de un cliente típico llega en otros formatos:
+
+1. **Cuentas de cobro** (`.docx` Word) — proveedores no obligados a facturación electrónica
+   (personas naturales, contratistas, freelancers) emiten cuenta de cobro en Word con
+   campos no estructurados: nombre, NIT/CC, concepto, valor, mes.
+2. **Recibos internacionales** — Stripe, PayPal, AWS, Google Workspace, Notion, Vercel,
+   GitHub, Anthropic, OpenAI, etc. Vienen en PDF adjunto o en el cuerpo del email (HTML).
+   Sin XML, sin estructura DIAN.
+
+Sin esto, el cliente abre el panel y ve solo la mitad de sus gastos del mes — Operatto
+no le ahorra trabajo en la otra mitad. **Bloquea la propuesta de valor "todo automatizado"**.
+
+**Implementación técnica**:
+
+1. **Detección del tipo de documento** (extender `processOne` en `pipeline.ts`):
+   - ZIP con XML DIAN → flujo actual ✅
+   - `.docx` adjunto → sub-pipeline cuenta de cobro
+   - PDF sin ZIP + sender NO colombiano → sub-pipeline recibo internacional
+   - Email body con sender conocido (`stripe.com`, `paypal.com`, `aws.amazon.com`,
+     `notion.so`, `anthropic.com`, etc) → parser por sender
+
+2. **Extracción con LLM (Claude o GPT)**:
+   - `.docx` → extraer texto con `mammoth` library
+   - PDF → extraer texto con `pdf-parse` library
+   - Email body → texto plano del HTML
+   - Pasar el texto a Claude/GPT con prompt estructurado:
+     ```
+     Extraé de este texto: fecha, proveedor, NIT (si aplica), número, total,
+     subtotal, iva, concepto, moneda. Devolvé JSON.
+     ```
+   - Parsear JSON + validar campos mínimos (fecha + total)
+   - Si moneda != COP → guardar en columna nueva `moneda` y `total_cop` (con tasa
+     del día de la factura)
+
+3. **Guardar en Sheet**:
+   - Misma estructura que facturas DIAN, con campos extra:
+     - `tipo` ("factura_dian" / "cuenta_cobro" / "recibo_internacional")
+     - `moneda` (COP/USD/EUR)
+     - `total_cop` (convertido si aplica)
+   - Carpeta Drive YYYY-MM/, sub-carpetas opcionales por tipo si crece
+
+4. **agent_events**:
+   - Mismo flujo, con `payload.tipo` para filtrar en panel
+   - Dashboard del Sheet: nueva sección "Por tipo de documento"
+
+5. **Costo LLM**:
+   - Anthropic Claude Haiku: ~$0.001 por extracción → 100 facts/mes/cliente = $0.10/mes
+   - Aceptable para el modelo de negocio
+
+6. **Heurísticas + LLM (híbrido)**:
+   - Senders conocidos (Stripe, etc) → parser regex específico (gratis, instantáneo)
+   - Resto → LLM
+   - Mejor de ambos: rápido + barato + flexible
+
+**Estimado**: 3 sub-sesiones (~10-12h total).
+- Sub-A: Cuentas de cobro `.docx` con LLM (~4h)
+- Sub-B: Recibos PDF internacionales (~4h)
+- Sub-C: Email body parsing por sender + heurísticas (~3h)
+
+**Bloquea**: nada técnico. Necesita API key de Claude/GPT en Netlify env vars.
+**Habilita**: la promesa "todo automatizado" para clientes con servicios SaaS y
+contratistas (la mayoría de PyMEs hoy).
+
+---
+
 ### 0. **Extracción de retenciones (ReteFuente, ReteIVA, ReteICA) + reglas configurables**
 
 **Por qué**: el agente hoy extrae subtotal/IVA/total. Para que sea **contablemente útil

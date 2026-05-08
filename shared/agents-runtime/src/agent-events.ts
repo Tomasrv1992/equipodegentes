@@ -19,6 +19,11 @@ export interface FacturaEventPayload {
   categoria?: string;
   cuentaPyg?: string;
   driveLink?: string;
+  /**
+   * Tipo de documento. Default 'factura_dian' para retro-compat.
+   * Valores: factura_dian | cuenta_cobro | recibo_internacional | recibo_servicio | planilla_ss
+   */
+  tipo?: string;
 }
 
 export interface EmitFacturaEventsInput {

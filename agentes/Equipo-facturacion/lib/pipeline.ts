@@ -33,6 +33,13 @@ export interface PipelineConfig {
     limit?: number | null;
     /** Gmail search window, e.g. "30d", "365d". */
     window?: string;
+    /**
+     * Si true, NO excluye emails con label "Procesado" del query Gmail.
+     * Útil para re-procesar y "encontrar" documentos que el cron viejo no
+     * pudo procesar (ej: Word/PDF antes de tener LLM).
+     * isDuplicate sigue activo en el Sheet para evitar duplicar filas DIAN.
+     */
+    force?: boolean;
   };
 }
 
@@ -53,6 +60,15 @@ export interface ProcessedRow extends InvoiceData {
   subject: string;
   categoria: string;
   cuentaPyg: string;
+  /**
+   * Tipo de documento (default 'factura_dian' si no se setea):
+   *   - factura_dian: ZIP+XML estándar DIAN (parser XML, sin LLM)
+   *   - cuenta_cobro: Word .docx (extracción LLM)
+   *   - recibo_internacional: PDF de Stripe/AWS/Notion/etc (LLM)
+   *   - recibo_servicio: PDF de servicios locales no-DIAN (LLM)
+   *   - planilla_ss: PDF planillas seguridad social PILA Colombia
+   */
+  tipo?: string;
 }
 
 // ===== Categorización =====
@@ -158,17 +174,24 @@ const PROCESSED_LABEL = "Procesado";
 
 export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const { google: g, options = {} } = cfg;
-  const { dryRun = false, limit = null, window = "30d" } = options;
+  const { dryRun = false, limit = null, window = "30d", force = false } = options;
 
-  // Query amplia: facturas DIAN (ZIP) + planillas SS (PDFs autoliquidaciones/comprobante).
+  // Query amplia: facturas DIAN (ZIP) + planillas SS + Word/PDFs no-DIAN.
   // El processOne distingue qué tipo es y aplica el sub-pipeline correspondiente.
   //
   // El parámetro `window` acepta dos formatos:
   //   - "30d" / "365d" → newer_than:Nd (rolling, último N días)
   //   - "2026/01/01"   → after:YYYY/MM/DD (fecha absoluta, ideal para backfill anual)
+  //
+  // Si `force=true`, el query NO excluye `-label:Procesado` → re-lee emails
+  // ya procesados. Útil para encontrar Word/PDFs que el cron viejo dejó sin
+  // procesar (cuando todavía no había LLM).
   const isAbsoluteDate = /^\d{4}\/\d{2}\/\d{2}$/.test(window);
   const dateFilter = isAbsoluteDate ? `after:${window}` : `newer_than:${window}`;
-  const searchQuery = `(filename:zip OR filename:autoliquidaciones OR filename:comprobante) -label:Procesado ${dateFilter}`;
+  const labelExclusion = force ? "" : "-label:Procesado ";
+  // Query: cubre todos los tipos de documentos que sub-pipelines pueden procesar
+  // (DIAN ZIP, planillas SS, Word, PDFs). Filename incluye extensión sin punto.
+  const searchQuery = `(filename:zip OR filename:pdf OR filename:docx OR filename:autoliquidaciones OR filename:comprobante) ${labelExclusion}${dateFilter}`;
 
   const auth = new google.auth.OAuth2(g.clientId, g.clientSecret);
   auth.setCredentials({ refresh_token: g.refreshToken });
@@ -1219,7 +1242,10 @@ async function processOne(
     }
 
     const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
-    const row: ProcessedRow = { ...data, driveLink, subject, categoria, cuentaPyg };
+    const row: ProcessedRow = {
+      ...data, driveLink, subject, categoria, cuentaPyg,
+      tipo: "factura_dian",
+    };
     const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
     pushToCache(tabName, newRow);
     await markEmailProcessed(gmail, messageId, labelId);
@@ -1338,6 +1364,7 @@ async function processPlanilla(
       subject,
       categoria: "Seguridad Social",
       cuentaPyg: "5202 - Seguridad social",
+      tipo: "planilla_ss",
     };
     const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
     pushToCache(tabName, newRow);
@@ -1500,6 +1527,7 @@ async function processCuentaCobroDocx(
       subject,
       categoria,
       cuentaPyg,
+      tipo: "cuenta_cobro",
     };
     const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
     pushToCache(tabName, newRow);
@@ -1673,6 +1701,7 @@ async function processGenericPdf(
       subject,
       categoria,
       cuentaPyg,
+      tipo: presumedType, // "recibo_internacional" o "recibo_servicio"
     };
     const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
     pushToCache(tabName, newRow);

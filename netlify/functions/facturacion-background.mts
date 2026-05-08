@@ -30,6 +30,12 @@ interface RequestBody {
   window?: string;
   /** Solo listar, no procesar. */
   dryRun?: boolean;
+  /**
+   * Si true, NO excluye -label:Procesado del query Gmail. Re-lee emails
+   * ya procesados para encontrar Word/PDF que el cron viejo dejó sin LLM.
+   * isDuplicate sigue activo en Sheet — no duplica filas.
+   */
+  force?: boolean;
 }
 
 export default async (req: Request) => {
@@ -192,6 +198,7 @@ export default async (req: Request) => {
             concepto: p.concepto,
             categoria: p.categoria,
             cuentaPyg: p.cuentaPyg,
+            tipo: (p as any).tipo ?? "factura_dian",
             driveLink: p.driveLink,
           }));
           await emitFacturaEvents({
@@ -315,6 +322,7 @@ async function buildConfig(
       options: {
         dryRun: body.dryRun ?? false,
         window: resolvedWindow,
+        force: body.force ?? false,
       },
     };
   }
@@ -332,6 +340,7 @@ async function buildConfig(
     options: {
       dryRun: body.dryRun ?? false,
       window: body.window ?? "30d",
+      force: body.force ?? false,
     },
   };
 }

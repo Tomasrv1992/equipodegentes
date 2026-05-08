@@ -54,10 +54,23 @@ export function runsLastDays(runs: AgentRun[], days: number, reference: Date = n
   return runs.filter((r) => new Date(r.started_at).getTime() >= cutoff);
 }
 
-/** Filtra runs ocurridos hoy (calendario, zona local del browser). */
+/** Devuelve la fecha en formato YYYY-MM-DD según zona Bogotá (no del browser). */
+function bogotaDateKey(d: Date): string {
+  // Intl con timeZone garantiza que un usuario en cualquier zona horaria
+  // vea el mismo "hoy" que un usuario en Bogotá. Crítico para no mostrar
+  // un cliente como "operativo hoy" cuando para él aún es ayer (o viceversa).
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Bogota",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+/** Filtra runs ocurridos hoy (calendario zona Bogotá). */
 export function runsToday(runs: AgentRun[], reference: Date = new Date()): AgentRun[] {
-  const today = reference.toDateString();
-  return runs.filter((r) => new Date(r.started_at).toDateString() === today);
+  const todayKey = bogotaDateKey(reference);
+  return runs.filter((r) => bogotaDateKey(new Date(r.started_at)) === todayKey);
 }
 
 /** Tiempo ahorrado en horas por procesado de N facturas. */
@@ -155,13 +168,14 @@ export function facturasLastDays(events: AgentEvent[], days: number, reference: 
   });
 }
 
-/** Filtra events con fecha REAL = hoy. */
+/** Filtra events con fecha REAL = hoy (calendario zona Bogotá). */
 export function facturasToday(events: AgentEvent[], reference: Date = new Date()): AgentEvent[] {
-  const today = reference.toDateString();
+  const todayKey = bogotaDateKey(reference);
   return events.filter((ev) => {
     const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
     if (!fecha) return false;
-    return new Date(fecha + "T00:00:00").toDateString() === today;
+    // payload.fecha viene en formato YYYY-MM-DD (no necesita conversión TZ)
+    return fecha === todayKey;
   });
 }
 

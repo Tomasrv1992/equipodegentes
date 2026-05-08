@@ -13,6 +13,10 @@
   function = "admin-create-onboarding"
   path = "/api/admin/create-onboarding-link"
 
+[[edge_functions]]
+  function = "admin-health-check"
+  path = "/api/admin/health-check"
+
 # OAuth flow del cliente (Fase 3)
 [[edge_functions]]
   function = "auth-google-start"

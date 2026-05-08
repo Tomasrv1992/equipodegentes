@@ -275,7 +275,8 @@ function nextCronAt(hour: number): string {
   const next = new Date();
   next.setHours(hour, 0, 0, 0);
   if (now.getTime() >= next.getTime()) {
-    // ya pasó hoy → mañana
+    // ya pasó hoy → avanzar a mañana
+    next.setDate(next.getDate() + 1);
   }
   return next.toLocaleTimeString("es-CO", {
     hour: "2-digit",

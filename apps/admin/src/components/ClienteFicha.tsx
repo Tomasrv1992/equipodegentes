@@ -269,12 +269,32 @@ interface ActivacionCardProps {
   slug: string;
 }
 
+interface HealthMonth {
+  mes: string;
+  gmail: number;
+  drive: number;
+  sheet: number;
+  events: number;
+  coincide: boolean;
+  diff: string | null;
+}
+interface HealthResult {
+  customerId: string;
+  year: number;
+  months: HealthMonth[];
+  totals: { gmail: number; drive: number; sheet: number; events: number; coincide: boolean };
+  summary: { meses_con_data: number; meses_con_discrepancia: number; todo_cuadra: boolean };
+}
+
 function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: ActivacionCardProps) {
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [creatingLink, setCreatingLink] = useState(false);
   const [createdLink, setCreatedLink] = useState<string | null>(null);
   const [linkError, setLinkError] = useState<string | null>(null);
+  const [checkingHealth, setCheckingHealth] = useState(false);
+  const [healthResult, setHealthResult] = useState<HealthResult | null>(null);
+  const [healthError, setHealthError] = useState<string | null>(null);
   const initialConfig = activacion.config as Record<string, string>;
   const [draft, setDraft] = useState({
     sheet_id: initialConfig.sheet_id ?? "",
@@ -282,6 +302,34 @@ function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: Activ
     notify_email: initialConfig.notify_email ?? "",
     netlify_site: initialConfig.netlify_site ?? "",
   });
+
+  async function handleHealthCheck() {
+    setCheckingHealth(true);
+    setHealthError(null);
+    setHealthResult(null);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("no session");
+      const resp = await fetch("/api/admin/health-check", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          customerId: cliente.slug,
+          agenteId: activacion.agente_id,
+        }),
+      });
+      const body = await resp.json();
+      if (!resp.ok) throw new Error(body.error ?? `HTTP ${resp.status}`);
+      setHealthResult(body as HealthResult);
+    } catch (e: any) {
+      setHealthError(e.message ?? String(e));
+    } finally {
+      setCheckingHealth(false);
+    }
+  }
 
   const last = runs[0];
   const sparkPoints = sparkRunsByDay(runs, 14);
@@ -445,6 +493,15 @@ function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: Activ
             </button>
             <span className="text-ink-4">·</span>
             <button
+              onClick={handleHealthCheck}
+              disabled={checkingHealth}
+              className="text-ink-3 hover:text-ink transition-colors tracking-[0.04em]"
+              title="Compara Gmail/Drive/Sheet/events mes a mes y detecta discrepancias"
+            >
+              {checkingHealth ? "Validando…" : "Validar coincidencia"}
+            </button>
+            <span className="text-ink-4">·</span>
+            <button
               onClick={() => togglePausa.mutate()}
               disabled={togglePausa.isPending}
               className="text-ink-3 hover:text-fail transition-colors tracking-[0.04em]"
@@ -462,6 +519,12 @@ function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: Activ
             )}
             {linkError && (
               <span className="text-fail w-full">Error: {linkError}</span>
+            )}
+            {healthError && (
+              <span className="text-fail w-full">Health check error: {healthError}</span>
+            )}
+            {healthResult && (
+              <HealthPanel result={healthResult} onClose={() => setHealthResult(null)} />
             )}
           </>
         ) : (
@@ -528,6 +591,87 @@ function CredentialStatusBadge({
         </span>
       )}
     </span>
+  );
+}
+
+function HealthPanel({
+  result,
+  onClose,
+}: {
+  result: HealthResult;
+  onClose: () => void;
+}) {
+  const { months, totals, summary } = result;
+  return (
+    <div className="w-full mt-3 border border-edge rounded-lg overflow-hidden">
+      <div
+        className={`px-4 py-2.5 flex items-center justify-between border-b border-edge ${
+          summary.todo_cuadra ? "bg-ok-soft" : "bg-warn-soft"
+        }`}
+      >
+        <div className="flex items-center gap-2">
+          <span className={`font-mono text-[10px] uppercase tracking-[0.1em] font-semibold ${
+            summary.todo_cuadra ? "text-ok" : "text-warn"
+          }`}>
+            {summary.todo_cuadra ? "✓ Todo cuadra" : `⚠ ${summary.meses_con_discrepancia} mes(es) con discrepancia`}
+          </span>
+          <span className="font-mono text-[10px] text-ink-3 tracking-[0.04em]">
+            · {summary.meses_con_data} mes(es) con data · año {result.year}
+          </span>
+        </div>
+        <button
+          onClick={onClose}
+          className="font-mono text-[10px] text-ink-3 hover:text-ink tracking-[0.04em]"
+        >
+          cerrar ×
+        </button>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-[11px] font-mono">
+          <thead className="bg-paper-sunken">
+            <tr className="text-ink-3 tracking-[0.04em] uppercase text-[9px]">
+              <th className="text-left px-3 py-1.5">Mes</th>
+              <th className="text-right px-3 py-1.5">Gmail</th>
+              <th className="text-right px-3 py-1.5">Drive</th>
+              <th className="text-right px-3 py-1.5">Sheet</th>
+              <th className="text-right px-3 py-1.5">Events</th>
+              <th className="text-left px-3 py-1.5">Estado</th>
+            </tr>
+          </thead>
+          <tbody>
+            {months.map((m) => (
+              <tr key={m.mes} className="border-t border-edge-2">
+                <td className="px-3 py-1.5 text-ink">{m.mes}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{m.gmail}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{m.drive}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{m.sheet}</td>
+                <td className="px-3 py-1.5 text-right tabular-nums">{m.events}</td>
+                <td className="px-3 py-1.5">
+                  {m.coincide ? (
+                    <span className="text-ok">✓</span>
+                  ) : (
+                    <span className="text-warn" title={m.diff || ""}>⚠ {m.diff}</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+            <tr className="border-t-2 border-edge bg-paper-sunken font-semibold">
+              <td className="px-3 py-1.5 text-ink uppercase tracking-[0.04em] text-[9px]">Total</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{totals.gmail}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{totals.drive}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{totals.sheet}</td>
+              <td className="px-3 py-1.5 text-right tabular-nums">{totals.events}</td>
+              <td className="px-3 py-1.5">
+                {totals.coincide ? <span className="text-ok">✓</span> : <span className="text-warn">⚠</span>}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="px-4 py-2 bg-paper-sunken border-t border-edge font-mono text-[9px] text-ink-3 tracking-[0.04em]">
+        Gmail = emails con label · Drive = PDFs en folder YYYY-MM · Sheet = filas en pestaña del mes · Events = filas en agent_events
+      </div>
+    </div>
   );
 }
 

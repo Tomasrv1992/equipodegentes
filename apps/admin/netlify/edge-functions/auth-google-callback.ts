@@ -60,7 +60,19 @@ export default async (request: Request, _context: Context) => {
     cliente_id: string;
     agente_id: string;
     cliente_slug: string;
+    step?: string;
   };
+
+  // 1.5. Si el token ya fue completado, redirigir al frontend SIN re-procesar.
+  //      Evita que un cliente que abre el link 2 veces (o reenvía el callback)
+  //      sobreescriba folder/sheet con nuevos recursos cada vez.
+  if (onboarding.step === "completed") {
+    console.log(`callback: token ya completado para ${onboarding.cliente_slug} — skip re-OAuth`);
+    return Response.redirect(
+      `${adminUrl}/onboarding/${state}?oauth=ok&completed=1`,
+      302,
+    );
+  }
 
   // 2. Intercambiar code por tokens
   const redirectUri = `${adminUrl}/api/auth/google/callback`;

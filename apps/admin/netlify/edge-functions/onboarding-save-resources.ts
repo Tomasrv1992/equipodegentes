@@ -100,10 +100,14 @@ export default async (request: Request, _context: Context) => {
     console.warn("step advance failed:", await advResp.text());
   }
 
-  // 4. Disparar el primer run del cron en BACKGROUND (fire-and-forget).
-  //    El cliente queda viendo "¡Listo!" mientras el cron procesa todo 2026.
-  //    Esto da experiencia "wow" — ve el potencial de Operatto en vivo, no
-  //    al día siguiente cuando arranque el cron diario.
+  // 4. Disparar el primer run del cron en BACKGROUND.
+  //    Background functions devuelven 202 inmediatamente — un await acá no
+  //    espera el procesamiento, solo confirma que el dispatch llegó OK.
+  //    Esto nos da diagnóstico real: sabemos si el primer run quedó encolado
+  //    o si falló por env vars / red / secret incorrecto.
+  let firstRunTriggered = false;
+  let firstRunError: string | null = null;
+
   try {
     const slugResp = await fetch(
       `${supabaseUrl}/rest/v1/clientes?id=eq.${ob.cliente_id}&select=slug`,
@@ -120,24 +124,43 @@ export default async (request: Request, _context: Context) => {
     const mainSiteUrl = Netlify.env.get("MAIN_SITE_URL");
     const internalSecret = Netlify.env.get("FACTURACION_INTERNAL_SECRET");
 
-    if (clienteSlug && mainSiteUrl && internalSecret && ob.agente_id === "facturacion") {
-      // Fire-and-forget: NO await, no romper si falla
-      fetch(`${mainSiteUrl}/.netlify/functions/facturacion-background`, {
-        method: "POST",
-        headers: {
-          "x-internal-secret": internalSecret,
-          "x-trigger": "onboarding",
-          "content-type": "application/json",
+    if (!clienteSlug) {
+      firstRunError = `cliente ${ob.cliente_id} sin slug en public.clientes`;
+    } else if (!mainSiteUrl) {
+      firstRunError = "MAIN_SITE_URL ausente en Netlify env vars (admin site)";
+    } else if (!internalSecret) {
+      firstRunError = "FACTURACION_INTERNAL_SECRET ausente en Netlify env vars (admin site)";
+    } else if (ob.agente_id !== "facturacion") {
+      firstRunError = `agente ${ob.agente_id} no soporta first-run automático`;
+    } else {
+      const dispatchResp = await fetch(
+        `${mainSiteUrl}/.netlify/functions/facturacion-background`,
+        {
+          method: "POST",
+          headers: {
+            "x-internal-secret": internalSecret,
+            "x-trigger": "onboarding",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ customerId: clienteSlug }),
         },
-        body: JSON.stringify({ customerId: clienteSlug }),
-      }).catch((e) => console.warn("first-run dispatch failed (no-fatal):", e));
+      );
+      // Background functions devuelven 202 si encolaron OK
+      if (dispatchResp.status === 202 || dispatchResp.status === 200) {
+        firstRunTriggered = true;
+        console.log(`[first-run] cliente=${clienteSlug} dispatched OK (status=${dispatchResp.status})`);
+      } else {
+        const txt = await dispatchResp.text();
+        firstRunError = `dispatch HTTP ${dispatchResp.status}: ${txt.slice(0, 200)}`;
+        console.warn(`[first-run] cliente=${clienteSlug} dispatch failed: ${firstRunError}`);
+      }
     }
   } catch (e: any) {
-    // No bloquear el onboarding si el dispatch falla
-    console.warn("first-run trigger error (no-fatal):", e.message);
+    firstRunError = `dispatch exception: ${e.message}`;
+    console.warn(`[first-run] dispatch exception: ${e.message}`);
   }
 
-  return json({ ok: true, firstRunTriggered: true });
+  return json({ ok: true, firstRunTriggered, firstRunError });
 };
 
 function json(body: unknown, status = 200): Response {

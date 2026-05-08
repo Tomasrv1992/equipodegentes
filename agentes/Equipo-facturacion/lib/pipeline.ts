@@ -701,6 +701,25 @@ function findDocxParts(payload: any) {
   return out;
 }
 
+/**
+ * Detecta PDFs adjuntos genéricos (no DIAN ZIP, no planilla SS).
+ * Usado para recibos internacionales (Stripe, AWS) y servicios locales no-DIAN.
+ */
+function findGenericPdfs(payload: any, exclude: Array<{ filename: string }>) {
+  const excludeNames = new Set(exclude.map((e) => e.filename));
+  const out: Array<{ filename: string; attachmentId: string }> = [];
+  function walk(part: any) {
+    if (part.filename && /\.pdf$/i.test(part.filename) && part.body?.attachmentId) {
+      if (!excludeNames.has(part.filename)) {
+        out.push({ filename: part.filename, attachmentId: part.body.attachmentId });
+      }
+    }
+    if (part.parts) part.parts.forEach(walk);
+  }
+  if (payload) walk(payload);
+  return out;
+}
+
 async function downloadAttachment(gmail: any, messageId: string, attachmentId: string, filename: string) {
   const res = await gmail.users.messages.attachments.get({ userId: "me", messageId, id: attachmentId });
   const buf = Buffer.from(res.data.data!, "base64url");
@@ -1016,6 +1035,19 @@ async function processOne(
       messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
       loadSheetRows, pushToCache,
     );
+  }
+
+  // Sub-pipeline PDF genérico (recibos internacionales / servicios locales):
+  // si NO hay ZIPs ni planillas SS pero SÍ hay PDFs adjuntos, intentar extracción
+  // con LLM. Cubre Stripe, AWS, Notion, recibos de servicios públicos, etc.
+  if (zips.length === 0) {
+    const genericPdfs = findGenericPdfs(msg.payload, planillas);
+    if (genericPdfs.length > 0) {
+      return await processGenericPdf(
+        messageId, labelId, gmail, drive, sheets, g, genericPdfs, subject, msg,
+        loadSheetRows, pushToCache,
+      );
+    }
   }
 
   if (zips.length === 0) return { skip: true, reason: "sin-zip", subject };
@@ -1385,6 +1417,165 @@ async function processCuentaCobroDocx(
     await applyMonthLabel(gmail, messageId, year, month);
 
     console.log(`[cuenta-cobro] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} (${extracted.moneda}) confianza=${extracted.confianza.toFixed(2)}`);
+
+    return { ok: true, ...row };
+  } finally {
+    cleanupTmp(tmpPaths);
+  }
+}
+
+/**
+ * Sub-pipeline PDF genérico (recibos internacionales + servicios locales no-DIAN).
+ *
+ * Cubre: Stripe, PayPal, AWS, Notion, GitHub, Anthropic, OpenAI, recibos de
+ * servicios públicos (luz/agua/internet) sin XML DIAN.
+ *
+ * Detecta sender para decidir presumedType:
+ *   - Sender internacional conocido → recibo_internacional
+ *   - Sender colombiano/desconocido → recibo_servicio (o LLM detecta no-factura)
+ *
+ * Si LLM dice "es_factura: false" (típico para confirmaciones de pago de
+ * Stripe sin detalle), skip silencioso.
+ */
+async function processGenericPdf(
+  messageId: string,
+  labelProcesadoId: string,
+  gmail: any,
+  drive: any,
+  sheets: any,
+  g: PipelineConfig["google"],
+  pdfs: Array<{ filename: string; attachmentId: string }>,
+  subject: string,
+  msg: any,
+  loadSheetRows: (tabName: string) => Promise<any[][]>,
+  pushToCache: (tabName: string, row: any[]) => void,
+): Promise<ProcessOneResult> {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return {
+      skip: true,
+      reason: "pdf-sin-api-key (configurar ANTHROPIC_API_KEY)",
+      subject,
+    };
+  }
+
+  const tmpPaths: string[] = [];
+  try {
+    const sender = getHeader(msg, "From") || "";
+    const dateHeader = getHeader(msg, "Date") || "";
+
+    // 1. Descargar primer PDF
+    const p = pdfs[0];
+    const pdfPath = await downloadAttachment(gmail, messageId, p.attachmentId, p.filename);
+    tmpPaths.push(pdfPath);
+
+    // 2. Extraer texto
+    const { extractTextFromPdf, isLikelyInternationalSender } = await import("./doc-parsers");
+    const text = await extractTextFromPdf(pdfPath);
+    if (!text || text.length < 30) {
+      return { skip: true, reason: "pdf-sin-texto-extraible", subject };
+    }
+
+    // 3. Determinar tipo presumido
+    const presumedType = isLikelyInternationalSender(sender)
+      ? "recibo_internacional"
+      : "recibo_servicio";
+
+    // 4. LLM
+    const { extractInvoiceFromText } = await import("./llm-extractor");
+    const extracted = await extractInvoiceFromText({
+      text,
+      presumedType,
+      filename: p.filename,
+      sender,
+      subject,
+      emailDate: dateHeader,
+    });
+    if (!extracted) {
+      return { skip: true, reason: `pdf-no-es-factura (LLM: ${presumedType})`, subject };
+    }
+    if (extracted.confianza < 0.4) {
+      return {
+        skip: true,
+        reason: `pdf-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
+        subject,
+      };
+    }
+
+    // 5. Year/month + skip pre-año-actual
+    const issue = new Date(extracted.fecha + "T00:00:00");
+    const year = issue.getFullYear();
+    const month = issue.getMonth() + 1;
+    const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
+    if (year < minYear) {
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      return {
+        skip: true,
+        reason: `pdf-fecha-año-anterior (${extracted.fecha} < ${minYear})`,
+        subject,
+      };
+    }
+
+    // 6. Tab + folder del mes
+    const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
+    const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+    const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
+
+    // 7. Dedup
+    const sheetRows = await loadSheetRows(tabName);
+    if (extracted.nit && extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit)) {
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyMonthLabel(gmail, messageId, year, month);
+      return {
+        dup: true,
+        motivo: `${extracted.proveedor} ${extracted.numero} (ya en ${tabName})`,
+        subject,
+      };
+    }
+
+    // 8. Consecutivo
+    let maxN = 0;
+    for (let i = 1; i < sheetRows.length; i++) {
+      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
+      if (!isNaN(v) && v > maxN) maxN = v;
+    }
+    const consecutivo = maxN + 1;
+
+    // 9. Subir PDF a Drive
+    const baseName = buildFileBaseName(consecutivo, extracted.proveedor);
+    const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
+    const driveLink = uploaded.webViewLink || "";
+
+    // 10. Append al Sheet — anota moneda en concepto si != COP
+    const { categoria, cuentaPyg } = categorizar({
+      nit: extracted.nit,
+      concepto: extracted.concepto,
+    });
+    const conceptoFinal = extracted.moneda !== "COP"
+      ? `${extracted.concepto} [${extracted.moneda} ${extracted.total.toLocaleString("en-US")}]`
+      : extracted.concepto;
+    const row: ProcessedRow = {
+      fecha: extracted.fecha,
+      proveedor: extracted.proveedor,
+      nit: extracted.nit,
+      numero: extracted.numero,
+      cufe: "",
+      subtotal: extracted.subtotal,
+      iva: extracted.iva,
+      total: extracted.totalCop,
+      concepto: conceptoFinal,
+      driveLink,
+      subject,
+      categoria,
+      cuentaPyg,
+    };
+    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
+    pushToCache(tabName, newRow);
+
+    // 11. Labels
+    await markEmailProcessed(gmail, messageId, labelProcesadoId);
+    await applyMonthLabel(gmail, messageId, year, month);
+
+    console.log(`[${presumedType}] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} ${extracted.moneda} confianza=${extracted.confianza.toFixed(2)}`);
 
     return { ok: true, ...row };
   } finally {

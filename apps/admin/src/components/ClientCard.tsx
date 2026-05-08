@@ -5,6 +5,7 @@ import { timelineLast24h, sparkRunsByDay } from "../lib/timeline";
 import {
   totalProcesadas,
   runsLastDays,
+  runsToday,
   tiempoAhorradoHoras,
   formatHoras,
 } from "../lib/metrics";
@@ -23,15 +24,15 @@ export default function ClientCard({ cliente, activacion, agente, runs }: Client
   const ticks = timelineLast24h(runs);
   const sparkPoints = sparkRunsByDay(runs, 14);
 
-  // Estado actual: peor estado de los runs últimas 24h
-  const last24Runs = runs.filter(
-    (r) => Date.now() - new Date(r.started_at).getTime() < 24 * 60 * 60 * 1000,
-  );
-  const hasRecentFail = last24Runs.some((r) => r.status === "fail");
-  const hasRecentWarn = last24Runs.some((r) => r.status === "warn");
-  const status: "ok" | "warn" | "fail" = hasRecentFail
+  // Estado actual: peor estado de los runs DE HOY (calendario, zona Bogotá).
+  // Errores de días anteriores no marcan al cliente como "con errores" — la
+  // operación es diaria y el cliente espera ver el estado del día.
+  const todayRuns = runsToday(runs);
+  const hasFailToday = todayRuns.some((r) => r.status === "fail");
+  const hasWarnToday = todayRuns.some((r) => r.status === "warn");
+  const status: "ok" | "warn" | "fail" = hasFailToday
     ? "fail"
-    : hasRecentWarn
+    : hasWarnToday
     ? "warn"
     : "ok";
 

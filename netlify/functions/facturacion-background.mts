@@ -310,8 +310,49 @@ function requireEnv(name: string): string {
 
 // ===== Notificaciones (Resend) =====
 
-const SHEET_LINK = "https://docs.google.com/spreadsheets/d/1dwCu-1ooeyOC5PEd2lBIhua4zUmC5ymymQ6X0O4zcMU/edit";
-const DRIVE_LINK = "https://drive.google.com/drive/folders/1ksS7gwlT8OYmMh4Eh2WiIQGNwkERdti2";
+// Fallback links del owner legacy. Para clientes multi-tenant se construyen
+// dinámicamente desde cred.sheet_id y cred.drive_folder_id.
+const OWNER_SHEET_LINK = "https://docs.google.com/spreadsheets/d/1dwCu-1ooeyOC5PEd2lBIhua4zUmC5ymymQ6X0O4zcMU/edit";
+const OWNER_DRIVE_LINK = "https://drive.google.com/drive/folders/1ksS7gwlT8OYmMh4Eh2WiIQGNwkERdti2";
+
+interface NotifyTarget {
+  to: string;
+  sheetLink: string;
+  driveLink: string;
+}
+
+/**
+ * Resuelve a quién mandar el correo y qué links usar.
+ * Multi-tenant: usa cred.notify_email + IDs del cliente.
+ * Legacy: env vars del site.
+ */
+async function resolveNotifyTarget(customerId?: string): Promise<NotifyTarget> {
+  if (customerId) {
+    try {
+      const { loadCredentialsBySlug } = await import("../../shared/agents-runtime/src/credentials-by-slug");
+      const cred = await loadCredentialsBySlug(customerId, "facturacion");
+      if (cred?.notify_email) {
+        return {
+          to: cred.notify_email,
+          sheetLink: cred.sheet_id
+            ? `https://docs.google.com/spreadsheets/d/${cred.sheet_id}/edit`
+            : OWNER_SHEET_LINK,
+          driveLink: cred.drive_folder_id
+            ? `https://drive.google.com/drive/folders/${cred.drive_folder_id}`
+            : OWNER_DRIVE_LINK,
+        };
+      }
+    } catch (e: any) {
+      console.warn(`resolveNotifyTarget: failed loading cred for ${customerId}:`, e.message);
+    }
+  }
+  // Fallback legacy — owner
+  return {
+    to: process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com",
+    sheetLink: OWNER_SHEET_LINK,
+    driveLink: OWNER_DRIVE_LINK,
+  };
+}
 
 async function notifyResult(result: PipelineResult, customerId?: string): Promise<void> {
   const apiKey = process.env.RESEND_API_KEY;
@@ -320,8 +361,8 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
     return;
   }
 
-  const to = process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com";
-  const from = process.env.NOTIFY_EMAIL_FROM || "Procesar-Facturas <onboarding@resend.dev>";
+  const target = await resolveNotifyTarget(customerId);
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
 
   const total = result.procesadas.length + result.errores.length + result.saltadas.length;
   const today = new Date().toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "America/Bogota" });
@@ -335,7 +376,7 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
     subject = `📭 Facturas ${today}: sin novedad`;
   }
 
-  const html = renderHtmlSummary(result, today, customerId);
+  const html = renderHtmlSummary(result, today, customerId, target.sheetLink, target.driveLink);
 
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -343,22 +384,25 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
       Authorization: `Bearer ${apiKey}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ from, to: [to], subject, html }),
+    body: JSON.stringify({ from, to: [target.to], subject, html }),
   });
 
   if (!res.ok) {
     const txt = await res.text();
     console.error("Resend error:", res.status, txt);
   } else {
-    console.log(`Email enviado a ${to} — total ${total} items`);
+    console.log(`Email enviado a ${target.to} (cliente: ${customerId ?? "owner"}) — total ${total} items`);
   }
 }
 
 async function notifyError(err: Error, customerId?: string): Promise<void> {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return;
-  const to = process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com";
-  const from = process.env.NOTIFY_EMAIL_FROM || "Procesar-Facturas <onboarding@resend.dev>";
+  // Errores van AL CLIENTE para que sepa que algo falla. Con copia oculta a Tomás
+  // se podría agregar después si querés monitorear todos.
+  const target = await resolveNotifyTarget(customerId);
+  const to = target.to;
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
 
   const today = new Date().toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "America/Bogota" });
   const hint = err.message?.includes("invalid_grant")
@@ -382,7 +426,13 @@ async function notifyError(err: Error, customerId?: string): Promise<void> {
   });
 }
 
-function renderHtmlSummary(result: PipelineResult, today: string, customerId?: string): string {
+function renderHtmlSummary(
+  result: PipelineResult,
+  today: string,
+  customerId?: string,
+  sheetLink: string = OWNER_SHEET_LINK,
+  driveLink: string = OWNER_DRIVE_LINK,
+): string {
   const moneyCO = (n: number) =>
     "$" + Math.round(n).toLocaleString("es-CO");
 
@@ -449,9 +499,9 @@ function renderHtmlSummary(result: PipelineResult, today: string, customerId?: s
       }
 
       <p style="margin:28px 0 4px;color:#666;font-size:13px">
-        <a href="${SHEET_LINK}">📊 Abrir Sheet</a>
+        <a href="${sheetLink}">📊 Abrir Sheet</a>
         &nbsp;·&nbsp;
-        <a href="${DRIVE_LINK}">📁 Abrir Drive</a>
+        <a href="${driveLink}">📁 Abrir Drive</a>
       </p>
     </div>
   `;

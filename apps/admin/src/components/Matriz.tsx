@@ -42,18 +42,18 @@ export default function Matriz() {
   const horasAhorradasMes = tiempoAhorradoHoras(facturasMes);
   const horasAhorradasAllTime = tiempoAhorradoHoras(facturasAllTime);
   // Runs hoy / errores siguen usando agent_runs (info técnica del cron)
-  const runsHoyN = runsToday(runs).length;
-  const errores7d = totalErrores(runsLastDays(runs, 7));
+  const runsTodayList = runsToday(runs);
+  const runsHoyN = runsTodayList.length;
+  // Errores HOY (calendario) — errores de días pasados no son ruido operacional.
+  const erroresHoy = totalErrores(runsTodayList);
   const lastFailRuns = runs
     .filter((r) => r.status === "fail")
     .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime());
   const lastFail = lastFailRuns[0];
   const lastFailWhen = lastFail ? timeAgo(lastFail.started_at) : null;
 
-  // Status global del hero
-  const heroStatus: "ok" | "warn" | "fail" = lastFail && new Date(lastFail.started_at).getTime() > Date.now() - 24 * 60 * 60 * 1000
-    ? "fail"
-    : "ok";
+  // Status global del hero — solo "fail" si hay errores HOY
+  const heroStatus: "ok" | "warn" | "fail" = erroresHoy > 0 ? "fail" : "ok";
 
   // Próximo cron (asumimos cron 7am Bogota; si ya pasó hoy, mañana)
   const proxCron = nextCronAt(7);
@@ -109,9 +109,9 @@ export default function Matriz() {
             meta: runsHoyN > 0 ? <>último: <span className="text-ok">{lastRunGlobal ? timeAgo(lastRunGlobal.started_at) : ""}</span></> : "esperando primer cron",
           },
           {
-            label: "Errores 7 días",
-            value: errores7d,
-            alert: errores7d > 0,
+            label: "Errores hoy",
+            value: erroresHoy,
+            alert: erroresHoy > 0,
             meta: lastFailWhen ? `último: ${lastFailWhen}` : "ninguno",
           },
           {
@@ -129,53 +129,9 @@ export default function Matriz() {
         ]}
       />
 
-      {/* === Clientes en operación (PRIMERO) === */}
-      <div className="flex items-baseline justify-between mb-4">
-        <h2 className="section-title">Clientes en operación</h2>
-        <span className="section-meta">
-          {actsActivas.length === 0
-            ? "ninguno activado"
-            : `${actsActivas.length} activación${actsActivas.length === 1 ? "" : "es"} · ordenado por última actividad`}
-        </span>
-      </div>
-
-      {clientes.length === 0 ? (
-        <EmptyState
-          title="Sin clientes todavía"
-          description="Cuando crees un cliente y actives Equipo-facturación, aparecerán acá con su timeline operacional."
-          cta={{ label: "Crear primer cliente", to: "/nuevo-cliente" }}
-        />
-      ) : actsActivas.length === 0 ? (
-        <EmptyState
-          title="Sin agentes activados"
-          description="Tenés clientes pero ninguno tiene un agente activado todavía. Editá un cliente para activar Equipo-facturación."
-          cta={null}
-        />
-      ) : (
-        <div className="grid grid-cols-1 gap-3 mb-9">
-          {actsActivas.map((act) => {
-            const cliente = clienteById[act.cliente_id];
-            if (!cliente) return null;
-            const agente = agenteById[act.agente_id];
-            const runsCA = runs.filter(
-              (r) => r.cliente_id === cliente.id && r.agente_id === act.agente_id,
-            );
-            return (
-              <ClientCard
-                key={`${act.cliente_id}-${act.agente_id}`}
-                cliente={cliente}
-                activacion={act}
-                agente={agente}
-                runs={runsCA}
-              />
-            );
-          })}
-        </div>
-      )}
-
-      {/* === Resumen por agente (DESPUÉS de clientes) === */}
+      {/* === Resumen por agente (PRIMERO — visión global) === */}
       {actsActivas.length > 0 && (
-        <section>
+        <section className="mb-9">
           <div className="flex items-baseline justify-between mb-4">
             <h2 className="section-title">Resumen por agente</h2>
             <Link
@@ -225,6 +181,50 @@ export default function Matriz() {
             })}
           </div>
         </section>
+      )}
+
+      {/* === Clientes en operación (DESPUÉS — detalle por cliente) === */}
+      <div className="flex items-baseline justify-between mb-4">
+        <h2 className="section-title">Clientes en operación</h2>
+        <span className="section-meta">
+          {actsActivas.length === 0
+            ? "ninguno activado"
+            : `${actsActivas.length} activación${actsActivas.length === 1 ? "" : "es"} · ordenado por última actividad`}
+        </span>
+      </div>
+
+      {clientes.length === 0 ? (
+        <EmptyState
+          title="Sin clientes todavía"
+          description="Cuando crees un cliente y actives Equipo-facturación, aparecerán acá con su timeline operacional."
+          cta={{ label: "Crear primer cliente", to: "/nuevo-cliente" }}
+        />
+      ) : actsActivas.length === 0 ? (
+        <EmptyState
+          title="Sin agentes activados"
+          description="Tenés clientes pero ninguno tiene un agente activado todavía. Editá un cliente para activar Equipo-facturación."
+          cta={null}
+        />
+      ) : (
+        <div className="grid grid-cols-1 gap-3 mb-9">
+          {actsActivas.map((act) => {
+            const cliente = clienteById[act.cliente_id];
+            if (!cliente) return null;
+            const agente = agenteById[act.agente_id];
+            const runsCA = runs.filter(
+              (r) => r.cliente_id === cliente.id && r.agente_id === act.agente_id,
+            );
+            return (
+              <ClientCard
+                key={`${act.cliente_id}-${act.agente_id}`}
+                cliente={cliente}
+                activacion={act}
+                agente={agente}
+                runs={runsCA}
+              />
+            );
+          })}
+        </div>
       )}
     </div>
   );

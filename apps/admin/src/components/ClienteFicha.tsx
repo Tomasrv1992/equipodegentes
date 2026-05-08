@@ -5,12 +5,13 @@ import { supabase } from "../lib/supabase";
 import { useAgentes, useFacturasByCliente } from "../lib/queries";
 import {
   runsLastDays,
+  runsToday,
   tiempoAhorradoHoras,
   formatHoras,
   totalErrores,
   totalFacturas,
   facturasThisMonth,
-  facturasLastDays,
+  facturasToday,
   aggFacturasByCurrentYear,
 } from "../lib/metrics";
 import Pill from "./Pill";
@@ -106,9 +107,10 @@ export default function ClienteFicha({ slug }: { slug: string }) {
   // === KPIs del cliente — agent_events (fecha REAL de la factura) ===
   const facturasArr = facturas ?? [];
   const facturasMes = totalFacturas(facturasThisMonth(facturasArr));
-  const facturas7d = totalFacturas(facturasLastDays(facturasArr, 7));
+  const facturasHoy = totalFacturas(facturasToday(facturasArr));
   const horasMes = tiempoAhorradoHoras(facturasMes);
-  // Errores siguen viniendo de agent_runs (info técnica del cron)
+  // Errores: hoy (operacional) y 30d (histórico)
+  const erroresHoy = totalErrores(runsToday(runs));
   const errores30d = totalErrores(runsLastDays(runs, 30));
   const monthlyAgg = aggFacturasByCurrentYear(facturasArr);
 
@@ -169,11 +171,12 @@ export default function ClienteFicha({ slug }: { slug: string }) {
         </div>
       </div>
 
-      {/* KPIs */}
+      {/* KPIs — orden operacional: día → mes → histórico */}
       <Kpis
         items={[
+          { label: "Procesadas hoy", value: facturasHoy, unit: "facturas" },
+          { label: "Errores hoy", value: erroresHoy, alert: erroresHoy > 0 },
           { label: "Procesadas mes", value: facturasMes, unit: "facturas", meta: facturasMes > 0 ? `≈ ${formatHoras(horasMes)} ahorradas` : "—" },
-          { label: "Procesadas 7 días", value: facturas7d, unit: "facturas" },
           { label: "Errores 30d", value: errores30d, alert: errores30d > 0 },
           { label: "Tiempo ahorrado", value: formatHoras(horasMes).replace(/[hm]/, ""), unit: formatHoras(horasMes).endsWith("h") ? "h" : "min", meta: "este mes" },
         ]}

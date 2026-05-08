@@ -10,7 +10,10 @@ export interface KpiData {
 
 export default function Kpis({ items }: { items: KpiData[] }) {
   return (
-    <section className="grid grid-cols-4 border border-edge rounded-lg bg-paper-2 mb-9 overflow-hidden">
+    <section
+      className="grid border border-edge rounded-lg bg-paper-2 mb-9 overflow-hidden"
+      style={{ gridTemplateColumns: `repeat(${items.length}, 1fr)` }}
+    >
       {items.map((kpi, i) => (
         <div
           key={i}

@@ -50,10 +50,19 @@ export default async (req: Request) => {
     /* body opcional, default {} */
   }
 
-  // 3. Resolver config según customerId
-  const cfg = await buildConfig(body);
+  // 3. Cargar credenciales del cliente (multi-tenant) ANTES del run
+  //    Lo necesitamos para detectar `wasFirstRun` y elegir entre email
+  //    de bienvenida (post-onboarding) vs email diario.
+  let credBefore: Awaited<ReturnType<typeof loadCredentialsForBackground>> = null;
+  if (body.customerId) {
+    credBefore = await loadCredentialsForBackground(body.customerId);
+  }
+  const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
 
-  // 4. Ejecutar pipeline + registrar en agent_runs
+  // 4. Resolver config según customerId (reutiliza cred si ya cargado)
+  const cfg = await buildConfig(body, credBefore);
+
+  // 5. Ejecutar pipeline + registrar en agent_runs
   const startedAt = Date.now();
   const clienteSlug = body.customerId ?? "owner";
 
@@ -205,9 +214,16 @@ export default async (req: Request) => {
     }
   }
 
-  // Email diario incondicional con resumen
+  // Email: si fue primer run del cliente (post-onboarding) Y terminó OK,
+  // mandamos email de BIENVENIDA con resumen completo del año actual.
+  // Sino, email diario regular con lo procesado en este run.
   try {
-    await notifyResult(result, body.customerId);
+    if (wasFirstRun && body.customerId && result.errores.length === 0) {
+      console.log(`[welcome] cliente ${body.customerId}: primer run OK, enviando email de bienvenida`);
+      await notifyWelcome(body.customerId);
+    } else {
+      await notifyResult(result, body.customerId);
+    }
   } catch (err: any) {
     console.error("notify failed:", err.message);
   }
@@ -223,13 +239,27 @@ export const config: Config = {
 
 // ===== Config builder =====
 
-async function buildConfig(body: RequestBody): Promise<PipelineConfig> {
+/**
+ * Carga las credenciales del cliente para el background fn (con validación).
+ * Devuelve null si el customerId no tiene fila o las creds están incompletas.
+ * Usar antes de buildConfig para detectar wasFirstRun.
+ */
+async function loadCredentialsForBackground(customerId: string) {
+  const { loadCredentialsBySlug } = await import("../../shared/agents-runtime/src/credentials-by-slug");
+  const cred = await loadCredentialsBySlug(customerId, "facturacion");
+  if (!cred) return null;
+  return cred;
+}
+
+async function buildConfig(
+  body: RequestBody,
+  preloadedCred: Awaited<ReturnType<typeof loadCredentialsForBackground>> = null,
+): Promise<PipelineConfig> {
   // === Multi-tenant: customerId es el SLUG del cliente en public.clientes ===
   // Carga credenciales del cliente desde Supabase (refresh_token desencriptado
   // con pgcrypto + recursos elegidos durante onboarding).
   if (body.customerId) {
-    const { loadCredentialsBySlug } = await import("../../shared/agents-runtime/src/credentials-by-slug");
-    const cred = await loadCredentialsBySlug(body.customerId, "facturacion");
+    const cred = preloadedCred ?? (await loadCredentialsForBackground(body.customerId));
     if (!cred) {
       throw new Error(
         `Cliente con slug "${body.customerId}" no tiene credenciales en client_credentials`,
@@ -516,6 +546,229 @@ function renderHtmlSummary(
       </p>
     </div>
   `;
+}
+
+/**
+ * Email de BIENVENIDA — sale 1 sola vez después del primer run exitoso del cliente.
+ * Resumen completo del año en curso: total facturas, monto, top proveedores,
+ * breakdown por mes, tiempo ahorrado. Más celebratorio que el email diario.
+ */
+async function notifyWelcome(customerId: string): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.warn("RESEND_API_KEY ausente — no se envía notificación welcome");
+    return;
+  }
+
+  const target = await resolveNotifyTarget(customerId);
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
+
+  // Cargar nombre del cliente + agregados desde Supabase
+  const supa = getServerClient();
+  const year = new Date().getFullYear();
+
+  const { data: cli } = await supa
+    .from("clientes")
+    .select("id, nombre")
+    .eq("slug", customerId)
+    .single();
+  const clienteNombre = (cli as { nombre?: string } | null)?.nombre ?? customerId;
+  const clienteId = (cli as { id?: string } | null)?.id;
+
+  if (!clienteId) {
+    console.warn(`[welcome] cliente ${customerId} no encontrado en clientes`);
+    return;
+  }
+
+  // Cargar todos los events del año en curso
+  const startYear = `${year}-01-01`;
+  const endYear = `${year + 1}-01-01`;
+  const { data: events } = await supa
+    .from("agent_events")
+    .select("payload")
+    .eq("cliente_id", clienteId)
+    .eq("agente_id", "facturacion")
+    .eq("tipo", "factura_procesada")
+    .gte("payload->>fecha", startYear)
+    .lt("payload->>fecha", endYear);
+
+  const list = (events as Array<{ payload: any }> | null) ?? [];
+  const total = list.length;
+  const totalMonto = list.reduce((s, ev) => s + (Number(ev.payload?.total) || 0), 0);
+  const tiempoMinutos = total * 10; // 10 min/factura
+  const tiempoHoras = Math.round((tiempoMinutos / 60) * 10) / 10;
+  const tiempoDias = Math.round((tiempoHoras / 8) * 10) / 10;
+
+  // Top 5 proveedores
+  const proveedoresMap = new Map<string, { count: number; monto: number }>();
+  for (const ev of list) {
+    const p = ev.payload?.proveedor || "Sin nombre";
+    const t = Number(ev.payload?.total) || 0;
+    const cur = proveedoresMap.get(p) ?? { count: 0, monto: 0 };
+    cur.count++;
+    cur.monto += t;
+    proveedoresMap.set(p, cur);
+  }
+  const topProveedores = Array.from(proveedoresMap.entries())
+    .map(([proveedor, agg]) => ({ proveedor, ...agg }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  // Breakdown por mes
+  const mesesMap = new Map<string, { count: number; monto: number }>();
+  for (const ev of list) {
+    const fecha = ev.payload?.fecha;
+    if (!fecha) continue;
+    const ymKey = fecha.slice(0, 7); // YYYY-MM
+    const cur = mesesMap.get(ymKey) ?? { count: 0, monto: 0 };
+    cur.count++;
+    cur.monto += Number(ev.payload?.total) || 0;
+    mesesMap.set(ymKey, cur);
+  }
+  const mesesOrdenados = Array.from(mesesMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, agg]) => {
+      const [, m] = key.split("-");
+      const mesName = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+                       "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"][parseInt(m, 10) - 1];
+      return { mes: mesName, ...agg };
+    });
+
+  const subject = `🎉 Operatto desatrasó tu ${year} — ${total} facturas listas`;
+  const html = renderWelcomeHtml({
+    clienteNombre,
+    year,
+    total,
+    totalMonto,
+    tiempoHoras,
+    tiempoDias,
+    topProveedores,
+    mesesOrdenados,
+    sheetLink: target.sheetLink,
+    driveLink: target.driveLink,
+  });
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ from, to: [target.to], subject, html }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    console.error("Resend welcome error:", res.status, txt);
+  } else {
+    console.log(`[welcome] email enviado a ${target.to} — ${total} facturas`);
+  }
+}
+
+interface WelcomeData {
+  clienteNombre: string;
+  year: number;
+  total: number;
+  totalMonto: number;
+  tiempoHoras: number;
+  tiempoDias: number;
+  topProveedores: Array<{ proveedor: string; count: number; monto: number }>;
+  mesesOrdenados: Array<{ mes: string; count: number; monto: number }>;
+  sheetLink: string;
+  driveLink: string;
+}
+
+function renderWelcomeHtml(d: WelcomeData): string {
+  const moneyCO = (n: number) => "$" + Math.round(n).toLocaleString("es-CO");
+
+  const proveedoresRows = d.topProveedores
+    .map((p, i) => `
+      <tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;color:#888;font-variant-numeric:tabular-nums">${i + 1}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee">${escapeHtml(p.proveedor)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${p.count}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${moneyCO(p.monto)}</td>
+      </tr>`)
+    .join("");
+
+  const mesesRows = d.mesesOrdenados
+    .map((m) => `
+      <tr>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee">${m.mes}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${m.count}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${moneyCO(m.monto)}</td>
+      </tr>`)
+    .join("");
+
+  return `
+<div style="font-family:system-ui,-apple-system,sans-serif;max-width:680px;margin:0 auto;color:#222;padding:24px">
+  <div style="text-align:center;padding:32px 16px;background:linear-gradient(135deg,#1a3a5c 0%,#2c5282 100%);color:#fff;border-radius:12px;margin-bottom:24px">
+    <div style="font-size:48px;margin-bottom:12px">🎉</div>
+    <h1 style="margin:0 0 8px;font-size:28px;font-weight:600">Operatto desatrasó tu ${d.year}</h1>
+    <p style="margin:0;font-size:16px;opacity:0.9">Hola ${escapeHtml(d.clienteNombre)} — esto fue lo que procesamos</p>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:24px">
+    <div style="background:#f5f7fa;padding:20px;border-radius:8px;text-align:center">
+      <div style="font-size:36px;font-weight:600;color:#1a3a5c;line-height:1">${d.total}</div>
+      <div style="font-size:13px;color:#666;margin-top:6px">facturas procesadas</div>
+    </div>
+    <div style="background:#f5f7fa;padding:20px;border-radius:8px;text-align:center">
+      <div style="font-size:36px;font-weight:600;color:#1a3a5c;line-height:1">${moneyCO(d.totalMonto)}</div>
+      <div style="font-size:13px;color:#666;margin-top:6px">monto registrado</div>
+    </div>
+    <div style="background:#fef9e7;padding:20px;border-radius:8px;text-align:center;grid-column:1/3">
+      <div style="font-size:24px;font-weight:600;color:#8a6d00;line-height:1">${d.tiempoHoras} h</div>
+      <div style="font-size:13px;color:#806600;margin-top:6px">≈ ${d.tiempoDias} días de trabajo ahorrado (10 min/factura)</div>
+    </div>
+  </div>
+
+  ${d.mesesOrdenados.length > 0 ? `
+    <h2 style="margin:24px 0 8px;font-size:18px;color:#1a3a5c">📊 Por mes</h2>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;background:#fff">
+      <thead><tr style="background:#fafafa">
+        <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;color:#666;font-weight:600">Mes</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Facturas</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Monto</th>
+      </tr></thead>
+      <tbody>${mesesRows}</tbody>
+    </table>
+  ` : ""}
+
+  ${d.topProveedores.length > 0 ? `
+    <h2 style="margin:24px 0 8px;font-size:18px;color:#1a3a5c">🏆 Top 5 proveedores</h2>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;background:#fff">
+      <thead><tr style="background:#fafafa">
+        <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;color:#666;font-weight:600">#</th>
+        <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;color:#666;font-weight:600">Proveedor</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Facturas</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Monto</th>
+      </tr></thead>
+      <tbody>${proveedoresRows}</tbody>
+    </table>
+  ` : ""}
+
+  <div style="background:#f0f9ff;padding:20px;border-radius:8px;margin:24px 0;border-left:4px solid #1a3a5c">
+    <h3 style="margin:0 0 12px;font-size:16px;color:#1a3a5c">📁 Tus archivos</h3>
+    <p style="margin:0;font-size:14px;line-height:1.6">
+      <a href="${d.sheetLink}" style="color:#1a3a5c;font-weight:600;text-decoration:none">📊 Abrir tu Sheet con Dashboard →</a><br>
+      <a href="${d.driveLink}" style="color:#1a3a5c;font-weight:600;text-decoration:none">📁 Abrir carpeta Drive con todos los PDFs →</a>
+    </p>
+  </div>
+
+  <div style="background:#fff;padding:20px;border:1px solid #e5e7eb;border-radius:8px;margin:24px 0">
+    <h3 style="margin:0 0 8px;font-size:16px;color:#1a3a5c">¿Qué sigue?</h3>
+    <p style="margin:0;font-size:14px;line-height:1.6;color:#444">
+      Operatto va a procesar todas tus facturas nuevas <strong>todos los días a las 7:00am</strong> (zona Bogotá).
+      Vas a recibir un email diario con el resumen del día. No tenés que hacer nada — solo abrir tu Sheet
+      cuando quieras revisar.
+    </p>
+  </div>
+
+  <p style="margin:32px 0 0;font-size:13px;color:#888;text-align:center">
+    Cualquier cosa, escribime. — Tomás
+  </p>
+</div>
+`;
 }
 
 function escapeHtml(s: any): string {

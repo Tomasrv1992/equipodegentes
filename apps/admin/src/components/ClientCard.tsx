@@ -1,15 +1,15 @@
 import { Link } from "react-router-dom";
 import Timeline24h from "./Timeline24h";
-import Sparkline from "./Sparkline";
-import { timelineLast24h, sparkRunsByDay } from "../lib/timeline";
+import { timelineLast24h } from "../lib/timeline";
 import {
-  totalProcesadas,
-  runsLastDays,
   runsToday,
   tiempoAhorradoHoras,
   formatHoras,
+  totalFacturas,
+  facturasToday,
+  facturasThisMonth,
 } from "../lib/metrics";
-import type { Cliente, Agente, AgentRun, ClientAgent } from "../types";
+import type { Cliente, Agente, AgentRun, ClientAgent, AgentEvent } from "../types";
 
 interface ClientCardProps {
   cliente: Cliente;
@@ -18,11 +18,12 @@ interface ClientCardProps {
   agente: Agente | undefined;
   /** Runs recientes del par (cliente, agente). */
   runs: AgentRun[];
+  /** agent_events tipo factura_procesada del par (cliente, agente). */
+  facturas: AgentEvent[];
 }
 
-export default function ClientCard({ cliente, activacion, agente, runs }: ClientCardProps) {
+export default function ClientCard({ cliente, activacion, agente, runs, facturas }: ClientCardProps) {
   const ticks = timelineLast24h(runs);
-  const sparkPoints = sparkRunsByDay(runs, 14);
 
   // Estado actual: peor estado de los runs DE HOY (calendario, zona Bogotá).
   // Errores de días anteriores no marcan al cliente como "con errores" — la
@@ -52,10 +53,10 @@ export default function ClientCard({ cliente, activacion, agente, runs }: Client
       })
     : null;
 
-  // Métricas de 7 días
-  const last7 = runsLastDays(runs, 7);
-  const facturas7d = totalProcesadas(last7);
-  const horasAhorradas = tiempoAhorradoHoras(facturas7d);
+  // Métricas por fecha REAL de la factura (agent_events) — coherente con el panel.
+  const facturasHoy = totalFacturas(facturasToday(facturas));
+  const facturasMes = totalFacturas(facturasThisMonth(facturas));
+  const horasAhorradasMes = tiempoAhorradoHoras(facturasMes);
 
   return (
     <Link
@@ -101,19 +102,38 @@ export default function ClientCard({ cliente, activacion, agente, runs }: Client
         <Timeline24h ticks={ticks} />
       </div>
 
-      {/* Columna derecha: sparkline + KPIs */}
-      <div className="p-6 flex flex-col justify-between gap-2">
-        <div className="flex items-baseline justify-between">
-          <span className="font-mono text-[9px] uppercase tracking-[0.1em] text-ink-3 font-medium">
-            Procesadas · últ 7 días
-          </span>
-          <span className="font-display text-xl font-semibold tracking-tighter text-ink">
-            {facturas7d}
-          </span>
+      {/* Columna derecha: KPIs Hoy + Mes (fecha real de la factura) */}
+      <div className="p-6 flex flex-col justify-between gap-3">
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <div className="font-mono text-[9px] uppercase tracking-[0.1em] text-ink-3 font-medium mb-1">
+              Hoy
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="font-display text-2xl font-semibold tracking-tighter text-ink leading-none">
+                {facturasHoy}
+              </span>
+              <span className="font-mono text-[9px] text-ink-3 tracking-[0.04em]">
+                facts
+              </span>
+            </div>
+          </div>
+          <div>
+            <div className="font-mono text-[9px] uppercase tracking-[0.1em] text-ink-3 font-medium mb-1">
+              Mes
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="font-display text-2xl font-semibold tracking-tighter text-ink leading-none">
+                {facturasMes}
+              </span>
+              <span className="font-mono text-[9px] text-ink-3 tracking-[0.04em]">
+                facts
+              </span>
+            </div>
+          </div>
         </div>
-        <Sparkline points={sparkPoints} />
         <div className="font-mono text-[10px] text-ink-3 tracking-[0.04em]">
-          ≈ {formatHoras(horasAhorradas)} ahorradas
+          ≈ {formatHoras(horasAhorradasMes)} ahorradas este mes
         </div>
       </div>
     </Link>

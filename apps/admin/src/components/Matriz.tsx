@@ -213,6 +213,9 @@ export default function Matriz() {
             const runsCA = runs.filter(
               (r) => r.cliente_id === cliente.id && r.agente_id === act.agente_id,
             );
+            const facturasCA = facturas.filter(
+              (f) => f.cliente_id === cliente.id && f.agente_id === act.agente_id,
+            );
             return (
               <ClientCard
                 key={`${act.cliente_id}-${act.agente_id}`}
@@ -220,6 +223,7 @@ export default function Matriz() {
                 activacion={act}
                 agente={agente}
                 runs={runsCA}
+                facturas={facturasCA}
               />
             );
           })}

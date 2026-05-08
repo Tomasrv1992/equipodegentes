@@ -361,6 +361,13 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
     return;
   }
 
+  // Owner (modo legacy single-tenant) NO recibe correo — Tomás monitorea desde
+  // el panel admin. Solo clientes multi-tenant reciben su resumen.
+  if (!customerId) {
+    console.log("notifyResult: skip (modo owner) — Tomás monitorea desde panel");
+    return;
+  }
+
   const target = await resolveNotifyTarget(customerId);
   const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
 
@@ -398,8 +405,12 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
 async function notifyError(err: Error, customerId?: string): Promise<void> {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return;
-  // Errores van AL CLIENTE para que sepa que algo falla. Con copia oculta a Tomás
-  // se podría agregar después si querés monitorear todos.
+  // Owner (modo legacy) NO recibe correo de error — Tomás monitorea desde panel.
+  if (!customerId) {
+    console.log("notifyError: skip (modo owner)");
+    return;
+  }
+  // Errores al cliente para que sepa que algo falla.
   const target = await resolveNotifyTarget(customerId);
   const to = target.to;
   const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";

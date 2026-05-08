@@ -685,6 +685,22 @@ function findPlanillaPdfs(payload: any) {
   return out;
 }
 
+/**
+ * Detecta adjuntos .docx (Word) — típicamente cuentas de cobro de proveedores
+ * no obligados a facturación electrónica (personas naturales, contratistas).
+ */
+function findDocxParts(payload: any) {
+  const out: Array<{ filename: string; attachmentId: string }> = [];
+  function walk(part: any) {
+    if (part.filename && /\.docx?$/i.test(part.filename) && part.body?.attachmentId) {
+      out.push({ filename: part.filename, attachmentId: part.body.attachmentId });
+    }
+    if (part.parts) part.parts.forEach(walk);
+  }
+  if (payload) walk(payload);
+  return out;
+}
+
 async function downloadAttachment(gmail: any, messageId: string, attachmentId: string, filename: string) {
   const res = await gmail.users.messages.attachments.get({ userId: "me", messageId, id: attachmentId });
   const buf = Buffer.from(res.data.data!, "base64url");
@@ -981,6 +997,7 @@ async function processOne(
 
   const zips = findZipParts(msg.payload);
   const planillas = findPlanillaPdfs(msg.payload);
+  const docxs = findDocxParts(msg.payload);
 
   // Sub-pipeline planillas: si NO hay ZIPs pero SÍ hay autoliquidaciones/comprobantes,
   // tratar como planilla seguridad social. Va al folder del mes con fila en Sheet
@@ -988,6 +1005,15 @@ async function processOne(
   if (zips.length === 0 && planillas.length > 0) {
     return await processPlanilla(
       messageId, labelId, gmail, drive, sheets, g, planillas, subject, msg,
+      loadSheetRows, pushToCache,
+    );
+  }
+
+  // Sub-pipeline cuenta de cobro Word: si NO hay ZIPs ni planillas, pero SÍ hay .docx,
+  // tratar como cuenta de cobro. Extrae texto con mammoth + LLM Claude para datos.
+  if (zips.length === 0 && docxs.length > 0) {
+    return await processCuentaCobroDocx(
+      messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
       loadSheetRows, pushToCache,
     );
   }
@@ -1210,6 +1236,155 @@ async function processPlanilla(
     // 8. Labels: Procesado + Facturas/YYYY-MM (mismo flujo que facturas DIAN)
     await markEmailProcessed(gmail, messageId, labelProcesadoId);
     await applyMonthLabel(gmail, messageId, year, month);
+
+    return { ok: true, ...row };
+  } finally {
+    cleanupTmp(tmpPaths);
+  }
+}
+
+/**
+ * Sub-pipeline cuenta de cobro Word (.docx).
+ *
+ * Los proveedores no obligados a facturación electrónica (personas naturales,
+ * contratistas, freelancers) emiten cuentas de cobro en Word con campos no
+ * estructurados. Las extraemos con LLM (Claude) y las guardamos en el Sheet
+ * con tipo='cuenta_cobro'.
+ *
+ * Se requiere env var ANTHROPIC_API_KEY. Si no está, skip silencioso con razón.
+ */
+async function processCuentaCobroDocx(
+  messageId: string,
+  labelProcesadoId: string,
+  gmail: any,
+  drive: any,
+  sheets: any,
+  g: PipelineConfig["google"],
+  docxs: Array<{ filename: string; attachmentId: string }>,
+  subject: string,
+  msg: any,
+  loadSheetRows: (tabName: string) => Promise<any[][]>,
+  pushToCache: (tabName: string, row: any[]) => void,
+): Promise<ProcessOneResult> {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return {
+      skip: true,
+      reason: "docx-sin-api-key (configurar ANTHROPIC_API_KEY)",
+      subject,
+    };
+  }
+
+  const tmpPaths: string[] = [];
+  try {
+    // 1. Descargar el primer .docx (asumimos 1 cuenta de cobro por email)
+    const d = docxs[0];
+    const docxPath = await downloadAttachment(gmail, messageId, d.attachmentId, d.filename);
+    tmpPaths.push(docxPath);
+
+    // 2. Extraer texto plano del Word
+    const { extractTextFromDocx } = await import("./doc-parsers");
+    const text = await extractTextFromDocx(docxPath);
+    if (!text || text.length < 30) {
+      return { skip: true, reason: "docx-sin-texto-extraible", subject };
+    }
+
+    // 3. Llamar al LLM para extraer campos estructurados
+    const { extractInvoiceFromText } = await import("./llm-extractor");
+    const sender = getHeader(msg, "From") || "";
+    const dateHeader = getHeader(msg, "Date") || "";
+    const extracted = await extractInvoiceFromText({
+      text,
+      presumedType: "cuenta_cobro",
+      filename: d.filename,
+      sender,
+      subject,
+      emailDate: dateHeader,
+    });
+    if (!extracted) {
+      return { skip: true, reason: "docx-no-es-factura (LLM)", subject };
+    }
+    if (extracted.confianza < 0.4) {
+      return {
+        skip: true,
+        reason: `docx-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
+        subject,
+      };
+    }
+
+    // 4. Year/month del documento
+    const issue = new Date(extracted.fecha + "T00:00:00");
+    const year = issue.getFullYear();
+    const month = issue.getMonth() + 1;
+
+    // Skip pre-año-actual (mismo guard que facturas DIAN)
+    const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
+    if (year < minYear) {
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      return {
+        skip: true,
+        reason: `docx-fecha-año-anterior (${extracted.fecha} < ${minYear})`,
+        subject,
+      };
+    }
+
+    // 5. Tab del mes + folder del mes
+    const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
+    const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+    const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
+
+    // 6. Dedup por NIT+número en el Sheet
+    const sheetRows = await loadSheetRows(tabName);
+    if (extracted.nit && extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit)) {
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyMonthLabel(gmail, messageId, year, month);
+      return {
+        dup: true,
+        motivo: `${extracted.proveedor} ${extracted.numero} (ya en ${tabName})`,
+        subject,
+      };
+    }
+
+    // 7. Consecutivo
+    let maxN = 0;
+    for (let i = 1; i < sheetRows.length; i++) {
+      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
+      if (!isNaN(v) && v > maxN) maxN = v;
+    }
+    const consecutivo = maxN + 1;
+
+    // 8. Subir el .docx al folder del mes
+    const baseName = buildFileBaseName(consecutivo, extracted.proveedor);
+    const uploaded = await uploadFile(drive, docxPath, folderId, `${baseName}.docx`);
+    const driveLink = uploaded.webViewLink || "";
+
+    // 9. Append al Sheet
+    const { categoria, cuentaPyg } = categorizar({
+      nit: extracted.nit,
+      concepto: extracted.concepto,
+    });
+    const row: ProcessedRow = {
+      fecha: extracted.fecha,
+      proveedor: extracted.proveedor,
+      nit: extracted.nit,
+      numero: extracted.numero,
+      cufe: "",
+      subtotal: extracted.subtotal,
+      iva: extracted.iva,
+      total: extracted.totalCop,  // siempre en COP en el Sheet
+      concepto: extracted.concepto + (extracted.moneda !== "COP" ? ` (${extracted.moneda})` : ""),
+      driveLink,
+      subject,
+      categoria,
+      cuentaPyg,
+    };
+    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
+    pushToCache(tabName, newRow);
+
+    // 10. Labels
+    await markEmailProcessed(gmail, messageId, labelProcesadoId);
+    await applyMonthLabel(gmail, messageId, year, month);
+
+    console.log(`[cuenta-cobro] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} (${extracted.moneda}) confianza=${extracted.confianza.toFixed(2)}`);
 
     return { ok: true, ...row };
   } finally {

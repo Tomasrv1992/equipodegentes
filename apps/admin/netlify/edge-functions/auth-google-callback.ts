@@ -8,7 +8,7 @@ import type { Context } from "@netlify/edge-functions";
 
 declare const Netlify: { env: { get: (key: string) => string | undefined } };
 
-export default async (request: Request, _context: Context) => {
+export default async (request: Request, context: Context) => {
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
@@ -275,19 +275,31 @@ export default async (request: Request, _context: Context) => {
     },
   );
 
-  // 8. Disparar el primer run en background (mismo que save-resources hace)
+  // 8. Disparar el primer run en background.
+  //    Edge functions cancelan los fetches pendientes cuando el handler retorna.
+  //    Para evitarlo: o await del fetch (esperamos 2-3s) o usar context.waitUntil
+  //    si está disponible. Vamos con AWAIT — el redirect inmediato no nos sirve
+  //    si el dispatch silenciosamente falla (Patricia onboardeó OK pero quedó sin run).
+  //
+  //    El dispatch a Netlify background fn devuelve 202 inmediato; esperar el
+  //    response no bloquea — solo confirma que el server recibió la petición.
   const mainSiteUrl = Netlify.env.get("MAIN_SITE_URL");
   const internalSecret = Netlify.env.get("FACTURACION_INTERNAL_SECRET");
   if (mainSiteUrl && internalSecret && onboarding.agente_id === "facturacion") {
-    fetch(`${mainSiteUrl}/.netlify/functions/facturacion-background`, {
-      method: "POST",
-      headers: {
-        "x-internal-secret": internalSecret,
-        "x-trigger": "onboarding",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ customerId: onboarding.cliente_slug }),
-    }).catch((e) => console.warn("first-run dispatch failed (no-fatal):", e));
+    try {
+      const dispatchResp = await fetch(`${mainSiteUrl}/.netlify/functions/facturacion-background`, {
+        method: "POST",
+        headers: {
+          "x-internal-secret": internalSecret,
+          "x-trigger": "onboarding",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ customerId: onboarding.cliente_slug }),
+      });
+      console.log(`[first-run] cliente=${onboarding.cliente_slug} dispatch status=${dispatchResp.status}`);
+    } catch (e: any) {
+      console.warn(`[first-run] dispatch failed (no-fatal): ${e.message}`);
+    }
   }
 
   // 9. Redirect — el frontend detecta step='completed' y muestra StepDone

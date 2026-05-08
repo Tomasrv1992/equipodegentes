@@ -1034,6 +1034,19 @@ async function processOne(
     const year = issue.getFullYear();
     const month = issue.getMonth() + 1;
 
+    // Skip facturas de años anteriores al actual (típico: cierre fiscal de
+    // diciembre del año pasado llega al inbox en enero del año nuevo).
+    // Etiqueta el email para no re-procesarlo en runs futuros.
+    const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
+    if (year < minYear) {
+      await markEmailProcessed(gmail, messageId, labelId);
+      return {
+        skip: true,
+        reason: `fecha-año-anterior (${data.fecha} < ${minYear})`,
+        subject,
+      };
+    }
+
     // Tab del mes (Enero, Febrero...). Se crea con headers si no existe.
     const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
     const tabRange = `'${tabName.replace(/'/g, "''")}'`;

@@ -2,7 +2,6 @@ import { Link } from "react-router-dom";
 import { useClientes, useAgentes, useLatestRuns, useClientAgents, useAllFacturas } from "../lib/queries";
 import {
   runsToday,
-  runsLastDays,
   totalErrores,
   tiempoAhorradoHoras,
   formatHoras,

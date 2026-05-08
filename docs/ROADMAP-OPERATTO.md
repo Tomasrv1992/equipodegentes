@@ -39,6 +39,89 @@
 ---
 
 
+### 0. **Extracción de retenciones (ReteFuente, ReteIVA, ReteICA) + reglas configurables**
+
+**Por qué**: el agente hoy extrae subtotal/IVA/total. Para que sea **contablemente útil
+en Colombia** necesita extraer también las retenciones que se aplican a la factura,
+porque definen lo que efectivamente se paga al proveedor y lo que queda como crédito
+fiscal del cliente. Sin esto, el contador del cliente igual tiene que abrir cada
+factura manualmente — perdemos buena parte del valor del agente.
+
+**Las 3 retenciones colombianas**:
+
+| Retención | Cuándo aplica | Tasa típica |
+|---|---|---|
+| **ReteFuente (RetenciónIvaIca)** | Servicios y compras según concepto | 1% – 11% |
+| **ReteIVA** | Si el cliente es agente retenedor de IVA | 15% del IVA facturado |
+| **ReteICA** | Compras a proveedores con domicilio en municipios donde el cliente paga ICA | 0.4% – 1% |
+
+**Implementación técnica**:
+
+1. **Extracción del XML**: extender `parseInvoiceXml()` en `pipeline.ts` para leer
+   los nodos `cac:WithholdingTaxTotal` del XML DIAN. Cada uno tiene un código
+   (`05`=ReteFuente, `06`=ReteIVA, `07`=ReteICA según DIAN). Devolver:
+   ```ts
+   reteFuente: number;
+   reteIva: number;
+   reteIca: number;
+   totalRetenciones: number;
+   ```
+
+2. **Sheet del cliente**: agregar 4 columnas (después de IVA, antes de Total):
+   `ReteFuente · ReteIVA · ReteICA · Total Retenciones`. Total real (lo que se
+   paga al proveedor) = Total - Total Retenciones. Útil para conciliar con pagos.
+
+3. **agent_events**: agregar al `payload` los 4 campos. Permite agregar al
+   Dashboard del Sheet una sección "Retenciones del mes".
+
+4. **Sistema de reglas configurables** — para casos donde el XML NO trae la
+   retención pero el cliente la aplica de oficio (caso común con proveedores
+   que no facturan retenciones por estar bajo régimen simplificado):
+
+   ```json
+   // client_credentials.retention_rules (jsonb nuevo)
+   {
+     "default": {
+       "reteFuente_porcentaje": 0,
+       "reteIva_porcentaje": 0,
+       "reteIca_porcentaje": 0
+     },
+     "por_categoria": {
+       "Honorarios profesionales": { "reteFuente_porcentaje": 11 },
+       "Servicios técnicos": { "reteFuente_porcentaje": 6 }
+     },
+     "por_nit": {
+       "900123456": { "reteFuente_porcentaje": 0 }  // proveedor exento
+     },
+     "umbral_minimo": {
+       "reteFuente_uvt": 4,  // 4 UVT mínimo para retener fuente
+       "reteIca_uvt": 4
+     }
+   }
+   ```
+
+   Lógica de cálculo en pipeline:
+   1. Si XML trae retención → usar esa (es la oficial)
+   2. Si XML no trae → calcular por reglas: `por_nit` > `por_categoria` > `default`
+   3. Aplicar umbral mínimo (no retener facturas pequeñas)
+   4. Marcar la fila como "ret. calculada" vs "ret. del XML" para auditoría
+
+5. **UI panel admin**: pantalla "Reglas de retención" en ficha del cliente con
+   editor de las reglas (JSON o form visual). Preview con últimas 10 facturas.
+
+6. **Email mensual** y **Dashboard del Sheet**: agregar sección "Retenciones
+   aplicadas este mes" con totales por tipo.
+
+**Estimado**: 2 sesiones (~5-6h total).
+- Sesión 1: parseInvoiceXml + columnas Sheet + agent_events (~3h)
+- Sesión 2: sistema de reglas + UI panel admin (~3h)
+
+**Bloquea**: nada técnico. **Habilita**: que el agente sea contablemente
+completo y desbloquee el siguiente segmento de clientes (PyMEs con contadora
+externa que necesitan info de retenciones).
+
+---
+
 ### 1. **Email mensual automático del resumen al cliente**
 
 **Por qué**: el cliente paga por el agente — necesita ver valor entregado cada mes.

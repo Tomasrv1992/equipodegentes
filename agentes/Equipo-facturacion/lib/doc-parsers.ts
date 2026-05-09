@@ -21,11 +21,44 @@ export async function extractTextFromDocx(filePath: string): Promise<string> {
   }
 }
 
+/**
+ * Polyfill: pdf-parse internamente usa pdfjs-dist que requiere DOMMatrix
+ * (API del navegador). En Node/Netlify functions no existe, entonces
+ * pdf-parse falla con "DOMMatrix is not defined" en cualquier PDF.
+ *
+ * Fix: definir un stub mínimo. pdf-parse solo lo usa para rendering canvas
+ * (que no necesitamos — solo queremos texto), entonces stub vacío basta.
+ */
+function ensureDomMatrixPolyfill(): void {
+  const g = globalThis as any;
+  if (typeof g.DOMMatrix === "undefined") {
+    g.DOMMatrix = class DOMMatrix {
+      constructor() {}
+    };
+  }
+  if (typeof g.DOMPoint === "undefined") {
+    g.DOMPoint = class DOMPoint {
+      constructor() {}
+    };
+  }
+  if (typeof g.ImageData === "undefined") {
+    g.ImageData = class ImageData {
+      constructor() {}
+    };
+  }
+  if (typeof g.Path2D === "undefined") {
+    g.Path2D = class Path2D {
+      constructor() {}
+    };
+  }
+}
+
 /** Extrae texto plano de un .pdf. Devuelve "" si falla. */
 export async function extractTextFromPdf(filePath: string): Promise<string> {
   try {
+    ensureDomMatrixPolyfill();
     const buffer = fs.readFileSync(filePath);
-    // Import dinámico — pdf-parse en CommonJS, mejor lazy
+    // Import dinámico — pdf-parse en CommonJS, mejor lazy (después del polyfill)
     const pdfParse = (await import("pdf-parse")).default;
     const result = await pdfParse(buffer);
     return (result.text || "").trim();

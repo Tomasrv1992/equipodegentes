@@ -1310,13 +1310,12 @@ async function processPlanilla(
     }
     const consecutivo = maxN + 1;
 
-    // 4. Proveedor: derivar del sender, o "Planilla Seguridad Social" como fallback
-    const sender = getHeader(msg, "From") || "";
-    let proveedor = "Planilla Seguridad Social";
-    const senderMatch = sender.match(/^"?([^"<]+?)"?\s*<?[^>]*>?$/);
-    if (senderMatch && senderMatch[1].trim() && !senderMatch[1].includes("@")) {
-      proveedor = senderMatch[1].trim();
-    }
+    // 4. Proveedor: hardcoded "Planilla Seguridad Social" (más claro y consistente).
+    //    Antes: derivábamos del sender, pero remitentes con display name corto
+    //    (ej: 'T <...>', 'M <...>' por forwards de Gmail) generaban proveedor = 'T' / 'M'.
+    //    Cuando hagamos OCR del PDF de planilla extraeremos el operador real
+    //    (Aportes en Línea, SOI, etc).
+    const proveedor = "Planilla Seguridad Social";
 
     // 5. N° planilla del filename (típicamente "Autoliquidaciones_84333812_..." → 84333812)
     const numeroPlanilla = (() => {

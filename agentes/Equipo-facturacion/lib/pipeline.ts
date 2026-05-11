@@ -27,6 +27,14 @@ export interface PipelineConfig {
     sheetId: string;
     sheetTab: string; // ej "Gastos 2026"
   };
+  /**
+   * Reglas de retención del cliente (opcional). Si está, el engine
+   * `aplicarReglasRetencion` decide qué retenciones aplicar (XML, oficio, override).
+   * Si está null/undefined, retenciones quedan tal como vienen del XML.
+   */
+  retentionRules?: unknown | null;
+  /** Municipio donde el cliente paga ICA (para cálculo de oficio). */
+  municipioIca?: string | null;
   /** Comportamiento. */
   options?: {
     dryRun?: boolean;
@@ -66,6 +74,12 @@ export interface InvoiceData {
   reteIva?: number;
   reteIca?: number;
   totalRetenciones?: number;
+  /**
+   * Opcionales: el pipeline las setea después de parseInvoiceXml + categorizar().
+   * El engine de retenciones las lee para decidir tarifa RTF de oficio.
+   */
+  categoria?: string;
+  cuentaPyg?: string;
 }
 
 export interface ProcessedRow extends InvoiceData {
@@ -276,6 +290,12 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const result: PipelineResult = { procesadas: [], errores: [], saltadas: [] };
   const llmTracker: LlmTracker = { calls: 0, preFilteredOut: 0 };
 
+  // Contexto de retenciones para pasar a processOne (puede ser null si cliente
+  // legacy sin reglas configuradas).
+  const retentionCtx = cfg.retentionRules
+    ? { rules: cfg.retentionRules, municipioIca: cfg.municipioIca ?? null }
+    : null;
+
   for (const e of emails) {
     try {
       const r = await processOne(
@@ -292,6 +312,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
           if (cached) cached.push(newRow);
         },
         llmTracker,
+        retentionCtx,
       );
       if ("ok" in r && r.ok) {
         result.procesadas.push(r);
@@ -1280,6 +1301,7 @@ async function processOne(
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void,
   llmTracker: LlmTracker,
+  retentionCtx: { rules: unknown | null; municipioIca: string | null } | null,
 ): Promise<ProcessOneResult> {
   const msg = await getMessageFull(gmail, messageId);
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
@@ -1437,10 +1459,43 @@ async function processOne(
     }
 
     const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
+    // Stub categoria en `data` para que el engine de retenciones pueda leerla
+    // cuando decide la tarifa RTF de oficio. ProcessedRow las setea explícitas abajo.
+    data.categoria = categoria;
+    data.cuentaPyg = cuentaPyg;
+
+    // Aplicar reglas de retención del cliente (si están configuradas).
+    // El engine prioriza: override_nit > xml > oficio (según reglas).
+    // Si retentionCtx es null (cliente legacy), retenciones quedan tal como
+    // vienen del XML (extracción Sub-fase 1).
+    let retencionSource:
+      | { rtf: string; iva: string; ica: string }
+      | undefined;
+    if (retentionCtx) {
+      const { aplicarReglasRetencion } = await import("./retenciones-engine");
+      const aplicado = aplicarReglasRetencion(
+        data,
+        retentionCtx.rules as any,
+        retentionCtx.municipioIca,
+        year,
+      );
+      data.reteFuente = aplicado.reteFuente;
+      data.reteIva = aplicado.reteIva;
+      data.reteIca = aplicado.reteIca;
+      data.totalRetenciones = aplicado.totalRetenciones;
+      retencionSource = aplicado.source;
+    }
+
+    // categoria/cuentaPyg ya están en data; el spread los incluye.
     const row: ProcessedRow = {
       ...data, driveLink, subject, categoria, cuentaPyg,
       tipo: "factura_dian",
     };
+    // Adjuntar audit trail al row (lo usa el background fn para guardar en
+    // agent_events.payload.retencionSource). No va al Sheet — campo interno.
+    if (retencionSource) {
+      (row as any).retencionSource = retencionSource;
+    }
     const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
     pushToCache(tabName, newRow);
     await markEmailProcessed(gmail, messageId, labelId);

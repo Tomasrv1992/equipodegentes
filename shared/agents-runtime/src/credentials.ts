@@ -47,6 +47,17 @@ export interface ClientCredentialsRow {
   created_at: string;
   updated_at: string;
   first_run_done: boolean;
+  /**
+   * Reglas de retención fiscal por cliente (jsonb).
+   * Schema documentado en `agentes/Equipo-facturacion/lib/retenciones-engine.ts`
+   * tipo `RetentionRules`. Default sensato (RTF on, IVA/ICA off) si null.
+   */
+  retention_rules: unknown | null;
+  /**
+   * Municipio donde el cliente paga ICA (mayúsculas: BOGOTA, MEDELLIN, etc).
+   * Determina la tarifa cuando ReteICA se aplica de oficio. Null si no aplica ICA.
+   */
+  municipio_ica: string | null;
 }
 
 export interface SaveOAuthTokensInput {

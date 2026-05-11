@@ -199,11 +199,15 @@ export default async (req: Request) => {
             categoria: p.categoria,
             cuentaPyg: p.cuentaPyg,
             tipo: (p as any).tipo ?? "factura_dian",
-            // Retenciones extraídas del XML DIAN (cero para no-DIAN)
+            // Retenciones: si el cliente tiene reglas configuradas, vienen
+            // del engine (XML/oficio/override). Sino, del XML directo.
             reteFuente: (p as any).reteFuente ?? 0,
             reteIva: (p as any).reteIva ?? 0,
             reteIca: (p as any).reteIca ?? 0,
             totalRetenciones: (p as any).totalRetenciones ?? 0,
+            // Audit trail del engine de retenciones (solo si se aplicó).
+            // Valores: "xml" | "oficio" | "override_nit" | "none"
+            retencionSource: (p as any).retencionSource,
             driveLink: p.driveLink,
           }));
           await emitFacturaEvents({
@@ -324,6 +328,10 @@ async function buildConfig(
         sheetId: cred.sheet_id,
         sheetTab: cred.sheet_tab,
       },
+      // Reglas de retención del cliente (Sub-fase 2). Si null, el pipeline
+      // deja las retenciones tal como vienen del XML (sin engine).
+      retentionRules: (cred as any).retention_rules ?? null,
+      municipioIca: (cred as any).municipio_ica ?? null,
       options: {
         dryRun: body.dryRun ?? false,
         window: resolvedWindow,

@@ -33,6 +33,20 @@ export interface FacturaEventPayload {
   reteIva?: number;
   reteIca?: number;
   totalRetenciones?: number;
+  /**
+   * Audit trail del engine de retenciones (Sub-fase 2). Indica de dónde
+   * salió cada valor de retención:
+   *   - "xml"          → del XML del proveedor (proveedor calculó)
+   *   - "oficio"       → calculado por reglas del cliente (XML vacío)
+   *   - "override_nit" → cliente declaró proveedor exento por NIT
+   *   - "none"         → no aplica retención (cliente no es agente o monto < umbral)
+   * Si el cliente no tiene reglas configuradas, este campo queda undefined.
+   */
+  retencionSource?: {
+    rtf: "xml" | "oficio" | "override_nit" | "none";
+    iva: "xml" | "oficio" | "override_nit" | "none";
+    ica: "xml" | "oficio" | "override_nit" | "none";
+  };
 }
 
 export interface EmitFacturaEventsInput {

@@ -440,7 +440,7 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
           properties: {
             title: DASHBOARD_TAB,
             index: 0,
-            gridProperties: { rowCount: 50, columnCount: 6 },
+            gridProperties: { rowCount: 60, columnCount: 6 },
           },
         },
       }],
@@ -530,6 +530,22 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["Total retenido", `=${MES_TABS.map((m) => `SUM('${m}'!P:P)`).join("+")}`, "", "", "", ""],
     // Row 47: Neto pagado (Total bruto - Retenciones)
     ["Neto pagado al proveedor", `=C23-B46`, "(Total año − Total retenido)", "", "", ""],
+    // Row 48: vacío
+    ["", "", "", "", "", ""],
+    // Row 49: header sección RETENCIONES MES ACTUAL
+    ["RETENCIONES MES ACTUAL", "", "", "", "", ""],
+    // Row 50: headers
+    ["Tipo", "Monto (COP)", "", "", "", ""],
+    // Row 51: ReteFuente del mes (INDIRECT a la pestaña del mes actual, col M)
+    ["ReteFuente del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!M:M"))`, "", "", "", ""],
+    // Row 52: ReteIVA del mes (col N)
+    ["ReteIVA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!N:N"))`, "", "", "", ""],
+    // Row 53: ReteICA del mes (col O)
+    ["ReteICA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!O:O"))`, "", "", "", ""],
+    // Row 54: Total retenciones del mes (col P)
+    ["Total retenido mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!P:P"))`, "", "", "", ""],
+    // Row 55: Neto pagado del mes (Monto mes actual − Total retenido mes)
+    ["Neto pagado mes", `=B6-B54`, "(Monto mes − Total retenido mes)", "", "", ""],
   ];
 
   await sheets.spreadsheets.values.update({
@@ -566,8 +582,8 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment,backgroundColor)",
             },
           },
-          // Headers de sección (rows 3, 9, 25, 33, 41): bold con fondo claro
-          ...[2, 8, 24, 32, 40].map((rowIdx) => ({
+          // Headers de sección (rows 3, 9, 25, 33, 41, 49): bold con fondo claro
+          ...[2, 8, 24, 32, 40, 48].map((rowIdx) => ({
             repeatCell: {
               range: { sheetId: dashSheetId, startRowIndex: rowIdx, endRowIndex: rowIdx + 1, startColumnIndex: 0, endColumnIndex: 6 },
               cell: {
@@ -632,7 +648,7 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat.numberFormat",
             },
           },
-          // Retenciones (rows 43-47): formato moneda en col B
+          // Retenciones AÑO (rows 43-47): formato moneda en col B
           {
             repeatCell: {
               range: { sheetId: dashSheetId, startRowIndex: 42, endRowIndex: 47, startColumnIndex: 1, endColumnIndex: 2 },
@@ -640,7 +656,7 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat.numberFormat",
             },
           },
-          // Retenciones header tabla (row 42)
+          // Retenciones AÑO header tabla (row 42)
           {
             repeatCell: {
               range: { sheetId: dashSheetId, startRowIndex: 41, endRowIndex: 42, startColumnIndex: 0, endColumnIndex: 3 },
@@ -648,7 +664,7 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat.textFormat",
             },
           },
-          // Total retenido + Neto pagado (rows 45-46): bold + fondo
+          // Total retenido + Neto pagado año (rows 46-47): bold + fondo
           {
             repeatCell: {
               range: { sheetId: dashSheetId, startRowIndex: 45, endRowIndex: 47, startColumnIndex: 0, endColumnIndex: 3 },
@@ -661,18 +677,47 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat(textFormat,backgroundColor)",
             },
           },
+          // Retenciones MES (rows 51-55): formato moneda en col B
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 50, endRowIndex: 55, startColumnIndex: 1, endColumnIndex: 2 },
+              cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } } },
+              fields: "userEnteredFormat.numberFormat",
+            },
+          },
+          // Retenciones MES header tabla (row 50)
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 49, endRowIndex: 50, startColumnIndex: 0, endColumnIndex: 3 },
+              cell: { userEnteredFormat: { textFormat: { bold: true } } },
+              fields: "userEnteredFormat.textFormat",
+            },
+          },
+          // Total retenido + Neto pagado mes (rows 54-55): bold + fondo
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 53, endRowIndex: 55, startColumnIndex: 0, endColumnIndex: 3 },
+              cell: {
+                userEnteredFormat: {
+                  textFormat: { bold: true },
+                  backgroundColor: { red: 0.98, green: 0.95, blue: 0.85 },
+                },
+              },
+              fields: "userEnteredFormat(textFormat,backgroundColor)",
+            },
+          },
           // Centrar columnas numéricas (B y C) en todas las secciones de data
           {
             repeatCell: {
-              range: { sheetId: dashSheetId, startRowIndex: 3, endRowIndex: 47, startColumnIndex: 1, endColumnIndex: 3 },
+              range: { sheetId: dashSheetId, startRowIndex: 3, endRowIndex: 55, startColumnIndex: 1, endColumnIndex: 3 },
               cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } },
               fields: "userEnteredFormat.horizontalAlignment",
             },
           },
-          // Bordes en todas las celdas con data (rows 3-46, cols A-C)
+          // Bordes en todas las celdas con data (rows 3-55, cols A-C)
           {
             updateBorders: {
-              range: { sheetId: dashSheetId, startRowIndex: 2, endRowIndex: 47, startColumnIndex: 0, endColumnIndex: 3 },
+              range: { sheetId: dashSheetId, startRowIndex: 2, endRowIndex: 55, startColumnIndex: 0, endColumnIndex: 3 },
               top:    { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
               bottom: { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
               left:   { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },

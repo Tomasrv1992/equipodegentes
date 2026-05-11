@@ -35,6 +35,8 @@ interface CredStatus {
   retention_rules: RetentionRulesShape | null;
   /** Municipio donde el cliente paga ICA (afecta tarifa de oficio). */
   municipio_ica: string | null;
+  /** NIT/cédula del cliente — descarta facturas donde el cliente es emisor. */
+  nit_cliente: string | null;
 }
 
 /** Schema del campo retention_rules en client_credentials. */
@@ -107,7 +109,7 @@ function useClienteBySlug(slug: string) {
           .limit(200),
         supabase
           .from("client_credentials")
-          .select("agente_id, google_oauth_status, google_email, drive_folder_id, drive_folder_name, sheet_id, sheet_name, notify_email, onboarded_at, retention_rules, municipio_ica")
+          .select("agente_id, google_oauth_status, google_email, drive_folder_id, drive_folder_name, sheet_id, sheet_name, notify_email, onboarded_at, retention_rules, municipio_ica, nit_cliente")
           .eq("cliente_id", (cliente as Cliente).id),
       ]);
       if (e2) throw e2;
@@ -603,6 +605,7 @@ function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: Activ
         agenteId={activacion.agente_id}
         rules={cred?.retention_rules ?? null}
         municipioIca={cred?.municipio_ica ?? null}
+        nitCliente={cred?.nit_cliente ?? null}
         slug={slug}
       />
     </div>
@@ -768,12 +771,14 @@ function RetentionRulesSection({
   agenteId,
   rules,
   municipioIca,
+  nitCliente,
   slug,
 }: {
   clienteId: string;
   agenteId: string;
   rules: RetentionRulesShape | null;
   municipioIca: string | null;
+  nitCliente: string | null;
   slug: string;
 }) {
   const qc = useQueryClient();
@@ -791,6 +796,7 @@ function RetentionRulesSection({
   // Estado del form
   const [draft, setDraft] = useState({
     tipo_persona: tipoPersona,
+    nit_cliente: nitCliente ?? "",
     aplica_rtf: agente.reteFuente ?? true,
     aplica_iva: agente.reteIva ?? false,
     aplica_ica: agente.reteIca ?? false,
@@ -804,6 +810,7 @@ function RetentionRulesSection({
   function resetDraft() {
     setDraft({
       tipo_persona: tipoPersona,
+      nit_cliente: nitCliente ?? "",
       aplica_rtf: agente.reteFuente ?? true,
       aplica_iva: agente.reteIva ?? false,
       aplica_ica: agente.reteIca ?? false,
@@ -846,6 +853,7 @@ function RetentionRulesSection({
           agenteId,
           retention_rules: newRules,
           municipio_ica: draft.municipio_ica || null,
+          nit_cliente: (draft.nit_cliente || "").replace(/\D+/g, "") || null,
         }),
       });
       if (!resp.ok) throw new Error(await resp.text());
@@ -889,6 +897,11 @@ function RetentionRulesSection({
         <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px] py-1">
           <span className="text-ink-3 tracking-[0.04em]">Tipo de cliente</span>
           <span className="font-mono text-ink truncate" title={tipoLabel}>{tipoLabel}</span>
+
+          <span className="text-ink-3 tracking-[0.04em]">NIT / Cédula</span>
+          <span className="font-mono text-ink">
+            {nitCliente || <span className="text-ink-4 italic">sin configurar</span>}
+          </span>
 
           <span className="text-ink-3 tracking-[0.04em]">Agente retenedor</span>
           <span className="font-mono text-ink">
@@ -947,6 +960,25 @@ function RetentionRulesSection({
             <option value="natural_declarante">Persona natural — declarante de renta</option>
             <option value="natural_no_declarante">Persona natural — NO declarante</option>
           </select>
+        </div>
+
+        {/* NIT / Cédula */}
+        <div>
+          <div className="label-tight mb-1.5">
+            {draft.tipo_persona === "juridica" ? "NIT (sin dígito de verificación)" : "Cédula de ciudadanía"}
+          </div>
+          <input
+            type="text"
+            inputMode="numeric"
+            value={draft.nit_cliente}
+            onChange={(e) => setDraft({ ...draft, nit_cliente: e.target.value.replace(/\D+/g, "") })}
+            className="input input-mono"
+            placeholder={draft.tipo_persona === "juridica" ? "Ej: 900507816" : "Ej: 1152197612"}
+            maxLength={11}
+          />
+          <div className="font-mono text-[10px] text-ink-3 mt-1 tracking-[0.04em]">
+            Necesario para descartar facturas donde el cliente figura como emisor (cuentas de cobro propias).
+          </div>
         </div>
 
         {/* Agente retenedor */}

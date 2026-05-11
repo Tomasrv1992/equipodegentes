@@ -19,6 +19,7 @@ interface Body {
   agenteId?: string;
   retention_rules: unknown;
   municipio_ica: string | null;
+  nit_cliente?: string | null;
 }
 
 export default async (request: Request, _context: Context) => {
@@ -72,6 +73,9 @@ export default async (request: Request, _context: Context) => {
       body: JSON.stringify({
         retention_rules: body.retention_rules,
         municipio_ica: body.municipio_ica,
+        // Solo actualizar nit_cliente si vino explícitamente en el body (undefined
+        // significa "no tocar"; null significa "borrar"; string significa "setear").
+        ...(body.nit_cliente !== undefined ? { nit_cliente: body.nit_cliente } : {}),
       }),
     },
   );

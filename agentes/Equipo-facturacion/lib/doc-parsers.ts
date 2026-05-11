@@ -58,8 +58,13 @@ export async function extractTextFromPdf(filePath: string): Promise<string> {
   try {
     ensureDomMatrixPolyfill();
     const buffer = fs.readFileSync(filePath);
-    // Import dinámico — pdf-parse en CommonJS, mejor lazy (después del polyfill)
-    const pdfParse = (await import("pdf-parse")).default;
+    // Import del módulo interno (no `'pdf-parse'`). El index.js de la librería
+    // ejecuta un self-test al cargarse que intenta abrir
+    // ./test/data/05-versions-space.pdf — ese archivo no existe en el bundle
+    // de Netlify y tira ENOENT en cada PDF que procesamos.
+    // @ts-ignore — no hay types para la ruta interna, casteamos manual.
+    const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default as
+      (buf: Buffer) => Promise<{ text: string }>;
     const result = await pdfParse(buffer);
     return (result.text || "").trim();
   } catch (err: any) {

@@ -975,10 +975,13 @@ function RetentionRulesSection({
         <div>
           <div className="label-tight mb-1.5">Municipio donde paga ICA</div>
           <select
-            value={draft.municipio_ica}
+            value={
+              draft.municipio_ica && !MUNICIPIOS_ICA.includes(draft.municipio_ica as any)
+                ? "OTRO"
+                : draft.municipio_ica
+            }
             onChange={(e) => setDraft({ ...draft, municipio_ica: e.target.value })}
             className="input"
-            disabled={!draft.aplica_ica}
           >
             <option value="">— No aplica —</option>
             {MUNICIPIOS_ICA.map((m) => (
@@ -991,10 +994,26 @@ function RetentionRulesSection({
                  m === "CARTAGENA" ? "Cartagena" :
                  m === "PEREIRA" ? "Pereira" :
                  m === "MANIZALES" ? "Manizales" :
-                 m}
+                 "Otro municipio…"}
               </option>
             ))}
           </select>
+          {/* Si eligió OTRO o un valor custom, mostrar input de texto */}
+          {(draft.municipio_ica === "OTRO" ||
+            (draft.municipio_ica && !MUNICIPIOS_ICA.includes(draft.municipio_ica as any))) && (
+            <div className="mt-2">
+              <input
+                type="text"
+                value={draft.municipio_ica === "OTRO" ? "" : draft.municipio_ica}
+                onChange={(e) => setDraft({ ...draft, municipio_ica: e.target.value.toUpperCase().trim() || "OTRO" })}
+                className="input input-mono"
+                placeholder="Ej: ENVIGADO, ITAGUI, RIONEGRO..."
+              />
+              <div className="font-mono text-[10px] text-ink-3 mt-1 tracking-[0.04em]">
+                Escribí el nombre del municipio. Como no está en nuestra lista de tarifas, ICA de oficio quedará en 0 — el cliente revisa manual.
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Aplicar de oficio */}
@@ -1003,15 +1022,26 @@ function RetentionRulesSection({
           <div className="flex flex-col gap-1.5 font-mono text-[11px]">
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={draft.oficio_rtf}
-                onChange={(e) => setDraft({ ...draft, oficio_rtf: e.target.checked })}
-                disabled={!draft.aplica_rtf} />
+                onChange={(e) => setDraft({
+                  ...draft,
+                  oficio_rtf: e.target.checked,
+                  // Si activa oficio RTF y no es agente retenedor, auto-activarlo
+                  aplica_rtf: e.target.checked ? true : draft.aplica_rtf,
+                })} />
               RTF (según categoría del servicio/producto)
             </label>
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={draft.oficio_ica}
-                onChange={(e) => setDraft({ ...draft, oficio_ica: e.target.checked })}
-                disabled={!draft.aplica_ica || !draft.municipio_ica} />
+                onChange={(e) => setDraft({
+                  ...draft,
+                  oficio_ica: e.target.checked,
+                  // Si activa oficio ICA, auto-activar también "agente retenedor de ICA"
+                  aplica_ica: e.target.checked ? true : draft.aplica_ica,
+                })} />
               ICA (según tarifa del municipio)
+              {draft.oficio_ica && !draft.municipio_ica && (
+                <span className="text-warn text-[10px] ml-2">⚠ falta elegir municipio arriba</span>
+              )}
             </label>
           </div>
         </div>

@@ -53,6 +53,19 @@ export interface InvoiceData {
   iva: number;
   total: number;
   concepto: string;
+  /**
+   * Retenciones aplicadas por el proveedor en la factura DIAN.
+   * Códigos DIAN del nodo cac:WithholdingTaxTotal/cac:TaxScheme/cbc:ID:
+   *   - 05: Retención en la Fuente (ReteFuente)
+   *   - 06: Retención de IVA (ReteIVA)
+   *   - 07: Retención de ICA (ReteICA)
+   * Si la factura no aplica retención, todos son 0.
+   * `totalRetenciones` = reteFuente + reteIva + reteIca
+   */
+  reteFuente?: number;
+  reteIva?: number;
+  reteIca?: number;
+  totalRetenciones?: number;
 }
 
 export interface ProcessedRow extends InvoiceData {
@@ -248,7 +261,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     try {
       const res = await sheets.spreadsheets.values.get({
         spreadsheetId: g.sheetId,
-        range: `${tabRange}!A:L`, // 12 cols
+        range: `${tabRange}!A:P`, // 16 cols (12 originales + 4 retenciones)
       });
       const rows = res.data.values || [];
       sheetRowsCache.set(tabName, rows);
@@ -331,11 +344,16 @@ function buildFileBaseName(n: number, proveedor: string, subIdx?: number): strin
   return `${N}. ${provClean}`;
 }
 
-// Headers nuevos: 12 columnas (col A = N° consecutivo del mes)
+// Headers: 16 columnas (col A = N° consecutivo del mes).
+// Las últimas 4 (ReteFuente, ReteIVA, ReteICA, Total Retenciones) se agregaron
+// el 2026-05-11 al implementar extracción de retenciones del XML DIAN.
+// Pestañas existentes con 12 columnas se migran automáticamente en getOrCreateMonthTab.
 const SHEET_HEADERS = [
   "N°", "Fecha", "Proveedor", "NIT", "N° Factura", "Subtotal", "IVA",
   "Total", "Concepto", "Link PDF", "Categoría", "Cuenta PYG",
+  "ReteFuente", "ReteIVA", "ReteICA", "Total Retenciones",
 ];
+const SHEET_HEADERS_COUNT = SHEET_HEADERS.length; // 16
 
 const DASHBOARD_TAB = "Dashboard";
 
@@ -468,11 +486,29 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["", "", "", "", "", ""],
     // Row 33: header sección
     ["TOP 5 CATEGORÍAS (todo el año)", "", "", "", "", ""],
-    // Row 34: QUERY
+    // Row 34: QUERY (expande 5 filas hacia abajo)
     [
       `=QUERY({${allMonthsRange}};"select Col11, count(Col11), sum(Col8) where Col11 is not null and Col11 <> '' group by Col11 order by count(Col11) desc limit 5 label Col11 'Categoría', count(Col11) 'Facturas', sum(Col8) 'Monto'";0)`,
       "", "", "", "", "",
     ],
+    // Rows 35-38 reservadas para el resultado del QUERY (5 filas + header = 6)
+    [], [], [], [], [],
+    // Row 40: vacío
+    ["", "", "", "", "", ""],
+    // Row 41: header sección RETENCIONES
+    ["RETENCIONES (todo el año)", "", "", "", "", ""],
+    // Row 42: headers tabla
+    ["Tipo", "Monto (COP)", "", "", "", ""],
+    // Row 43: ReteFuente = SUM de cols M de las 12 pestañas
+    ["ReteFuente", `=${MES_TABS.map((m) => `SUM('${m}'!M:M)`).join("+")}`, "", "", "", ""],
+    // Row 44: ReteIVA
+    ["ReteIVA", `=${MES_TABS.map((m) => `SUM('${m}'!N:N)`).join("+")}`, "", "", "", ""],
+    // Row 45: ReteICA
+    ["ReteICA", `=${MES_TABS.map((m) => `SUM('${m}'!O:O)`).join("+")}`, "", "", "", ""],
+    // Row 46: Total retenciones (suma directa de col P)
+    ["Total retenido", `=${MES_TABS.map((m) => `SUM('${m}'!P:P)`).join("+")}`, "", "", "", ""],
+    // Row 47: Neto pagado (Total bruto - Retenciones)
+    ["Neto pagado al proveedor", `=C23-B46`, "(Total año − Total retenido)", "", "", ""],
   ];
 
   await sheets.spreadsheets.values.update({
@@ -509,8 +545,8 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment,backgroundColor)",
             },
           },
-          // Headers de sección (rows 3, 9, 25, 33): bold con fondo claro
-          ...[2, 8, 24, 32].map((rowIdx) => ({
+          // Headers de sección (rows 3, 9, 25, 33, 41): bold con fondo claro
+          ...[2, 8, 24, 32, 40].map((rowIdx) => ({
             repeatCell: {
               range: { sheetId: dashSheetId, startRowIndex: rowIdx, endRowIndex: rowIdx + 1, startColumnIndex: 0, endColumnIndex: 6 },
               cell: {
@@ -575,18 +611,47 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
               fields: "userEnteredFormat.numberFormat",
             },
           },
+          // Retenciones (rows 43-47): formato moneda en col B
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 42, endRowIndex: 47, startColumnIndex: 1, endColumnIndex: 2 },
+              cell: { userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } } },
+              fields: "userEnteredFormat.numberFormat",
+            },
+          },
+          // Retenciones header tabla (row 42)
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 41, endRowIndex: 42, startColumnIndex: 0, endColumnIndex: 3 },
+              cell: { userEnteredFormat: { textFormat: { bold: true } } },
+              fields: "userEnteredFormat.textFormat",
+            },
+          },
+          // Total retenido + Neto pagado (rows 45-46): bold + fondo
+          {
+            repeatCell: {
+              range: { sheetId: dashSheetId, startRowIndex: 45, endRowIndex: 47, startColumnIndex: 0, endColumnIndex: 3 },
+              cell: {
+                userEnteredFormat: {
+                  textFormat: { bold: true },
+                  backgroundColor: { red: 0.98, green: 0.95, blue: 0.85 },
+                },
+              },
+              fields: "userEnteredFormat(textFormat,backgroundColor)",
+            },
+          },
           // Centrar columnas numéricas (B y C) en todas las secciones de data
           {
             repeatCell: {
-              range: { sheetId: dashSheetId, startRowIndex: 3, endRowIndex: 39, startColumnIndex: 1, endColumnIndex: 3 },
+              range: { sheetId: dashSheetId, startRowIndex: 3, endRowIndex: 47, startColumnIndex: 1, endColumnIndex: 3 },
               cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } },
               fields: "userEnteredFormat.horizontalAlignment",
             },
           },
-          // Bordes en todas las celdas con data (rows 3-38, cols A-C)
+          // Bordes en todas las celdas con data (rows 3-46, cols A-C)
           {
             updateBorders: {
-              range: { sheetId: dashSheetId, startRowIndex: 2, endRowIndex: 39, startColumnIndex: 0, endColumnIndex: 3 },
+              range: { sheetId: dashSheetId, startRowIndex: 2, endRowIndex: 47, startColumnIndex: 0, endColumnIndex: 3 },
               top:    { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
               bottom: { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
               left:   { style: "SOLID", width: 1, color: { red: 0.78, green: 0.78, blue: 0.82 } },
@@ -618,6 +683,10 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
 /**
  * Devuelve el nombre del tab del mes (ej "Enero", "Febrero"...). Si no existe,
  * lo crea con headers + frozen + bold. Idempotente.
+ *
+ * Migración automática: si la pestaña existe pero solo tiene 12 columnas
+ * (versión vieja, pre-retenciones), agrega las 4 columnas nuevas
+ * (ReteFuente, ReteIVA, ReteICA, Total Retenciones) con sus headers.
  */
 async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number): Promise<string> {
   const tabName = MES_TABS[month - 1];
@@ -625,9 +694,59 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
 
   const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
   const existing = meta.data.sheets?.find((s: any) => s.properties?.title === tabName);
-  if (existing) return tabName;
 
-  // Crear tab + headers + formato
+  if (existing) {
+    // Pestaña ya existe → verificar si necesita migración (agregar columnas faltantes)
+    const existingCols = existing.properties?.gridProperties?.columnCount ?? 0;
+    if (existingCols < SHEET_HEADERS_COUNT) {
+      const existingTabId = existing.properties.sheetId;
+      // 1. Expandir grid a 16 columnas
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+          requests: [{
+            updateSheetProperties: {
+              properties: {
+                sheetId: existingTabId,
+                gridProperties: { columnCount: SHEET_HEADERS_COUNT, frozenRowCount: 1 },
+              },
+              fields: "gridProperties.columnCount,gridProperties.frozenRowCount",
+            },
+          }],
+        },
+      });
+      // 2. Escribir SOLO los headers faltantes (columnas 13-16 = M-P)
+      const newHeaders = SHEET_HEADERS.slice(existingCols);
+      const startColLetter = String.fromCharCode("A".charCodeAt(0) + existingCols);
+      const endColLetter = String.fromCharCode("A".charCodeAt(0) + SHEET_HEADERS_COUNT - 1);
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `'${tabName}'!${startColLetter}1:${endColLetter}1`,
+        valueInputOption: "RAW",
+        requestBody: { values: [newHeaders] },
+      });
+      // 3. Aplicar formato bold + bg a los nuevos headers
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+          requests: [{
+            repeatCell: {
+              range: {
+                sheetId: existingTabId,
+                startRowIndex: 0, endRowIndex: 1,
+                startColumnIndex: existingCols, endColumnIndex: SHEET_HEADERS_COUNT,
+              },
+              cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 } } },
+              fields: "userEnteredFormat(textFormat,backgroundColor)",
+            },
+          }],
+        },
+      });
+    }
+    return tabName;
+  }
+
+  // Pestaña no existe → crear desde cero con 16 cols
   const created = await sheets.spreadsheets.batchUpdate({
     spreadsheetId: sheetId,
     requestBody: {
@@ -635,7 +754,7 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
         addSheet: {
           properties: {
             title: tabName,
-            gridProperties: { frozenRowCount: 1, columnCount: 12 },
+            gridProperties: { frozenRowCount: 1, columnCount: SHEET_HEADERS_COUNT },
           },
         },
       }],
@@ -645,7 +764,7 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: sheetId,
-    range: `'${tabName}'!A1:L1`,
+    range: `'${tabName}'!A1:P1`,
     valueInputOption: "RAW",
     requestBody: { values: [SHEET_HEADERS] },
   });
@@ -656,7 +775,7 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
       requestBody: {
         requests: [{
           repeatCell: {
-            range: { sheetId: newTabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 12 },
+            range: { sheetId: newTabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: SHEET_HEADERS_COUNT },
             cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 } } },
             fields: "userEnteredFormat(textFormat,backgroundColor)",
           },
@@ -963,6 +1082,14 @@ function parseInvoiceXml(xmlPath: string, xmlParser: XMLParser): InvoiceData | n
   const taxArr = Array.isArray(invoice.TaxTotal) ? invoice.TaxTotal : invoice.TaxTotal ? [invoice.TaxTotal] : [];
   for (const t of taxArr) iva += asNumber(t.TaxAmount);
 
+  // Retenciones del nodo cac:WithholdingTaxTotal (puede ser objeto o array).
+  // Cada nodo tiene un TaxScheme.ID que indica el tipo:
+  //   05 = ReteFuente (Retención en la Fuente)
+  //   06 = ReteIVA
+  //   07 = ReteICA
+  const { reteFuente, reteIva, reteIca } = extractRetenciones(invoice);
+  const totalRetenciones = reteFuente + reteIva + reteIca;
+
   const lines = Array.isArray(invoice.InvoiceLine)
     ? invoice.InvoiceLine
     : invoice.InvoiceLine
@@ -986,7 +1113,72 @@ function parseInvoiceXml(xmlPath: string, xmlParser: XMLParser): InvoiceData | n
     iva,
     total,
     concepto,
+    reteFuente,
+    reteIva,
+    reteIca,
+    totalRetenciones,
   };
+}
+
+/**
+ * Extrae las 3 retenciones colombianas del nodo cac:WithholdingTaxTotal.
+ * Soporta el caso de que sea objeto único o array.
+ * El nodo TaxScheme.ID identifica el tipo:
+ *   - "05" → ReteFuente
+ *   - "06" → ReteIVA
+ *   - "07" → ReteICA
+ * Si no hay nodo, todos quedan en 0.
+ */
+function extractRetenciones(invoice: any): {
+  reteFuente: number;
+  reteIva: number;
+  reteIca: number;
+} {
+  const out = { reteFuente: 0, reteIva: 0, reteIca: 0 };
+  const wt = invoice.WithholdingTaxTotal;
+  if (!wt) return out;
+
+  // Puede venir como objeto único o como array de objetos (múltiples retenciones)
+  const wtArr = Array.isArray(wt) ? wt : [wt];
+
+  for (const w of wtArr) {
+    // El TaxSubtotal a su vez puede ser objeto o array
+    const subArr = Array.isArray(w.TaxSubtotal)
+      ? w.TaxSubtotal
+      : w.TaxSubtotal
+        ? [w.TaxSubtotal]
+        : [];
+
+    // Si NO hay TaxSubtotal pero hay TaxAmount directo, sumamos al ReteFuente (default)
+    if (subArr.length === 0) {
+      const amount = asNumber(w.TaxAmount);
+      out.reteFuente += amount;
+      continue;
+    }
+
+    for (const sub of subArr) {
+      const code = String(
+        pick(sub, "TaxCategory.TaxScheme.ID") ?? pick(sub, "TaxScheme.ID") ?? ""
+      ).trim();
+      const amount = asNumber(sub.TaxAmount);
+      switch (code) {
+        case "05":
+          out.reteFuente += amount;
+          break;
+        case "06":
+          out.reteIva += amount;
+          break;
+        case "07":
+          out.reteIca += amount;
+          break;
+        default:
+          // Código desconocido: por convención sumamos a ReteFuente (es el más común)
+          out.reteFuente += amount;
+      }
+    }
+  }
+
+  return out;
 }
 
 // ===== Drive =====
@@ -1052,15 +1244,18 @@ async function appendToSheet(
   consecutivo: number,
   d: ProcessedRow
 ): Promise<any[]> {
-  // 12 cols: A=N°, B=Fecha, C=Proveedor, D=NIT, E=N°Factura, F=Subtotal,
-  //          G=IVA, H=Total, I=Concepto, J=Link PDF, K=Categoría, L=Cuenta PYG
+  // 16 cols: A=N°, B=Fecha, C=Proveedor, D=NIT, E=N°Factura, F=Subtotal,
+  //          G=IVA, H=Total, I=Concepto, J=Link PDF, K=Categoría, L=Cuenta PYG,
+  //          M=ReteFuente, N=ReteIVA, O=ReteICA, P=Total Retenciones.
+  // Para non-DIAN (Word/PDF/planillas), retenciones = 0 (LLM no las extrae aún).
   const row = [
     consecutivo, d.fecha, d.proveedor, d.nit, d.numero, d.subtotal,
     d.iva, d.total, d.concepto, d.driveLink, d.categoria, d.cuentaPyg,
+    d.reteFuente ?? 0, d.reteIva ?? 0, d.reteIca ?? 0, d.totalRetenciones ?? 0,
   ];
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `${tabRange}!A:L`,
+    range: `${tabRange}!A:P`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });

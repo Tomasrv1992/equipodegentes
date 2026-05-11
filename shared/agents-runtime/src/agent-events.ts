@@ -24,6 +24,15 @@ export interface FacturaEventPayload {
    * Valores: factura_dian | cuenta_cobro | recibo_internacional | recibo_servicio | planilla_ss
    */
   tipo?: string;
+  /**
+   * Retenciones aplicadas (códigos DIAN 05/06/07). Solo facturas DIAN las extraen;
+   * cuentas de cobro y recibos no-DIAN quedan en 0 a menos que se configuren
+   * reglas de retención por cliente (Sub-fase 2).
+   */
+  reteFuente?: number;
+  reteIva?: number;
+  reteIca?: number;
+  totalRetenciones?: number;
 }
 
 export interface EmitFacturaEventsInput {

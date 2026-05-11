@@ -199,6 +199,11 @@ export default async (req: Request) => {
             categoria: p.categoria,
             cuentaPyg: p.cuentaPyg,
             tipo: (p as any).tipo ?? "factura_dian",
+            // Retenciones extraídas del XML DIAN (cero para no-DIAN)
+            reteFuente: (p as any).reteFuente ?? 0,
+            reteIva: (p as any).reteIva ?? 0,
+            reteIca: (p as any).reteIca ?? 0,
+            totalRetenciones: (p as any).totalRetenciones ?? 0,
             driveLink: p.driveLink,
           }));
           await emitFacturaEvents({

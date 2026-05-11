@@ -35,6 +35,13 @@ export interface PipelineConfig {
   retentionRules?: unknown | null;
   /** Municipio donde el cliente paga ICA (para cálculo de oficio). */
   municipioIca?: string | null;
+  /**
+   * NIT o cédula del cliente actual. Usado para detectar y descartar
+   * facturas DONDE EL CLIENTE ES EMISOR (cuentas de cobro que él emite a
+   * sus propios clientes) — sino se cuelan como gastos.
+   * Si null, no se aplica el filtro (legacy / cron viejo).
+   */
+  nitCliente?: string | null;
   /** Comportamiento. */
   options?: {
     dryRun?: boolean;
@@ -61,6 +68,17 @@ export interface InvoiceData {
   iva: number;
   total: number;
   concepto: string;
+  /**
+   * Impuesto Nacional al Consumo (INC, TaxScheme=04). Aplica a restaurantes,
+   * bebidas alcohólicas, ciertos servicios. NO es IVA. Si la factura no tiene
+   * INC, queda en 0.
+   */
+  inc?: number;
+  /**
+   * Suma de impuestos distintos a IVA (01) e INC (04). Para casos especiales
+   * (impuestos al combustible, bolsas plásticas, etc).
+   */
+  otrosImpuestos?: number;
   /**
    * Retenciones aplicadas por el proveedor en la factura DIAN.
    * Códigos DIAN del nodo cac:WithholdingTaxTotal/cac:TaxScheme/cbc:ID:
@@ -296,6 +314,9 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     ? { rules: cfg.retentionRules, municipioIca: cfg.municipioIca ?? null }
     : null;
 
+  // NIT/cédula del cliente — usado para detectar facturas self-emitted y skip.
+  const nitCliente = cfg.nitCliente ? String(cfg.nitCliente).replace(/\D+/g, "") : null;
+
   for (const e of emails) {
     try {
       const r = await processOne(
@@ -313,6 +334,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
         },
         llmTracker,
         retentionCtx,
+        nitCliente,
       );
       if ("ok" in r && r.ok) {
         result.procesadas.push(r);
@@ -1133,7 +1155,11 @@ function unwrapAttachedDocument(parsed: any, xmlParser: XMLParser): any | null {
   return xmlParser.parse(innerXml);
 }
 
-function parseInvoiceXml(xmlPath: string, xmlParser: XMLParser): InvoiceData | null {
+function parseInvoiceXml(
+  xmlPath: string,
+  xmlParser: XMLParser,
+  nitCliente?: string | null,
+): InvoiceData | null {
   const raw = fs.readFileSync(xmlPath, "utf8");
   const parsed = xmlParser.parse(raw);
 
@@ -1155,13 +1181,50 @@ function parseInvoiceXml(xmlPath: string, xmlParser: XMLParser): InvoiceData | n
     pick(supplier, "PartyTaxScheme.CompanyID") ?? pick(supplier, "PartyIdentification.ID") ?? ""
   ).replace(/\D+/g, "");
 
+  // Skip si el supplier es el mismo cliente actual: significa que es una factura
+  // que el cliente emitió (cuenta de cobro hacia sus clientes), no un gasto.
+  if (nitCliente) {
+    const nitClienteClean = String(nitCliente).replace(/\D+/g, "");
+    if (nit && nit === nitClienteClean) {
+      console.log(`[skip-self-emitted] proveedor=${proveedor} nit=${nit} === nitCliente`);
+      return null;
+    }
+  }
+
+  // PayableAmount es el TOTAL FINAL que paga el cliente (incluye propinas y
+  // cargos globales). TaxInclusiveAmount sería solo subtotal+impuestos (sin
+  // propinas), insuficiente para restaurantes con INC y propina cliente.
   const totals = invoice.LegalMonetaryTotal;
   const subtotal = asNumber(pick(totals, "LineExtensionAmount"));
-  const total = asNumber(pick(totals, "TaxInclusiveAmount") ?? pick(totals, "PayableAmount"));
+  const total = asNumber(pick(totals, "PayableAmount") ?? pick(totals, "TaxInclusiveAmount"));
 
+  // Distinguir IVA (TaxScheme.ID=01) de otros impuestos (INC=04, etc).
+  // Antes sumaba todo como IVA — bug en facturas de restaurantes (INC) y otros
+  // sectores con impuestos especiales.
   let iva = 0;
+  let inc = 0;
+  let otrosImpuestos = 0;
   const taxArr = Array.isArray(invoice.TaxTotal) ? invoice.TaxTotal : invoice.TaxTotal ? [invoice.TaxTotal] : [];
-  for (const t of taxArr) iva += asNumber(t.TaxAmount);
+  for (const t of taxArr) {
+    const taxAmount = asNumber(t.TaxAmount);
+    const subtotalsArr = Array.isArray(t.TaxSubtotal)
+      ? t.TaxSubtotal
+      : t.TaxSubtotal
+        ? [t.TaxSubtotal]
+        : [];
+    if (subtotalsArr.length === 0) {
+      // No hay subtotales detallados: fallback al taxAmount como IVA
+      iva += taxAmount;
+      continue;
+    }
+    for (const sub of subtotalsArr) {
+      const schemeId = asString(pick(sub, "TaxCategory.TaxScheme.ID"));
+      const subAmount = asNumber(pick(sub, "TaxAmount"));
+      if (schemeId === "01") iva += subAmount;
+      else if (schemeId === "04") inc += subAmount;
+      else otrosImpuestos += subAmount;
+    }
+  }
 
   // Retenciones del nodo cac:WithholdingTaxTotal (puede ser objeto o array).
   // Cada nodo tiene un TaxScheme.ID que indica el tipo:
@@ -1194,6 +1257,8 @@ function parseInvoiceXml(xmlPath: string, xmlParser: XMLParser): InvoiceData | n
     iva,
     total,
     concepto,
+    inc,
+    otrosImpuestos,
     reteFuente,
     reteIva,
     reteIca,
@@ -1362,6 +1427,7 @@ async function processOne(
   pushToCache: (tabName: string, row: any[]) => void,
   llmTracker: LlmTracker,
   retentionCtx: { rules: unknown | null; municipioIca: string | null } | null,
+  nitCliente: string | null,
 ): Promise<ProcessOneResult> {
   const msg = await getMessageFull(gmail, messageId);
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
@@ -1453,7 +1519,7 @@ async function processOne(
     let data: InvoiceData | null = null;
     for (const x of xmlPaths) {
       try {
-        const candidate = parseInvoiceXml(x, xmlParser);
+        const candidate = parseInvoiceXml(x, xmlParser, nitCliente);
         if (candidate && (candidate.numero || candidate.cufe)) {
           data = candidate;
           break;

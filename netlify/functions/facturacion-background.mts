@@ -347,6 +347,8 @@ async function buildConfig(
       // deja las retenciones tal como vienen del XML (sin engine).
       retentionRules: (cred as any).retention_rules ?? null,
       municipioIca: (cred as any).municipio_ica ?? null,
+      // NIT/cédula del cliente para descartar facturas self-emitted (Migración 0008).
+      nitCliente: (cred as any).nit_cliente ?? null,
       options: {
         dryRun: body.dryRun ?? false,
         window: resolvedWindow,

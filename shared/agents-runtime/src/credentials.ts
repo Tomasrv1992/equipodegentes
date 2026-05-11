@@ -58,6 +58,12 @@ export interface ClientCredentialsRow {
    * Determina la tarifa cuando ReteICA se aplica de oficio. Null si no aplica ICA.
    */
   municipio_ica: string | null;
+  /**
+   * NIT o cédula del cliente. Usado para detectar facturas DIAN donde el
+   * cliente es el emisor (cuentas de cobro hacia sus propios clientes) y
+   * descartarlas — sino se cuelan como gastos.
+   */
+  nit_cliente: string | null;
 }
 
 export interface SaveOAuthTokensInput {

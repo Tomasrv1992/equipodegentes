@@ -314,20 +314,23 @@ async function buildConfig(
       );
     }
 
-    // Backfill rule: si es el primer run del cliente (first_run_done = false),
-    // procesa todo el año calendario actual (after:YYYY/01/01) en vez del rolling 30d.
+    // Backfill rule: si es el primer run del cliente (first_run_done = false)
+    // o si vino force=true (reprocesamiento manual), procesa todo el año
+    // calendario actual (after:YYYY/01/01) en vez del rolling 30d.
     // El primer run después de onboarding entrega valor inmediato al cliente.
+    // Force re-procesa hacia atrás para capturar lo que el cron viejo no pudo.
     let resolvedWindow: string;
     if (body.window) {
       resolvedWindow = body.window;  // override explícito desde el body
-    } else if (!cred.first_run_done) {
-      // First run → backfill desde 1° de enero del año actual
+    } else if (!cred.first_run_done || body.force) {
+      // First run o force=true → backfill desde 1° de enero del año actual
       const yearStart = new Date(new Date().getFullYear(), 0, 1);
       const yyyy = yearStart.getFullYear();
       const mm = String(yearStart.getMonth() + 1).padStart(2, "0");
       const dd = String(yearStart.getDate()).padStart(2, "0");
       resolvedWindow = `${yyyy}/${mm}/${dd}`;
-      console.log(`[backfill] cliente ${body.customerId} first_run_done=false → window=${resolvedWindow}`);
+      const reason = !cred.first_run_done ? "first_run_done=false" : "force=true";
+      console.log(`[backfill] cliente ${body.customerId} ${reason} → window=${resolvedWindow}`);
     } else {
       resolvedWindow = "30d";
     }

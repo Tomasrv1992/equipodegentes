@@ -8,7 +8,13 @@ interface OnboardingInfo {
   cliente_slug: string;
   agente_id: string;
   agente_nombre: string;
-  step: "pending" | "oauth_done" | "resources_done" | "completed" | "expired";
+  step:
+    | "pending"
+    | "oauth_done"
+    | "fiscal_pending"
+    | "resources_done"
+    | "completed"
+    | "expired";
   expires_at: string;
 }
 
@@ -137,12 +143,17 @@ export default function OnboardingPage() {
           <StepConnectGoogle token={token} forceNew={info.step === "oauth_done"} />
         )}
 
-        {/* Step 2: Seleccionar Drive + Sheet */}
+        {/* Step 2: Seleccionar Drive + Sheet (fallback si auto-create falló) */}
         {info.step === "oauth_done" && oauthOk && (
           <StepResources token={token} cliente={info} />
         )}
 
-        {/* Step 3: Listo */}
+        {/* Step 3: Datos fiscales (NIT + retenciones) */}
+        {info.step === "fiscal_pending" && (
+          <StepFiscalData token={token} cliente={info} />
+        )}
+
+        {/* Step 4: Listo */}
         {info.step === "completed" && <StepDone cliente={info} />}
       </div>
     </div>
@@ -385,7 +396,324 @@ function StepResources({
   );
 }
 
-// ===== Step 3: Done =====
+// ===== Step 3: Datos fiscales =====
+const MUNICIPIOS_ICA = [
+  { value: "", label: "— No aplica / no estoy seguro —" },
+  { value: "BOGOTA", label: "Bogotá" },
+  { value: "MEDELLIN", label: "Medellín" },
+  { value: "CALI", label: "Cali" },
+  { value: "BARRANQUILLA", label: "Barranquilla" },
+  { value: "BUCARAMANGA", label: "Bucaramanga" },
+  { value: "CARTAGENA", label: "Cartagena" },
+  { value: "PEREIRA", label: "Pereira" },
+  { value: "MANIZALES", label: "Manizales" },
+  { value: "OTRO", label: "Otro municipio…" },
+];
+
+function StepFiscalData({
+  token,
+  cliente,
+}: {
+  token: string;
+  cliente: OnboardingInfo;
+}) {
+  type TipoPersona = "juridica" | "natural_declarante" | "natural_no_declarante";
+
+  const [tipoPersona, setTipoPersona] = useState<TipoPersona>("juridica");
+  const [nitCliente, setNitCliente] = useState("");
+  const [reteFuente, setReteFuente] = useState(true);
+  const [reteIva, setReteIva] = useState(false);
+  const [reteIca, setReteIca] = useState(false);
+  const [municipioIca, setMunicipioIca] = useState("");
+  const [municipioCustom, setMunicipioCustom] = useState("");
+  const [oficioRtf, setOficioRtf] = useState(true);
+  const [oficioIca, setOficioIca] = useState(false);
+  const [notas, setNotas] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [errMsg, setErrMsg] = useState("");
+  const [done, setDone] = useState(false);
+
+  // Auto-ajustar defaults cuando cambia tipo de persona
+  function handleTipoPersonaChange(newTipo: TipoPersona) {
+    setTipoPersona(newTipo);
+    if (newTipo === "natural_no_declarante") {
+      // Persona natural NO declarante: típicamente sin retenciones
+      setReteFuente(false);
+      setReteIva(false);
+      setReteIca(false);
+      setOficioRtf(false);
+      setOficioIca(false);
+    } else if (newTipo === "natural_declarante") {
+      // Persona natural declarante: típicamente RTF activo
+      setReteFuente(true);
+      setReteIva(false);
+      setReteIca(false);
+      setOficioRtf(true);
+      setOficioIca(false);
+    } else {
+      // Persona jurídica: típicamente RTF + ICA si tiene municipio
+      setReteFuente(true);
+      setReteIva(false);
+      setReteIca(false);
+      setOficioRtf(true);
+      setOficioIca(false);
+    }
+  }
+
+  const nitLabel =
+    tipoPersona === "juridica"
+      ? "NIT de tu empresa (sin dígito de verificación)"
+      : "Tu cédula de ciudadanía";
+  const nitPlaceholder =
+    tipoPersona === "juridica" ? "Ej: 900507816" : "Ej: 1037621575";
+
+  // Validación
+  const nitLimpio = nitCliente.replace(/\D+/g, "");
+  const nitValido = nitLimpio.length >= 6 && nitLimpio.length <= 11;
+
+  async function handleSave() {
+    if (!nitValido) {
+      setErrMsg("Necesitamos un NIT/cédula válido (6-11 dígitos).");
+      return;
+    }
+    setSaving(true);
+    setErrMsg("");
+    try {
+      const municipioFinal =
+        municipioIca === "OTRO"
+          ? municipioCustom.toUpperCase().trim() || null
+          : municipioIca || null;
+
+      const resp = await fetch("/api/onboarding/save-fiscal-data", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          token,
+          tipo_persona: tipoPersona,
+          nit_cliente: nitLimpio,
+          agente_retenedor: {
+            reteFuente,
+            reteIva,
+            reteIca,
+          },
+          municipio_ica: municipioFinal,
+          aplicar_de_oficio: {
+            rtf_si_xml_vacio: oficioRtf,
+            ica_si_xml_vacio: oficioIca,
+          },
+          notas,
+        }),
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      setDone(true);
+    } catch (e: any) {
+      setErrMsg(e.message ?? String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (done) return <StepDone cliente={cliente} />;
+
+  return (
+    <section className="card mt-10 space-y-6">
+      <div>
+        <div className="label mb-3">Último paso</div>
+        <h2 className="font-display text-2xl font-semibold tracking-tighter mb-2">
+          Datos fiscales
+        </h2>
+        <p className="font-sans text-sm text-ink-3 leading-relaxed">
+          Necesitamos saber un par de cosas para procesar tus facturas
+          correctamente. Si no estás seguro de alguna respuesta, podés dejarla
+          en su valor por defecto y editarlo después.
+        </p>
+      </div>
+
+      {/* Tipo de persona */}
+      <div>
+        <label className="label mb-2 block">Tipo de cliente</label>
+        <select
+          value={tipoPersona}
+          onChange={(e) => handleTipoPersonaChange(e.target.value as TipoPersona)}
+          className="input"
+        >
+          <option value="juridica">Persona jurídica (empresa con NIT)</option>
+          <option value="natural_declarante">
+            Persona natural — declarante de renta
+          </option>
+          <option value="natural_no_declarante">
+            Persona natural — NO declarante de renta
+          </option>
+        </select>
+      </div>
+
+      {/* NIT / Cédula */}
+      <div>
+        <label className="label mb-2 block">{nitLabel}</label>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={nitCliente}
+          onChange={(e) => setNitCliente(e.target.value.replace(/\D+/g, ""))}
+          maxLength={11}
+          placeholder={nitPlaceholder}
+          className="input"
+        />
+        <p className="font-mono text-[10px] text-ink-3 mt-1.5 leading-relaxed">
+          Lo usamos para descartar facturas donde vos figuras como emisor (tus
+          propias cuentas de cobro), así no se cuelan como gastos.
+        </p>
+      </div>
+
+      {/* Agente retenedor */}
+      <div>
+        <label className="label mb-2 block">¿Sos agente retenedor de…?</label>
+        <div className="flex flex-col gap-2 font-mono text-[11px]">
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={reteFuente}
+              onChange={(e) => setReteFuente(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              Retención en la Fuente (RTF)
+              <br />
+              <span className="text-ink-3 normal-case">
+                La mayoría de empresas formales lo son.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={reteIva}
+              onChange={(e) => setReteIva(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              Retención de IVA
+              <br />
+              <span className="text-ink-3 normal-case">
+                Solo si sos gran contribuyente.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={reteIca}
+              onChange={(e) => setReteIca(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              Retención de ICA
+              <br />
+              <span className="text-ink-3 normal-case">
+                Solo en algunos municipios y según actividad económica.
+              </span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      {/* Municipio ICA */}
+      <div>
+        <label className="label mb-2 block">Municipio donde pagás ICA</label>
+        <select
+          value={municipioIca}
+          onChange={(e) => setMunicipioIca(e.target.value)}
+          className="input"
+        >
+          {MUNICIPIOS_ICA.map((m) => (
+            <option key={m.value} value={m.value}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+        {municipioIca === "OTRO" && (
+          <input
+            type="text"
+            value={municipioCustom}
+            onChange={(e) => setMunicipioCustom(e.target.value)}
+            placeholder="Ej: ENVIGADO, ITAGUI, RIONEGRO..."
+            className="input input-mono mt-2"
+          />
+        )}
+      </div>
+
+      {/* Aplicar de oficio */}
+      <div>
+        <label className="label mb-2 block">
+          Aplicar retención de oficio si el proveedor no la incluyó
+        </label>
+        <div className="flex flex-col gap-2 font-mono text-[11px]">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={oficioRtf}
+              onChange={(e) => {
+                setOficioRtf(e.target.checked);
+                if (e.target.checked) setReteFuente(true);
+              }}
+            />
+            <span>RTF (según categoría del servicio/producto)</span>
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={oficioIca}
+              onChange={(e) => {
+                setOficioIca(e.target.checked);
+                if (e.target.checked) setReteIca(true);
+              }}
+            />
+            <span>ICA (según tarifa del municipio)</span>
+            {oficioIca && !municipioIca && (
+              <span className="text-fail text-[10px] ml-2">
+                ⚠ falta elegir municipio
+              </span>
+            )}
+          </label>
+        </div>
+      </div>
+
+      {/* Notas */}
+      <div>
+        <label className="label mb-2 block">Notas (opcional)</label>
+        <textarea
+          value={notas}
+          onChange={(e) => setNotas(e.target.value)}
+          className="input"
+          rows={2}
+          placeholder="Ej: régimen especial, observaciones del contador..."
+        />
+      </div>
+
+      {errMsg && (
+        <p className="font-mono text-[11px] text-fail tracking-[0.04em]">
+          {errMsg}
+        </p>
+      )}
+
+      <button
+        onClick={handleSave}
+        disabled={saving || !nitValido}
+        className="btn-accent"
+      >
+        {saving ? "Guardando…" : "Listo, arrancar a procesar"}
+      </button>
+
+      {!nitValido && nitCliente.length > 0 && (
+        <p className="font-mono text-[10px] text-fail tracking-[0.04em]">
+          NIT/cédula debe tener entre 6 y 11 dígitos.
+        </p>
+      )}
+    </section>
+  );
+}
+
+// ===== Step 4: Done =====
 function StepDone({ cliente }: { cliente: OnboardingInfo }) {
   return (
     <section className="card mt-10 text-center">

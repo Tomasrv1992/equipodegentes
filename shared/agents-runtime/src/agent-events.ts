@@ -77,10 +77,31 @@ export async function emitFacturaEvents(input: EmitFacturaEventsInput): Promise<
     payload: f as unknown as Record<string, unknown>,
   }));
 
-  const { error } = await supa.from("agent_events").insert(rows);
-  if (error) {
-    // No-fatal: loguamos pero no rompemos el pipeline
-    console.error(`emitFacturaEvents: insert failed (${input.facturas.length} rows): ${error.message}`);
+  // Insert por filas individuales con ON CONFLICT DO NOTHING (idempotente).
+  // El insert bulk fallaba TODO el batch si una sola fila chocaba con el UNIQUE
+  // constraint agent_events_factura_unique (migración 0005), perdiendo events
+  // de facturas nuevas. Ahora cada fila va por separado — los duplicados se
+  // ignoran silenciosamente y las nuevas se guardan.
+  let okCount = 0;
+  let dupCount = 0;
+  for (const row of rows) {
+    const { error } = await supa.from("agent_events").insert(row);
+    if (!error) {
+      okCount++;
+    } else if (
+      error.code === "23505" ||
+      /duplicate key|unique constraint/i.test(error.message)
+    ) {
+      dupCount++;
+    } else {
+      // Error no-duplicado: logueamos pero seguimos
+      console.error(`emitFacturaEvents row failed: ${error.message}`);
+    }
+  }
+  if (dupCount > 0 || okCount < rows.length) {
+    console.log(
+      `[events] cliente=${input.clienteId}: ${okCount} inserted, ${dupCount} duplicates skipped`,
+    );
   }
 }
 

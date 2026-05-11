@@ -1501,7 +1501,7 @@ async function processOne(
   if (zips.length === 0 && docxs.length > 0) {
     return await processCuentaCobroDocx(
       messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
-      loadSheetRows, pushToCache, llmTracker,
+      loadSheetRows, pushToCache, llmTracker, nitCliente,
     );
   }
 
@@ -1513,7 +1513,7 @@ async function processOne(
     if (genericPdfs.length > 0) {
       return await processGenericPdf(
         messageId, labelId, gmail, drive, sheets, g, genericPdfs, subject, msg,
-        loadSheetRows, pushToCache, llmTracker,
+        loadSheetRows, pushToCache, llmTracker, nitCliente,
       );
     }
   }
@@ -1802,6 +1802,7 @@ async function processCuentaCobroDocx(
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void,
   llmTracker: LlmTracker,
+  nitCliente: string | null,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -1860,6 +1861,19 @@ async function processCuentaCobroDocx(
         reason: `docx-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
         subject,
       };
+    }
+
+    // Skip si el documento es una cuenta de cobro EMITIDA por el propio cliente
+    // (NIT extraído del LLM coincide con nit_cliente). El LLM detecta "proveedor"
+    // = quien emite, así que si emisor=cliente, no es un gasto del cliente.
+    if (nitCliente) {
+      const extractedNit = String(extracted.nit ?? "").replace(/\D+/g, "");
+      const nitClienteClean = String(nitCliente).replace(/\D+/g, "");
+      if (extractedNit && extractedNit === nitClienteClean) {
+        console.log(`[skip-self-emitted-docx] proveedor=${extracted.proveedor} nit=${extractedNit} === nitCliente`);
+        await markEmailProcessed(gmail, messageId, labelProcesadoId);
+        return { skip: true, reason: "docx-self-emitted (cliente es emisor)", subject };
+      }
     }
 
     // 4. Year/month del documento
@@ -1970,6 +1984,7 @@ async function processGenericPdf(
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void,
   llmTracker: LlmTracker,
+  nitCliente: string | null,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -2033,6 +2048,18 @@ async function processGenericPdf(
         reason: `pdf-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
         subject,
       };
+    }
+
+    // Skip si el PDF es factura/recibo EMITIDO por el propio cliente
+    // (NIT extraído coincide con nit_cliente).
+    if (nitCliente) {
+      const extractedNit = String(extracted.nit ?? "").replace(/\D+/g, "");
+      const nitClienteClean = String(nitCliente).replace(/\D+/g, "");
+      if (extractedNit && extractedNit === nitClienteClean) {
+        console.log(`[skip-self-emitted-pdf] proveedor=${extracted.proveedor} nit=${extractedNit} === nitCliente`);
+        await markEmailProcessed(gmail, messageId, labelProcesadoId);
+        return { skip: true, reason: "pdf-self-emitted (cliente es emisor)", subject };
+      }
     }
 
     // 5. Year/month + skip pre-año-actual

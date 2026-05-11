@@ -257,7 +257,11 @@ export default async (request: Request, context: Context) => {
     console.warn("update client_credentials failed:", await upResp.text());
   }
 
-  // 7. Marcar onboarding token como COMPLETED (skip paso 2)
+  // 7. Marcar onboarding token como FISCAL_PENDING (no completed todavía).
+  //    El cliente todavía tiene que llenar el wizard fiscal antes del primer run.
+  //    Si el agente NO es facturacion (futuros agentes sin retenciones), saltea
+  //    directo a completed.
+  const nextStep = onboarding.agente_id === "facturacion" ? "fiscal_pending" : "completed";
   await fetch(
     `${supabaseUrl}/rest/v1/onboarding_tokens?token=eq.${encodeURIComponent(state)}`,
     {
@@ -269,39 +273,38 @@ export default async (request: Request, context: Context) => {
         Prefer: "return=minimal",
       },
       body: JSON.stringify({
-        step: "completed",
-        completed_at: new Date().toISOString(),
+        step: nextStep,
+        // completed_at solo si saltamos a completed (agente no facturacion).
+        ...(nextStep === "completed" ? { completed_at: new Date().toISOString() } : {}),
       }),
     },
   );
 
-  // 8. Disparar el primer run en background.
-  //    Edge functions cancelan los fetches pendientes cuando el handler retorna.
-  //    Para evitarlo: o await del fetch (esperamos 2-3s) o usar context.waitUntil
-  //    si está disponible. Vamos con AWAIT — el redirect inmediato no nos sirve
-  //    si el dispatch silenciosamente falla (Patricia onboardeó OK pero quedó sin run).
-  //
-  //    El dispatch a Netlify background fn devuelve 202 inmediato; esperar el
-  //    response no bloquea — solo confirma que el server recibió la petición.
-  const mainSiteUrl = Netlify.env.get("MAIN_SITE_URL");
-  const internalSecret = Netlify.env.get("FACTURACION_INTERNAL_SECRET");
-  if (mainSiteUrl && internalSecret && onboarding.agente_id === "facturacion") {
-    try {
-      const dispatchResp = await fetch(`${mainSiteUrl}/.netlify/functions/facturacion-background`, {
-        method: "POST",
-        headers: {
-          "x-internal-secret": internalSecret,
-          "x-trigger": "onboarding",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ customerId: onboarding.cliente_slug }),
-      });
-      console.log(`[first-run] cliente=${onboarding.cliente_slug} dispatch status=${dispatchResp.status}`);
-    } catch (e: any) {
-      console.warn(`[first-run] dispatch failed (no-fatal): ${e.message}`);
+  // 8. Si el agente NO es facturacion, disparar primer run aquí (flow viejo).
+  //    Si SÍ es facturacion, el primer run se dispara desde la edge function
+  //    onboarding-save-fiscal-data después de que el cliente complete el wizard.
+  if (nextStep === "completed") {
+    const mainSiteUrl = Netlify.env.get("MAIN_SITE_URL");
+    const internalSecret = Netlify.env.get("FACTURACION_INTERNAL_SECRET");
+    if (mainSiteUrl && internalSecret && onboarding.agente_id === "facturacion") {
+      try {
+        const dispatchResp = await fetch(`${mainSiteUrl}/.netlify/functions/facturacion-background`, {
+          method: "POST",
+          headers: {
+            "x-internal-secret": internalSecret,
+            "x-trigger": "onboarding",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ customerId: onboarding.cliente_slug }),
+        });
+        console.log(`[first-run] cliente=${onboarding.cliente_slug} dispatch status=${dispatchResp.status}`);
+      } catch (e: any) {
+        console.warn(`[first-run] dispatch failed (no-fatal): ${e.message}`);
+      }
     }
   }
 
-  // 9. Redirect — el frontend detecta step='completed' y muestra StepDone
-  return Response.redirect(`${adminUrl}/onboarding/${state}?oauth=ok&completed=1`, 302);
+  // 9. Redirect — el frontend detecta el step y muestra el step apropiado.
+  const redirectFlag = nextStep === "completed" ? "completed=1" : "fiscal=1";
+  return Response.redirect(`${adminUrl}/onboarding/${state}?oauth=ok&${redirectFlag}`, 302);
 };

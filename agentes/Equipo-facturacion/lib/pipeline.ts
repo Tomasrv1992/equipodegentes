@@ -293,7 +293,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     try {
       const res = await sheets.spreadsheets.values.get({
         spreadsheetId: g.sheetId,
-        range: `${tabRange}!A:P`, // 16 cols (12 originales + 4 retenciones)
+        range: `${tabRange}!A:O`, // 15 cols nueva estructura (retenciones entre IVA y Total)
       });
       const rows = res.data.values || [];
       sheetRowsCache.set(tabName, rows);
@@ -387,16 +387,19 @@ function buildFileBaseName(n: number, proveedor: string, subIdx?: number): strin
   return `${N}. ${provClean}`;
 }
 
-// Headers: 16 columnas (col A = N° consecutivo del mes).
-// Las últimas 4 (ReteFuente, ReteIVA, ReteICA, Total Retenciones) se agregaron
-// el 2026-05-11 al implementar extracción de retenciones del XML DIAN.
-// Pestañas existentes con 12 columnas se migran automáticamente en getOrCreateMonthTab.
+// Headers: 15 columnas. Retenciones AHORA entre IVA y Total a Pagar (no al final).
+// "Total a Pagar" se calcula como Subtotal + IVA - ReteFuente - ReteIVA - ReteICA
+// = lo que el cliente le paga REALMENTE al proveedor (post-retenciones).
+// "# Documento" reemplaza "N° Factura" — sirve para facturas DIAN y cuentas de cobro.
+// Pestañas con esquema viejo (12 o 16 cols) se reescriben automáticamente.
 const SHEET_HEADERS = [
-  "N°", "Fecha", "Proveedor", "NIT", "N° Factura", "Subtotal", "IVA",
-  "Total", "Concepto", "Link PDF", "Categoría", "Cuenta PYG",
-  "ReteFuente", "ReteIVA", "ReteICA", "Total Retenciones",
+  "#", "Fecha", "Proveedor", "NIT", "# Documento",       // A-E
+  "Subtotal", "IVA",                                      // F-G
+  "ReteFuente", "ReteIVA", "ReteICA",                     // H-I-J
+  "Total a Pagar",                                        // K
+  "Concepto", "Categoría", "Cuenta PYG", "Link PDF",      // L-O
 ];
-const SHEET_HEADERS_COUNT = SHEET_HEADERS.length; // 16
+const SHEET_HEADERS_COUNT = SHEET_HEADERS.length; // 15
 
 const DASHBOARD_TAB = "Dashboard";
 
@@ -481,8 +484,11 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
   // Los `,` solo se usan dentro del lenguaje QUERY (en el SQL string) que tiene su
   // propia sintaxis SQL. Las funciones nativas (CHOOSE, TEXT, ROUND, SUM, etc) van con `;`.
   const monthChooseStr = MES_TABS.map((m) => `"${m}"`).join(";");
-  // Rangos consolidados de las 12 pestañas (para QUERY)
-  const allMonthsRange = MES_TABS.map((m) => `'${m}'!A2:L`).join(";");
+  // Rango consolidado de las 12 pestañas (para QUERY). 15 cols → A2:O.
+  // Col en QUERY: 1=#, 2=Fecha, 3=Proveedor, 4=NIT, 5=#Doc, 6=Subtotal, 7=IVA,
+  // 8=ReteFuente, 9=ReteIVA, 10=ReteICA, 11=Total a Pagar, 12=Concepto,
+  // 13=Categoría, 14=Cuenta PYG, 15=Link PDF.
+  const allMonthsRange = MES_TABS.map((m) => `'${m}'!A2:O`).join(";");
 
   const content: any[][] = [
     // Row 1: título grande
@@ -495,8 +501,8 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["Mes", `=PROPER(TEXT(TODAY();"mmmm yyyy"))`, "", "", "", ""],
     // Row 5: Facturas
     ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!A2:A1000"))`, "", "", "", ""],
-    // Row 6: Monto
-    ["Monto total (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!H2:H1000"))`, "", "", "", ""],
+    // Row 6: Monto (Total a Pagar = col K)
+    ["Total a Pagar (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!K2:K1000"))`, "", "", "", ""],
     // Row 7: Tiempo
     ["Tiempo ahorrado", `=ROUND(B5*10/60;1)&" h (10 min/factura)"`, "", "", "", ""],
     // Row 8: vacío
@@ -504,12 +510,12 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     // Row 9: header sección
     ["HISTÓRICO 2026", "", "", "", "", ""],
     // Row 10: headers
-    ["Mes", "Facturas", "Monto (COP)", "", "", ""],
-    // Row 11-22: 12 meses
+    ["Mes", "Facturas", "Total a Pagar (COP)", "", "", ""],
+    // Row 11-22: 12 meses (Total a Pagar = col K)
     ...MES_TABS.map((m) => [
       m,
       `=COUNTA('${m}'!A2:A1000)`,
-      `=SUM('${m}'!H2:H1000)`,
+      `=SUM('${m}'!K2:K1000)`,
       "", "", "",
     ]),
     // Row 23: Total
@@ -518,9 +524,9 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["", "", "", "", "", ""],
     // Row 25: header sección
     ["TOP 5 PROVEEDORES (todo el año)", "", "", "", "", ""],
-    // Row 26: QUERY (se expande hacia abajo automáticamente con 5 filas + header)
+    // Row 26: QUERY — Col3=Proveedor, Col11=Total a Pagar
     [
-      `=QUERY({${allMonthsRange}};"select Col3, count(Col3), sum(Col8) where Col3 is not null and Col3 <> '' group by Col3 order by count(Col3) desc limit 5 label Col3 'Proveedor', count(Col3) 'Facturas', sum(Col8) 'Monto'";0)`,
+      `=QUERY({${allMonthsRange}};"select Col3, count(Col3), sum(Col11) where Col3 is not null and Col3 <> '' group by Col3 order by count(Col3) desc limit 5 label Col3 'Proveedor', count(Col3) 'Facturas', sum(Col11) 'Total a Pagar'";0)`,
       "", "", "", "", "",
     ],
     // Rows 27-31 reservadas para el resultado del QUERY (5 filas)
@@ -529,9 +535,9 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["", "", "", "", "", ""],
     // Row 33: header sección
     ["TOP 5 CATEGORÍAS (todo el año)", "", "", "", "", ""],
-    // Row 34: QUERY (expande 5 filas hacia abajo)
+    // Row 34: QUERY — Col13=Categoría, Col11=Total a Pagar
     [
-      `=QUERY({${allMonthsRange}};"select Col11, count(Col11), sum(Col8) where Col11 is not null and Col11 <> '' group by Col11 order by count(Col11) desc limit 5 label Col11 'Categoría', count(Col11) 'Facturas', sum(Col8) 'Monto'";0)`,
+      `=QUERY({${allMonthsRange}};"select Col13, count(Col13), sum(Col11) where Col13 is not null and Col13 <> '' group by Col13 order by count(Col13) desc limit 5 label Col13 'Categoría', count(Col13) 'Facturas', sum(Col11) 'Total a Pagar'";0)`,
       "", "", "", "", "",
     ],
     // Rows 35-38 reservadas para el resultado del QUERY (5 filas + header = 6)
@@ -542,32 +548,32 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["RETENCIONES (todo el año)", "", "", "", "", ""],
     // Row 42: headers tabla
     ["Tipo", "Monto (COP)", "", "", "", ""],
-    // Row 43: ReteFuente = SUM de cols M de las 12 pestañas
-    ["ReteFuente", `=${MES_TABS.map((m) => `SUM('${m}'!M:M)`).join("+")}`, "", "", "", ""],
-    // Row 44: ReteIVA
-    ["ReteIVA", `=${MES_TABS.map((m) => `SUM('${m}'!N:N)`).join("+")}`, "", "", "", ""],
-    // Row 45: ReteICA
-    ["ReteICA", `=${MES_TABS.map((m) => `SUM('${m}'!O:O)`).join("+")}`, "", "", "", ""],
-    // Row 46: Total retenciones (suma directa de col P)
-    ["Total retenido", `=${MES_TABS.map((m) => `SUM('${m}'!P:P)`).join("+")}`, "", "", "", ""],
-    // Row 47: Neto pagado (Total bruto - Retenciones)
-    ["Neto pagado al proveedor", `=C23-B46`, "(Total año − Total retenido)", "", "", ""],
+    // Row 43: ReteFuente = SUM de cols H de las 12 pestañas
+    ["ReteFuente", `=${MES_TABS.map((m) => `SUM('${m}'!H:H)`).join("+")}`, "", "", "", ""],
+    // Row 44: ReteIVA = col I
+    ["ReteIVA", `=${MES_TABS.map((m) => `SUM('${m}'!I:I)`).join("+")}`, "", "", "", ""],
+    // Row 45: ReteICA = col J
+    ["ReteICA", `=${MES_TABS.map((m) => `SUM('${m}'!J:J)`).join("+")}`, "", "", "", ""],
+    // Row 46: Total retenciones (suma de las 3 anteriores)
+    ["Total retenido", `=B43+B44+B45`, "", "", "", ""],
+    // Row 47: Bruto (Subtotal + IVA) = Total a Pagar + Retenciones
+    ["Bruto facturado", `=C23+B46`, "(Total a Pagar + Total retenido)", "", "", ""],
     // Row 48: vacío
     ["", "", "", "", "", ""],
     // Row 49: header sección RETENCIONES MES ACTUAL
     ["RETENCIONES MES ACTUAL", "", "", "", "", ""],
     // Row 50: headers
     ["Tipo", "Monto (COP)", "", "", "", ""],
-    // Row 51: ReteFuente del mes (INDIRECT a la pestaña del mes actual, col M)
-    ["ReteFuente del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!M:M"))`, "", "", "", ""],
-    // Row 52: ReteIVA del mes (col N)
-    ["ReteIVA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!N:N"))`, "", "", "", ""],
-    // Row 53: ReteICA del mes (col O)
-    ["ReteICA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!O:O"))`, "", "", "", ""],
-    // Row 54: Total retenciones del mes (col P)
-    ["Total retenido mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!P:P"))`, "", "", "", ""],
-    // Row 55: Neto pagado del mes (Monto mes actual − Total retenido mes)
-    ["Neto pagado mes", `=B6-B54`, "(Monto mes − Total retenido mes)", "", "", ""],
+    // Row 51: ReteFuente del mes (col H)
+    ["ReteFuente del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!H:H"))`, "", "", "", ""],
+    // Row 52: ReteIVA del mes (col I)
+    ["ReteIVA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!I:I"))`, "", "", "", ""],
+    // Row 53: ReteICA del mes (col J)
+    ["ReteICA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!J:J"))`, "", "", "", ""],
+    // Row 54: Total retenciones del mes (suma de las 3 anteriores)
+    ["Total retenido mes", `=B51+B52+B53`, "", "", "", ""],
+    // Row 55: Bruto facturado mes (Total a Pagar del mes + retenciones del mes)
+    ["Bruto facturado mes", `=B6+B54`, "(Total a Pagar mes + Total retenido mes)", "", "", ""],
   ];
 
   await sheets.spreadsheets.values.update({
@@ -770,11 +776,13 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
 
 /**
  * Devuelve el nombre del tab del mes (ej "Enero", "Febrero"...). Si no existe,
- * lo crea con headers + frozen + bold. Idempotente.
+ * lo crea con headers + frozen + bold + centrado + formato moneda + auto-resize.
+ * Idempotente.
  *
- * Migración automática: si la pestaña existe pero solo tiene 12 columnas
- * (versión vieja, pre-retenciones), agrega las 4 columnas nuevas
- * (ReteFuente, ReteIVA, ReteICA, Total Retenciones) con sus headers.
+ * Migración automática: si la pestaña existe con DIFERENTE número de columnas
+ * que SHEET_HEADERS_COUNT (versión vieja: 12 o 16 cols), DROP + RECREATE.
+ * Tomás está al tanto de que los datos viejos se borran — la idea es re-disparar
+ * con force=true después del deploy y todo se regenera con el formato nuevo.
  */
 async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number): Promise<string> {
   const tabName = MES_TABS[month - 1];
@@ -784,57 +792,22 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
   const existing = meta.data.sheets?.find((s: any) => s.properties?.title === tabName);
 
   if (existing) {
-    // Pestaña ya existe → verificar si necesita migración (agregar columnas faltantes)
     const existingCols = existing.properties?.gridProperties?.columnCount ?? 0;
-    if (existingCols < SHEET_HEADERS_COUNT) {
-      const existingTabId = existing.properties.sheetId;
-      // 1. Expandir grid a 16 columnas
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: sheetId,
-        requestBody: {
-          requests: [{
-            updateSheetProperties: {
-              properties: {
-                sheetId: existingTabId,
-                gridProperties: { columnCount: SHEET_HEADERS_COUNT, frozenRowCount: 1 },
-              },
-              fields: "gridProperties.columnCount,gridProperties.frozenRowCount",
-            },
-          }],
-        },
-      });
-      // 2. Escribir SOLO los headers faltantes (columnas 13-16 = M-P)
-      const newHeaders = SHEET_HEADERS.slice(existingCols);
-      const startColLetter = String.fromCharCode("A".charCodeAt(0) + existingCols);
-      const endColLetter = String.fromCharCode("A".charCodeAt(0) + SHEET_HEADERS_COUNT - 1);
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: sheetId,
-        range: `'${tabName}'!${startColLetter}1:${endColLetter}1`,
-        valueInputOption: "RAW",
-        requestBody: { values: [newHeaders] },
-      });
-      // 3. Aplicar formato bold + bg a los nuevos headers
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: sheetId,
-        requestBody: {
-          requests: [{
-            repeatCell: {
-              range: {
-                sheetId: existingTabId,
-                startRowIndex: 0, endRowIndex: 1,
-                startColumnIndex: existingCols, endColumnIndex: SHEET_HEADERS_COUNT,
-              },
-              cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 } } },
-              fields: "userEnteredFormat(textFormat,backgroundColor)",
-            },
-          }],
-        },
-      });
+    if (existingCols === SHEET_HEADERS_COUNT) {
+      return tabName; // OK como está
     }
-    return tabName;
+    // Esquema viejo (12 o 16 cols) → DROP y recrear con esquema nuevo (15 cols).
+    console.log(`[migrate-tab] ${tabName}: ${existingCols} cols → drop + recreate (${SHEET_HEADERS_COUNT} cols)`);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [{ deleteSheet: { sheetId: existing.properties.sheetId } }],
+      },
+    });
+    // Fallthrough al bloque de creación abajo
   }
 
-  // Pestaña no existe → crear desde cero con 16 cols
+  // Crear desde cero con 15 cols + formato completo
   const created = await sheets.spreadsheets.batchUpdate({
     spreadsheetId: sheetId,
     requestBody: {
@@ -850,24 +823,70 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
   });
   const newTabId = created.data.replies?.[0]?.addSheet?.properties?.sheetId;
 
+  // Escribir headers
+  const endColLetter = String.fromCharCode("A".charCodeAt(0) + SHEET_HEADERS_COUNT - 1); // "O"
   await sheets.spreadsheets.values.update({
     spreadsheetId: sheetId,
-    range: `'${tabName}'!A1:P1`,
+    range: `'${tabName}'!A1:${endColLetter}1`,
     valueInputOption: "RAW",
     requestBody: { values: [SHEET_HEADERS] },
   });
 
   if (newTabId != null) {
+    // Cols de moneda: F=Subtotal, G=IVA, H=ReteFuente, I=ReteIVA, J=ReteICA, K=Total a Pagar
+    // Indices: F=5, G=6, H=7, I=8, J=9, K=10 (0-indexed). endIndex es exclusive → 11.
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: sheetId,
       requestBody: {
-        requests: [{
-          repeatCell: {
-            range: { sheetId: newTabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: SHEET_HEADERS_COUNT },
-            cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 } } },
-            fields: "userEnteredFormat(textFormat,backgroundColor)",
+        requests: [
+          // 1) Headers: bold + bg azul claro + centrado vertical/horizontal
+          {
+            repeatCell: {
+              range: { sheetId: newTabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: SHEET_HEADERS_COUNT },
+              cell: {
+                userEnteredFormat: {
+                  textFormat: { bold: true },
+                  backgroundColor: { red: 0.9, green: 0.9, blue: 0.95 },
+                  horizontalAlignment: "CENTER",
+                  verticalAlignment: "MIDDLE",
+                  wrapStrategy: "WRAP",
+                },
+              },
+              fields: "userEnteredFormat(textFormat,backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy)",
+            },
           },
-        }],
+          // 2) Filas de datos (1-999): centrado horizontal + vertical
+          {
+            repeatCell: {
+              range: { sheetId: newTabId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 0, endColumnIndex: SHEET_HEADERS_COUNT },
+              cell: {
+                userEnteredFormat: { horizontalAlignment: "CENTER", verticalAlignment: "MIDDLE" },
+              },
+              fields: "userEnteredFormat(horizontalAlignment,verticalAlignment)",
+            },
+          },
+          // 3) Cols F-K (Subtotal, IVA, las 3 retenciones, Total a Pagar): formato moneda COP
+          {
+            repeatCell: {
+              range: { sheetId: newTabId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 5, endColumnIndex: 11 },
+              cell: {
+                userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } },
+              },
+              fields: "userEnteredFormat.numberFormat",
+            },
+          },
+          // 4) Auto-resize todas las columnas al contenido
+          {
+            autoResizeDimensions: {
+              dimensions: {
+                sheetId: newTabId,
+                dimension: "COLUMNS",
+                startIndex: 0,
+                endIndex: SHEET_HEADERS_COUNT,
+              },
+            },
+          },
+        ],
       },
     });
   }
@@ -1390,18 +1409,24 @@ async function appendToSheet(
   consecutivo: number,
   d: ProcessedRow
 ): Promise<any[]> {
-  // 16 cols: A=N°, B=Fecha, C=Proveedor, D=NIT, E=N°Factura, F=Subtotal,
-  //          G=IVA, H=Total, I=Concepto, J=Link PDF, K=Categoría, L=Cuenta PYG,
-  //          M=ReteFuente, N=ReteIVA, O=ReteICA, P=Total Retenciones.
-  // Para non-DIAN (Word/PDF/planillas), retenciones = 0 (LLM no las extrae aún).
+  // 15 cols: A=#, B=Fecha, C=Proveedor, D=NIT, E=#Documento, F=Subtotal,
+  //          G=IVA, H=ReteFuente, I=ReteIVA, J=ReteICA, K=Total a Pagar,
+  //          L=Concepto, M=Categoría, N=Cuenta PYG, O=Link PDF.
+  // Total a Pagar = Subtotal + IVA - retenciones (lo que se paga REAL al proveedor).
+  const rtf = d.reteFuente ?? 0;
+  const riva = d.reteIva ?? 0;
+  const rica = d.reteIca ?? 0;
+  const totalAPagar = (d.subtotal || 0) + (d.iva || 0) - rtf - riva - rica;
   const row = [
-    consecutivo, d.fecha, d.proveedor, d.nit, d.numero, d.subtotal,
-    d.iva, d.total, d.concepto, d.driveLink, d.categoria, d.cuentaPyg,
-    d.reteFuente ?? 0, d.reteIva ?? 0, d.reteIca ?? 0, d.totalRetenciones ?? 0,
+    consecutivo, d.fecha, d.proveedor, d.nit, d.numero,           // A-E
+    d.subtotal, d.iva,                                              // F-G
+    rtf, riva, rica,                                                // H-I-J
+    totalAPagar,                                                    // K
+    d.concepto, d.categoria, d.cuentaPyg, d.driveLink,              // L-O
   ];
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `${tabRange}!A:P`,
+    range: `${tabRange}!A:O`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });

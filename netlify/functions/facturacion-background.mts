@@ -36,6 +36,12 @@ interface RequestBody {
    * isDuplicate sigue activo en Sheet — no duplica filas.
    */
   force?: boolean;
+  /**
+   * Si true, NO manda email al cliente al terminar el run. Útil para
+   * pruebas de validación interna sin spam al cliente. El procesamiento
+   * (Sheet, Drive, agent_events) sigue normal — solo se skipea el correo.
+   */
+  silent?: boolean;
 }
 
 export default async (req: Request) => {
@@ -132,10 +138,12 @@ export default async (req: Request) => {
       }
     }
 
-    try {
-      await notifyError(err, body.customerId);
-    } catch {
-      /* notify falla silencioso */
+    if (!body.silent) {
+      try {
+        await notifyError(err, body.customerId);
+      } catch {
+        /* notify falla silencioso */
+      }
     }
     return new Response("internal error", { status: 500 });
   }
@@ -237,15 +245,22 @@ export default async (req: Request) => {
   // Email: si fue primer run del cliente (post-onboarding) Y terminó OK,
   // mandamos email de BIENVENIDA con resumen completo del año actual.
   // Sino, email diario regular con lo procesado en este run.
-  try {
-    if (wasFirstRun && body.customerId && result.errores.length === 0) {
-      console.log(`[welcome] cliente ${body.customerId}: primer run OK, enviando email de bienvenida`);
-      await notifyWelcome(body.customerId);
-    } else {
-      await notifyResult(result, body.customerId);
+  //
+  // Si body.silent === true → SKIPEAR completamente el envío. Útil para
+  // disparar runs de prueba sin spam al cliente.
+  if (body.silent) {
+    console.log(`[silent] skip email — cliente=${body.customerId ?? "owner"}`);
+  } else {
+    try {
+      if (wasFirstRun && body.customerId && result.errores.length === 0) {
+        console.log(`[welcome] cliente ${body.customerId}: primer run OK, enviando email de bienvenida`);
+        await notifyWelcome(body.customerId);
+      } else {
+        await notifyResult(result, body.customerId);
+      }
+    } catch (err: any) {
+      console.error("notify failed:", err.message);
     }
-  } catch (err: any) {
-    console.error("notify failed:", err.message);
   }
 
   return new Response(JSON.stringify({ ok: true, durationMs, runId }), {

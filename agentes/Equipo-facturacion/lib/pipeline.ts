@@ -869,16 +869,31 @@ async function getOrCreateLabel(gmail: any, name: string): Promise<string> {
 async function findInvoiceEmails(gmail: any, query: string) {
   const out: any[] = [];
   let pageToken: string | undefined;
-  do {
-    const res = await gmail.users.messages.list({
-      userId: "me",
-      q: query,
-      maxResults: 100,
-      pageToken,
-    });
-    if (res.data.messages) out.push(...res.data.messages);
-    pageToken = res.data.nextPageToken ?? undefined;
-  } while (pageToken);
+  let pages = 0;
+  try {
+    do {
+      pages++;
+      const res = await gmail.users.messages.list({
+        userId: "me",
+        q: query,
+        maxResults: 500,
+        pageToken,
+      });
+      const batch = res.data.messages ?? [];
+      out.push(...batch);
+      const nextTok = res.data.nextPageToken;
+      console.log(
+        `[gmail-list] page=${pages} batch=${batch.length} nextToken=${nextTok ? "yes" : "no"} totalSoFar=${out.length}`,
+      );
+      pageToken = nextTok ?? undefined;
+    } while (pageToken);
+  } catch (err: any) {
+    console.error(
+      `[gmail-list] EARLY-EXIT after page=${pages} total=${out.length}: ${err.message}`,
+    );
+    // No re-throw — devolvemos lo que tenemos hasta acá
+  }
+  console.log(`[gmail-list] DONE pages=${pages} total=${out.length} query="${query}"`);
   return out;
 }
 

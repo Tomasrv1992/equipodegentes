@@ -23,8 +23,19 @@ import {
 // Tipos públicos
 // ============================================================================
 
+export type TipoPersona =
+  | "juridica"               // empresa con NIT — default agente retenedor
+  | "natural_declarante"     // persona natural declarante de renta — tarifa RTF estándar
+  | "natural_no_declarante"; // persona natural no declarante — RTF mayor (~10% vs 11%)
+
 export interface RetentionRules {
   version: number;
+  /**
+   * Tipo del cliente que paga. Afecta:
+   *   - Si es agente retenedor por defecto (jurídicas sí, naturales depende)
+   *   - Tarifa RTF de oficio (naturales no declarantes tienen tarifa diferente)
+   */
+  tipo_persona?: TipoPersona;
   es_agente_retenedor: {
     reteFuente: boolean;
     reteIva: boolean;

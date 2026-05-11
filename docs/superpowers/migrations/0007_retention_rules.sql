@@ -26,6 +26,7 @@ alter table public.client_credentials
   add column if not exists retention_rules jsonb
     default '{
       "version": 1,
+      "tipo_persona": "juridica",
       "es_agente_retenedor": {
         "reteFuente": true,
         "reteIva": false,

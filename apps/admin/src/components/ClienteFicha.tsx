@@ -31,7 +31,47 @@ interface CredStatus {
   sheet_name: string | null;
   notify_email: string | null;
   onboarded_at: string | null;
+  /** Reglas de retención fiscal del cliente (Sub-fase 2). */
+  retention_rules: RetentionRulesShape | null;
+  /** Municipio donde el cliente paga ICA (afecta tarifa de oficio). */
+  municipio_ica: string | null;
 }
+
+/** Schema del campo retention_rules en client_credentials. */
+interface RetentionRulesShape {
+  version?: number;
+  tipo_persona?: "juridica" | "natural_declarante" | "natural_no_declarante";
+  es_agente_retenedor?: {
+    reteFuente?: boolean;
+    reteIva?: boolean;
+    reteIca?: boolean;
+  };
+  aplicar_de_oficio?: {
+    rtf_si_xml_vacio?: boolean;
+    ica_si_xml_vacio?: boolean;
+  };
+  overrides_por_nit?: Record<string, NitOverrideShape>;
+  notas?: string;
+}
+
+interface NitOverrideShape {
+  exento_rtf?: boolean;
+  exento_iva?: boolean;
+  exento_ica?: boolean;
+  nota?: string;
+}
+
+const MUNICIPIOS_ICA = [
+  "BOGOTA",
+  "MEDELLIN",
+  "CALI",
+  "BARRANQUILLA",
+  "BUCARAMANGA",
+  "CARTAGENA",
+  "PEREIRA",
+  "MANIZALES",
+  "OTRO",
+] as const;
 
 function useClienteBySlug(slug: string) {
   return useQuery({
@@ -67,7 +107,7 @@ function useClienteBySlug(slug: string) {
           .limit(200),
         supabase
           .from("client_credentials")
-          .select("agente_id, google_oauth_status, google_email, drive_folder_id, drive_folder_name, sheet_id, sheet_name, notify_email, onboarded_at")
+          .select("agente_id, google_oauth_status, google_email, drive_folder_id, drive_folder_name, sheet_id, sheet_name, notify_email, onboarded_at, retention_rules, municipio_ica")
           .eq("cliente_id", (cliente as Cliente).id),
       ]);
       if (e2) throw e2;
@@ -556,6 +596,15 @@ function ActivacionCard({ cliente, activacion, agente, runs, cred, slug }: Activ
           </>
         )}
       </div>
+
+      {/* Sección Retenciones fiscales — visualización + edición */}
+      <RetentionRulesSection
+        clienteId={cliente.id}
+        agenteId={activacion.agente_id}
+        rules={cred?.retention_rules ?? null}
+        municipioIca={cred?.municipio_ica ?? null}
+        slug={slug}
+      />
     </div>
   );
 }
@@ -707,5 +756,298 @@ function FieldEdit({
         className="input input-mono"
       />
     </label>
+  );
+}
+
+// ============================================================================
+// RetentionRulesSection — visualización + edición de reglas de retención
+// ============================================================================
+
+function RetentionRulesSection({
+  clienteId,
+  agenteId,
+  rules,
+  municipioIca,
+  slug,
+}: {
+  clienteId: string;
+  agenteId: string;
+  rules: RetentionRulesShape | null;
+  municipioIca: string | null;
+  slug: string;
+}) {
+  const qc = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Defaults para nuevo cliente sin reglas
+  const r = rules ?? {};
+  const tipoPersona = r.tipo_persona ?? "juridica";
+  const agente = r.es_agente_retenedor ?? { reteFuente: true, reteIva: false, reteIca: false };
+  const oficio = r.aplicar_de_oficio ?? { rtf_si_xml_vacio: true, ica_si_xml_vacio: false };
+  const overrides = r.overrides_por_nit ?? {};
+  const overrideNits = Object.keys(overrides);
+
+  // Estado del form
+  const [draft, setDraft] = useState({
+    tipo_persona: tipoPersona,
+    aplica_rtf: agente.reteFuente ?? true,
+    aplica_iva: agente.reteIva ?? false,
+    aplica_ica: agente.reteIca ?? false,
+    oficio_rtf: oficio.rtf_si_xml_vacio ?? true,
+    oficio_ica: oficio.ica_si_xml_vacio ?? false,
+    municipio_ica: municipioIca ?? "",
+    notas: r.notas ?? "",
+  });
+
+  // Resetear draft cuando cambia rules de Supabase
+  function resetDraft() {
+    setDraft({
+      tipo_persona: tipoPersona,
+      aplica_rtf: agente.reteFuente ?? true,
+      aplica_iva: agente.reteIva ?? false,
+      aplica_ica: agente.reteIca ?? false,
+      oficio_rtf: oficio.rtf_si_xml_vacio ?? true,
+      oficio_ica: oficio.ica_si_xml_vacio ?? false,
+      municipio_ica: municipioIca ?? "",
+      notas: r.notas ?? "",
+    });
+  }
+
+  const guardar = useMutation({
+    mutationFn: async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("no session");
+
+      const newRules: RetentionRulesShape = {
+        version: 1,
+        tipo_persona: draft.tipo_persona,
+        es_agente_retenedor: {
+          reteFuente: draft.aplica_rtf,
+          reteIva: draft.aplica_iva,
+          reteIca: draft.aplica_ica,
+        },
+        aplicar_de_oficio: {
+          rtf_si_xml_vacio: draft.oficio_rtf,
+          ica_si_xml_vacio: draft.oficio_ica,
+        },
+        overrides_por_nit: overrides,
+        notas: draft.notas,
+      };
+
+      const resp = await fetch("/api/admin/update-retention-rules", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          clienteId,
+          agenteId,
+          retention_rules: newRules,
+          municipio_ica: draft.municipio_ica || null,
+        }),
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["cliente", slug] });
+      setEditing(false);
+      setSaveError(null);
+    },
+    onError: (err: any) => {
+      setSaveError(err.message ?? String(err));
+    },
+  });
+
+  // === VISTA (no editing) ====================================================
+  if (!editing) {
+    const tipoLabel = {
+      juridica: "Persona jurídica",
+      natural_declarante: "Persona natural — declarante",
+      natural_no_declarante: "Persona natural — NO declarante",
+    }[tipoPersona];
+
+    const retencionesActivas: string[] = [];
+    if (agente.reteFuente) retencionesActivas.push("RTF");
+    if (agente.reteIva) retencionesActivas.push("IVA");
+    if (agente.reteIca) retencionesActivas.push("ICA");
+
+    return (
+      <div className="mt-4 pt-4 border-t border-edge-2">
+        <div className="flex items-baseline justify-between mb-3">
+          <h3 className="font-display text-[13px] font-semibold tracking-tighter text-ink">
+            Retenciones fiscales
+          </h3>
+          <button
+            onClick={() => { resetDraft(); setEditing(true); }}
+            className="font-mono text-[10px] text-accent hover:underline tracking-[0.04em]"
+          >
+            editar
+          </button>
+        </div>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px] py-1">
+          <span className="text-ink-3 tracking-[0.04em]">Tipo de cliente</span>
+          <span className="font-mono text-ink truncate" title={tipoLabel}>{tipoLabel}</span>
+
+          <span className="text-ink-3 tracking-[0.04em]">Agente retenedor</span>
+          <span className="font-mono text-ink">
+            {retencionesActivas.length > 0
+              ? retencionesActivas.join(" · ")
+              : <span className="text-ink-4 italic">ninguna</span>}
+          </span>
+
+          <span className="text-ink-3 tracking-[0.04em]">Municipio ICA</span>
+          <span className="font-mono text-ink">
+            {municipioIca || <span className="text-ink-4 italic">no aplica</span>}
+          </span>
+
+          <span className="text-ink-3 tracking-[0.04em]">Aplicar de oficio</span>
+          <span className="font-mono text-ink">
+            {(() => {
+              const arr: string[] = [];
+              if (oficio.rtf_si_xml_vacio) arr.push("RTF");
+              if (oficio.ica_si_xml_vacio) arr.push("ICA");
+              return arr.length > 0
+                ? arr.join(" · ")
+                : <span className="text-ink-4 italic">ninguna</span>;
+            })()}
+          </span>
+
+          {overrideNits.length > 0 && (
+            <>
+              <span className="text-ink-3 tracking-[0.04em]">Proveedores exentos</span>
+              <span className="font-mono text-ink">{overrideNits.length} NIT(s)</span>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // === EDICIÓN (form) ========================================================
+  return (
+    <div className="mt-4 pt-4 border-t border-edge-2 bg-paper-sunken -mx-6 px-6 pb-4">
+      <div className="flex items-baseline justify-between mb-3">
+        <h3 className="font-display text-[13px] font-semibold tracking-tighter text-ink">
+          Editar retenciones fiscales
+        </h3>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 text-[12px]">
+        {/* Tipo de persona */}
+        <div>
+          <div className="label-tight mb-1.5">Tipo de cliente</div>
+          <select
+            value={draft.tipo_persona}
+            onChange={(e) => setDraft({ ...draft, tipo_persona: e.target.value as any })}
+            className="input"
+          >
+            <option value="juridica">Persona jurídica (empresa)</option>
+            <option value="natural_declarante">Persona natural — declarante de renta</option>
+            <option value="natural_no_declarante">Persona natural — NO declarante</option>
+          </select>
+        </div>
+
+        {/* Agente retenedor */}
+        <div>
+          <div className="label-tight mb-1.5">¿Es agente retenedor de…?</div>
+          <div className="flex flex-col gap-1.5 font-mono text-[11px]">
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={draft.aplica_rtf}
+                onChange={(e) => setDraft({ ...draft, aplica_rtf: e.target.checked })} />
+              Retención en la Fuente (RTF)
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={draft.aplica_iva}
+                onChange={(e) => setDraft({ ...draft, aplica_iva: e.target.checked })} />
+              Retención de IVA (solo grandes contribuyentes)
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={draft.aplica_ica}
+                onChange={(e) => setDraft({ ...draft, aplica_ica: e.target.checked })} />
+              Retención de ICA
+            </label>
+          </div>
+        </div>
+
+        {/* Municipio ICA */}
+        <div>
+          <div className="label-tight mb-1.5">Municipio donde paga ICA</div>
+          <select
+            value={draft.municipio_ica}
+            onChange={(e) => setDraft({ ...draft, municipio_ica: e.target.value })}
+            className="input"
+            disabled={!draft.aplica_ica}
+          >
+            <option value="">— No aplica —</option>
+            {MUNICIPIOS_ICA.map((m) => (
+              <option key={m} value={m}>
+                {m === "BOGOTA" ? "Bogotá" :
+                 m === "MEDELLIN" ? "Medellín" :
+                 m === "CALI" ? "Cali" :
+                 m === "BARRANQUILLA" ? "Barranquilla" :
+                 m === "BUCARAMANGA" ? "Bucaramanga" :
+                 m === "CARTAGENA" ? "Cartagena" :
+                 m === "PEREIRA" ? "Pereira" :
+                 m === "MANIZALES" ? "Manizales" :
+                 m}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Aplicar de oficio */}
+        <div>
+          <div className="label-tight mb-1.5">Aplicar retención de oficio si el proveedor no la incluyó</div>
+          <div className="flex flex-col gap-1.5 font-mono text-[11px]">
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={draft.oficio_rtf}
+                onChange={(e) => setDraft({ ...draft, oficio_rtf: e.target.checked })}
+                disabled={!draft.aplica_rtf} />
+              RTF (según categoría del servicio/producto)
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={draft.oficio_ica}
+                onChange={(e) => setDraft({ ...draft, oficio_ica: e.target.checked })}
+                disabled={!draft.aplica_ica || !draft.municipio_ica} />
+              ICA (según tarifa del municipio)
+            </label>
+          </div>
+        </div>
+
+        {/* Notas */}
+        <div>
+          <div className="label-tight mb-1.5">Notas internas (opcional)</div>
+          <textarea
+            value={draft.notas}
+            onChange={(e) => setDraft({ ...draft, notas: e.target.value })}
+            className="input"
+            rows={2}
+            placeholder="Ej: cliente con régimen especial, etc"
+          />
+        </div>
+
+        {saveError && (
+          <div className="text-fail text-[11px]">Error guardando: {saveError}</div>
+        )}
+
+        <div className="flex items-center gap-3 mt-2">
+          <button
+            onClick={() => guardar.mutate()}
+            disabled={guardar.isPending}
+            className="btn-accent"
+          >
+            {guardar.isPending ? "Guardando…" : "Guardar"}
+          </button>
+          <button
+            onClick={() => setEditing(false)}
+            className="font-mono text-[11px] text-ink-3 hover:text-ink tracking-[0.04em]"
+          >
+            cancelar
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

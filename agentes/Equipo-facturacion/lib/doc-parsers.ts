@@ -91,22 +91,84 @@ export function attachmentType(filename: string): "docx" | "pdf" | "zip" | "xml"
  * Útil para presumedType del LLM.
  */
 const KNOWN_INTL_SENDERS = [
+  // Pagos / suscripciones
   "@stripe.com",
   "@paypal.com",
-  "@amazon",  // amazon.com, amazonaws.com
+
+  // Cloud / infra
+  "@amazon",
   "@aws.amazon.com",
   "@billing.amazon",
-  "@notion.so",
-  "@github.com",
-  "@anthropic.com",
-  "@openai.com",
   "@vercel.com",
   "@netlify.com",
-  "@google.com",  // workspace billing
+  "@cloudflare.com",
+  "@digitalocean.com",
+  "@heroku.com",
+  "@firebase.com",
+
+  // SaaS productividad
+  "@notion.so",
+  "@github.com",
+  "@gitlab.com",
+  "@anthropic.com",
+  "@openai.com",
+  "@google.com",
+  "@workspace.google.com",
+  "@dropbox.com",
+  "@slack.com",
+  "@zoom.us",
+  "@calendly.com",
+  "@hubspot.com",
+  "@miro.com",
+  "@figma.com",
+  "@canva.com",
+  "@asana.com",
+  "@trello.com",
+  "@monday.com",
+  "@airtable.com",
+  "@typeform.com",
+  "@loom.com",
+
+  // Ads / marketing platforms (LinkedIn Ads, Meta Ads, Google Ads)
+  "@linkedin.com",
+  "@facebookmail.com",
+  "@business.facebook.com",
+  "@meta.com",
+  "@ads.google.com",
+
+  // Otros frecuentes
+  "@apple.com",
+  "@microsoft.com",
+  "@adobe.com",
+  "@discord.com",
+  "@spotify.com",
   "noreply@cursor.sh",
+];
+
+/**
+ * Patrones que indican que el sender PROBABLEMENTE es billing internacional,
+ * aunque su dominio no esté en KNOWN_INTL_SENDERS. Captura senders nuevos
+ * sin tener que actualizar la lista hardcoded.
+ *
+ * Ejemplos que matchean:
+ *   - invoice+statements@mail.anthropic.com
+ *   - invoice+statements+acct_XXX@stripe.com (Miro vía Stripe)
+ *   - billing@new-saas.io
+ *   - receipts@anyservice.com
+ *   - payments@somewhere.com
+ *   - noreply+billing@apple.com
+ */
+const INTL_BILLING_HEURISTIC: RegExp[] = [
+  /\b(invoice|receipt|billing|statements?|payments?|charges?)[+\-_.]/i,
+  /^(invoice|receipt|billing|statements?|payments?|charges?)@/i,
+  /@invoices?\./i,
+  /@billing\./i,
+  /noreply[+\-_]billing/i,
 ];
 
 export function isLikelyInternationalSender(sender: string): boolean {
   const lower = (sender || "").toLowerCase();
-  return KNOWN_INTL_SENDERS.some((domain) => lower.includes(domain));
+  if (KNOWN_INTL_SENDERS.some((domain) => lower.includes(domain))) return true;
+  if (INTL_BILLING_HEURISTIC.some((rx) => rx.test(lower))) return true;
+  return false;
 }

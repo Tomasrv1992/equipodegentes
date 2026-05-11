@@ -20,40 +20,56 @@
  * Mantener actualizado conforme aparezcan falsos positivos en logs.
  */
 const NON_INVOICE_SENDER_PATTERNS: RegExp[] = [
-  // Confirmaciones de redes sociales / notificaciones
+  // Confirmaciones de redes sociales / notificaciones personales (no billing)
   /@facebookmail\.com/i,
-  /@linkedin\.com/i,
+  /@linkedinmail\.com/i,
   /@instagram\.com/i,
   /@tiktok\.com/i,
   /@twitter\.com/i,
   /@x\.com/i,
   /notification[s]?@/i,
-  /no[-_]?reply@(?!stripe|paypal|aws|amazon|notion|github|anthropic|openai|vercel|netlify|google|cursor)/i,
 
   // Marketing / promos
   /^(marketing|promo|promociones|newsletter|news|info)@/i,
   /@mailchimp\.com/i,
   /@sendgrid\.net/i,
-  /@hubspot\.com/i,
 
-  // Spam comercial colombiano típico
+  // Spam comercial colombiano típico (mayoría promos — pero overrides abajo
+  // dejan pasar si el local-part dice billing/invoice/etc)
   /@mercadolibre\.com/i,
-  /@rappi\.com/i,  // recibos sí podrían venir, pero la mayoría son promos
+  /@rappi\.com/i,
   /@didi\./i,
   /@ifood\.com/i,
 
-  // Sistemas internos no facturados
+  // Calendly / Meet (invitaciones, no facturas)
   /@calendly\.com/i,
-  /@zoom\.us/i,
   /@meet\.google\.com/i,
 
-  // Bancos: notificaciones (no comprobantes facturables como tales)
+  // Bancos: notificaciones (alertas de movimiento, no comprobantes)
   /alertas?@/i,
   /movimientos?@/i,
 ];
 
+/**
+ * Excepciones — si el sender contiene cualquiera de estos patterns en el
+ * LOCAL-PART, NO es spam aunque matchee un dominio "negativo". Sirve para
+ * casos como:
+ *   - invoice+statements@linkedin.com (LinkedIn Ads, sí es factura)
+ *   - billing@hubspot.com (HubSpot, sí es factura)
+ *   - noreply+billing@apple.com (App Store, sí es factura)
+ *   - payments@stripe.com (Stripe genérico, sí es factura)
+ */
+const INVOICE_OVERRIDE_PATTERNS: RegExp[] = [
+  /(invoice|receipt|billing|statements?|payments?|subscription|finance|charges?)/i,
+];
+
 export function isLikelyNonInvoiceSender(sender: string): boolean {
   if (!sender) return false;
+  // Override: si el local-part señala billing/invoice/etc, NO es spam
+  const localPart = sender.split("@")[0] ?? "";
+  if (INVOICE_OVERRIDE_PATTERNS.some((rx) => rx.test(localPart))) {
+    return false;
+  }
   return NON_INVOICE_SENDER_PATTERNS.some((rx) => rx.test(sender));
 }
 

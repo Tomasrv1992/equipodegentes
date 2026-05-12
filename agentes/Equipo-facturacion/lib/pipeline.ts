@@ -55,6 +55,15 @@ export interface PipelineConfig {
      * isDuplicate sigue activo en el Sheet para evitar duplicar filas DIAN.
      */
     force?: boolean;
+    /**
+     * Si está set (1-12), filtra el query Gmail a SOLO ese mes del año.
+     * Usado por el dispatcher multi-pass: para clientes grandes en primer
+     * run o force=true, en lugar de un único run que procesa todo el año
+     * (y se timeoutea), dispara 12 invocaciones paralelas (1 por mes).
+     * Cada una procesa <100 facturas en <5 min, cabe en el límite de 15 min
+     * de Netlify Background Functions.
+     */
+    monthFilter?: number;
   };
 }
 
@@ -219,7 +228,7 @@ const PROCESSED_LABEL = "Procesado";
 
 export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const { google: g, options = {} } = cfg;
-  const { dryRun = false, limit = null, window = "30d", force = false } = options;
+  const { dryRun = false, limit = null, window = "30d", force = false, monthFilter } = options;
 
   // Query amplia: facturas DIAN (ZIP) + planillas SS + Word/PDFs no-DIAN.
   // El processOne distingue qué tipo es y aplica el sub-pipeline correspondiente.
@@ -228,11 +237,25 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   //   - "30d" / "365d" → newer_than:Nd (rolling, último N días)
   //   - "2026/01/01"   → after:YYYY/MM/DD (fecha absoluta, ideal para backfill anual)
   //
+  // Si `monthFilter` está set (1-12), sobreescribe window y usa after:YYYY/MM/01
+  // before:YYYY/MM+1/01 — filtra a UN solo mes. Usado por multi-pass para
+  // clientes grandes (12 invocaciones paralelas, 1 por mes).
+  //
   // Si `force=true`, el query NO excluye `-label:Procesado` → re-lee emails
-  // ya procesados. Útil para encontrar Word/PDFs que el cron viejo dejó sin
-  // procesar (cuando todavía no había LLM).
-  const isAbsoluteDate = /^\d{4}\/\d{2}\/\d{2}$/.test(window);
-  const dateFilter = isAbsoluteDate ? `after:${window}` : `newer_than:${window}`;
+  // ya procesados.
+  let dateFilter: string;
+  if (monthFilter && monthFilter >= 1 && monthFilter <= 12) {
+    const year = new Date().getFullYear();
+    const mm = String(monthFilter).padStart(2, "0");
+    const nextMonth = monthFilter === 12 ? 1 : monthFilter + 1;
+    const nextYear = monthFilter === 12 ? year + 1 : year;
+    const nmm = String(nextMonth).padStart(2, "0");
+    dateFilter = `after:${year}/${mm}/01 before:${nextYear}/${nmm}/01`;
+    console.log(`[monthFilter] procesando solo ${year}-${mm} (${dateFilter})`);
+  } else {
+    const isAbsoluteDate = /^\d{4}\/\d{2}\/\d{2}$/.test(window);
+    dateFilter = isAbsoluteDate ? `after:${window}` : `newer_than:${window}`;
+  }
   const labelExclusion = force ? "" : "-label:Procesado ";
   // Query: cubre todos los tipos de documentos que sub-pipelines pueden procesar
   // (DIAN ZIP, planillas SS, Word, PDFs). Filename incluye extensión sin punto.
@@ -317,36 +340,60 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // NIT/cédula del cliente — usado para detectar facturas self-emitted y skip.
   const nitCliente = cfg.nitCliente ? String(cfg.nitCliente).replace(/\D+/g, "") : null;
 
-  for (const e of emails) {
-    try {
-      const r = await processOne(
-        e.id!,
-        labelId,
-        gmail,
-        drive,
-        sheets,
-        xmlParser,
-        g,
-        loadSheetRows,
-        (tabName, newRow) => {
-          const cached = sheetRowsCache.get(tabName);
-          if (cached) cached.push(newRow);
-        },
-        llmTracker,
-        retentionCtx,
-        nitCliente,
-      );
-      if ("ok" in r && r.ok) {
-        result.procesadas.push(r);
-      } else if ("dup" in r && r.dup) {
-        result.saltadas.push({ messageId: e.id!, motivo: r.motivo, asunto: r.subject });
-      } else if ("skip" in r && r.skip) {
-        result.saltadas.push({ messageId: e.id!, motivo: r.reason, asunto: r.subject });
+  // CONCURRENCIA: procesar 5 emails en paralelo para reducir tiempo total ~5x.
+  // Crítico para clientes con alto volumen (Tomas92, Patricia, Paulina) que
+  // antes timeoutaban a los 15min de Netlify Background.
+  //
+  // Thread-safety:
+  // - sheetRowsCache es un Map: writes son atómicos en JS single-thread
+  //   (Node es event-loop, no preemptivo). pushToCache es safe.
+  // - result.procesadas/saltadas/errores: arrays con .push() — JS garantiza
+  //   atomicidad. No hay race conditions.
+  // - llmTracker (counters): JS atomic. OK.
+  // - El consecutivo Sheet ya no es cronológico, pero la col B (Fecha) es
+  //   la verdad temporal — sin impacto funcional.
+  const CONCURRENCY = 5;
+  const queue = [...emails];
+
+  async function worker() {
+    while (queue.length > 0) {
+      const e = queue.shift();
+      if (!e) return;
+      try {
+        const r = await processOne(
+          e.id!,
+          labelId,
+          gmail,
+          drive,
+          sheets,
+          xmlParser,
+          g,
+          loadSheetRows,
+          (tabName, newRow) => {
+            const cached = sheetRowsCache.get(tabName);
+            if (cached) cached.push(newRow);
+          },
+          llmTracker,
+          retentionCtx,
+          nitCliente,
+        );
+        if ("ok" in r && r.ok) {
+          result.procesadas.push(r);
+        } else if ("dup" in r && r.dup) {
+          result.saltadas.push({ messageId: e.id!, motivo: r.motivo, asunto: r.subject });
+        } else if ("skip" in r && r.skip) {
+          result.saltadas.push({ messageId: e.id!, motivo: r.reason, asunto: r.subject });
+        }
+      } catch (err: any) {
+        result.errores.push({ messageId: e.id!, error: err.message });
       }
-    } catch (err: any) {
-      result.errores.push({ messageId: e.id!, error: err.message });
     }
   }
+
+  console.log(`[concurrency] processing ${emails.length} emails with ${CONCURRENCY} workers`);
+  const startTime = Date.now();
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+  console.log(`[concurrency] done in ${Math.round((Date.now() - startTime) / 1000)}s · ${result.procesadas.length} procesadas, ${result.saltadas.length} saltadas, ${result.errores.length} errores`);
 
   // Adjuntar stats LLM al result (importante: aunque sea 0 si nunca llamó)
   result.llmStats = {

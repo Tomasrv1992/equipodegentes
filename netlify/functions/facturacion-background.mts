@@ -42,6 +42,18 @@ interface RequestBody {
    * (Sheet, Drive, agent_events) sigue normal — solo se skipea el correo.
    */
   silent?: boolean;
+  /**
+   * Si está set (1-12), filtra el procesamiento a SOLO ese mes del año.
+   * Usado por multi-pass para clientes grandes.
+   */
+  monthFilter?: number;
+  /**
+   * Si true y customerId presente, en lugar de un único run, dispara 12
+   * invocaciones (una por mes) y termina. Útil para primer run + force=true
+   * en clientes con alto volumen — evita timeout de Netlify 15min.
+   * El dispatcher recibe este request y abre 12 fan-outs paralelos.
+   */
+  multiPass?: boolean;
 }
 
 export default async (req: Request) => {
@@ -62,6 +74,43 @@ export default async (req: Request) => {
     /* body opcional, default {} */
   }
 
+  // 2.5. MULTI-PASS FAN-OUT: si viene multiPass=true + customerId, en lugar
+  //      de procesar nosotros mismos, disparamos 12 invocaciones (una por mes)
+  //      en paralelo y terminamos. Cada invocación procesa solo su mes,
+  //      cabiendo en el límite de 15min de Netlify. Resuelve clientes grandes.
+  if (body.multiPass && body.customerId) {
+    const baseUrl = process.env.URL;
+    if (!baseUrl) {
+      return new Response("missing URL env", { status: 500 });
+    }
+    const target = `${baseUrl}/.netlify/functions/facturacion-background`;
+    const dispatches: Array<Promise<any>> = [];
+    for (let mes = 1; mes <= 12; mes++) {
+      dispatches.push(
+        fetch(target, {
+          method: "POST",
+          headers: {
+            "x-internal-secret": secret,
+            "x-trigger": "multi-pass",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            customerId: body.customerId,
+            force: body.force ?? false,
+            silent: body.silent ?? true, // silent por default en multi-pass (12 emails es spam)
+            monthFilter: mes,
+          }),
+        }).catch((e) => console.warn(`[multi-pass] dispatch mes ${mes} failed: ${e.message}`)),
+      );
+    }
+    console.log(`[multi-pass] cliente=${body.customerId} → disparando 12 invocaciones paralelas`);
+    await Promise.all(dispatches);
+    return new Response(
+      JSON.stringify({ ok: true, multiPass: true, monthsDispatched: 12 }),
+      { headers: { "content-type": "application/json" } },
+    );
+  }
+
   // 3. Cargar credenciales del cliente (multi-tenant) ANTES del run
   //    Lo necesitamos para detectar `wasFirstRun` y elegir entre email
   //    de bienvenida (post-onboarding) vs email diario.
@@ -70,6 +119,60 @@ export default async (req: Request) => {
     credBefore = await loadCredentialsForBackground(body.customerId);
   }
   const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
+
+  // 3.5. AUTO MULTI-PASS para clientes en first_run o force=true.
+  //      Disparamos 12 invocaciones paralelas (1 por mes) para evitar timeout
+  //      en clientes grandes. Si el body trae monthFilter o multiPass=false
+  //      explícito, NO auto-disparamos (respetamos lo que vino).
+  const shouldAutoFanOut =
+    body.customerId &&
+    body.monthFilter == null &&
+    !body.multiPass &&
+    (wasFirstRun || body.force === true);
+
+  if (shouldAutoFanOut) {
+    const baseUrl = process.env.URL;
+    if (baseUrl) {
+      const target = `${baseUrl}/.netlify/functions/facturacion-background`;
+      const dispatches: Array<Promise<any>> = [];
+      for (let mes = 1; mes <= 12; mes++) {
+        dispatches.push(
+          fetch(target, {
+            method: "POST",
+            headers: {
+              "x-internal-secret": secret,
+              "x-trigger": "auto-multi-pass",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              customerId: body.customerId,
+              force: body.force ?? false,
+              silent: true, // siempre silent en fan-out (sino 12 emails al cliente)
+              monthFilter: mes,
+            }),
+          }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
+        );
+      }
+      console.log(`[auto-fan-out] cliente=${body.customerId} (${wasFirstRun ? "first_run" : "force"}) → disparando 12 invocaciones paralelas (1 por mes)`);
+      await Promise.all(dispatches);
+      // Marcar first_run_done para que próxima vez NO vuelva a hacer fan-out
+      if (wasFirstRun && credBefore) {
+        try {
+          const supa = getServerClient();
+          await supa.rpc("client_credentials_mark_first_run_done", {
+            p_cliente_id: credBefore.cliente_id,
+            p_agente_id: "facturacion",
+          });
+        } catch (err: any) {
+          console.warn(`[auto-fan-out] failed mark first_run_done: ${err.message}`);
+        }
+      }
+      return new Response(
+        JSON.stringify({ ok: true, autoFanOut: true, monthsDispatched: 12 }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+  }
 
   // 4. Resolver config según customerId (reutiliza cred si ya cargado)
   const cfg = await buildConfig(body, credBefore);
@@ -356,6 +459,7 @@ async function buildConfig(
         dryRun: body.dryRun ?? false,
         window: resolvedWindow,
         force: body.force ?? false,
+        monthFilter: body.monthFilter,
       },
     };
   }

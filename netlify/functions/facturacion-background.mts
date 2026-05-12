@@ -382,6 +382,21 @@ export const config: Config = {
  * Devuelve null si el customerId no tiene fila o las creds están incompletas.
  * Usar antes de buildConfig para detectar wasFirstRun.
  */
+async function getNombreClienteFromSlug(slug: string | undefined): Promise<string | null> {
+  if (!slug) return null;
+  try {
+    const supa = getServerClient();
+    const { data } = await supa
+      .from("clientes")
+      .select("nombre")
+      .eq("slug", slug)
+      .single();
+    return (data as { nombre?: string } | null)?.nombre ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function loadCredentialsForBackground(customerId: string) {
   const { loadCredentialsBySlug } = await import("../../shared/agents-runtime/src/credentials-by-slug");
   const cred = await loadCredentialsBySlug(customerId, "facturacion");
@@ -455,6 +470,9 @@ async function buildConfig(
       municipioIca: (cred as any).municipio_ica ?? null,
       // NIT/cédula del cliente para descartar facturas self-emitted (Migración 0008).
       nitCliente: (cred as any).nit_cliente ?? null,
+      // Nombre del cliente para fuzzy match cuando LLM no extrae NIT.
+      // Cargado en buildConfig con un query extra (fuera de este return).
+      nombreCliente: await getNombreClienteFromSlug(body.customerId),
       options: {
         dryRun: body.dryRun ?? false,
         window: resolvedWindow,

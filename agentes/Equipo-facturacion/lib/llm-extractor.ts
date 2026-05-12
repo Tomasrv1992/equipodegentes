@@ -67,14 +67,40 @@ export async function extractInvoiceFromText(
 
   const prompt = buildExtractionPrompt(ctx);
 
-  try {
-    const resp = await anthropic.messages.create({
-      model: "claude-haiku-4-5", // barato + rápido + suficiente para extracción
-      max_tokens: 600,
-      messages: [{ role: "user", content: prompt }],
-    });
+  // Retry con backoff exponencial para errores 529 (overloaded) y 429 (rate limit)
+  // Críticos cuando se procesan muchos clientes en paralelo (auto-fan-out + concurrencia).
+  const MAX_RETRIES = 3;
+  let lastError: any = null;
+  let resp: any = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      resp = await anthropic.messages.create({
+        model: "claude-haiku-4-5",
+        max_tokens: 600,
+        messages: [{ role: "user", content: prompt }],
+      });
+      break; // éxito → salir del retry loop
+    } catch (err: any) {
+      lastError = err;
+      const status = err?.status ?? err?.response?.status;
+      const isRetryable = status === 529 || status === 429 || status === 503;
+      if (!isRetryable || attempt === MAX_RETRIES) {
+        console.error(`LLM extraction failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}, status=${status}): ${err.message}`);
+        return null;
+      }
+      const delayMs = Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500); // 1s, 2s, 4s + jitter
+      console.warn(`LLM ${status} overloaded — retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
 
-    const textBlock = resp.content.find((b) => b.type === "text");
+  if (!resp) {
+    console.error("LLM extraction failed — sin respuesta tras retries:", lastError?.message);
+    return null;
+  }
+
+  try {
+    const textBlock = resp.content.find((b: any) => b.type === "text");
     if (!textBlock || textBlock.type !== "text") return null;
 
     const json = parseLlmJson(textBlock.text);

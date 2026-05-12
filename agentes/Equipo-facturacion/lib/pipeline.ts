@@ -42,6 +42,13 @@ export interface PipelineConfig {
    * Si null, no se aplica el filtro (legacy / cron viejo).
    */
   nitCliente?: string | null;
+  /**
+   * Nombre/slug del cliente (ej "DENTILANDIA", "Tomás Ramírez Villa").
+   * Backup filter cuando el LLM no extrae NIT pero sí extrae el nombre del
+   * proveedor — si el nombre coincide con el cliente (normalizado), se
+   * detecta como auto-factura y skipea.
+   */
+  nombreCliente?: string | null;
   /** Comportamiento. */
   options?: {
     dryRun?: boolean;
@@ -339,6 +346,8 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
 
   // NIT/cédula del cliente — usado para detectar facturas self-emitted y skip.
   const nitCliente = cfg.nitCliente ? String(cfg.nitCliente).replace(/\D+/g, "") : null;
+  // Nombre del cliente normalizado — backup filter cuando LLM no extrae NIT.
+  const nombreClienteNorm = cfg.nombreCliente ? normalizeProveedorName(cfg.nombreCliente) : null;
 
   // CONCURRENCIA: procesar 5 emails en paralelo para reducir tiempo total ~5x.
   // Crítico para clientes con alto volumen (Tomas92, Patricia, Paulina) que
@@ -376,6 +385,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
           llmTracker,
           retentionCtx,
           nitCliente,
+          nombreClienteNorm,
         );
         if ("ok" in r && r.ok) {
           result.procesadas.push(r);
@@ -1544,6 +1554,7 @@ async function processOne(
   llmTracker: LlmTracker,
   retentionCtx: { rules: unknown | null; municipioIca: string | null } | null,
   nitCliente: string | null,
+  nombreClienteNorm: string | null,
 ): Promise<ProcessOneResult> {
   const msg = await getMessageFull(gmail, messageId);
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
@@ -1592,7 +1603,7 @@ async function processOne(
   if (zips.length === 0 && docxs.length > 0) {
     return await processCuentaCobroDocx(
       messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
-      loadSheetRows, pushToCache, llmTracker, nitCliente,
+      loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
     );
   }
 
@@ -1604,7 +1615,7 @@ async function processOne(
     if (genericPdfs.length > 0) {
       return await processGenericPdf(
         messageId, labelId, gmail, drive, sheets, g, genericPdfs, subject, msg,
-        loadSheetRows, pushToCache, llmTracker, nitCliente,
+        loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
       );
     }
   }
@@ -1900,6 +1911,7 @@ async function processCuentaCobroDocx(
   pushToCache: (tabName: string, row: any[]) => void,
   llmTracker: LlmTracker,
   nitCliente: string | null,
+  nombreClienteNorm: string | null,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -1960,17 +1972,14 @@ async function processCuentaCobroDocx(
       };
     }
 
-    // Skip si el documento es una cuenta de cobro EMITIDA por el propio cliente
-    // (NIT extraído del LLM coincide con nit_cliente). El LLM detecta "proveedor"
-    // = quien emite, así que si emisor=cliente, no es un gasto del cliente.
-    if (nitCliente) {
-      const extractedNit = String(extracted.nit ?? "").replace(/\D+/g, "");
-      const nitClienteClean = String(nitCliente).replace(/\D+/g, "");
-      if (extractedNit && extractedNit === nitClienteClean) {
-        console.log(`[skip-self-emitted-docx] proveedor=${extracted.proveedor} nit=${extractedNit} === nitCliente`);
-        await markEmailProcessed(gmail, messageId, labelProcesadoId);
-        return { skip: true, reason: "docx-self-emitted (cliente es emisor)", subject };
-      }
+    // Skip si el documento es una cuenta de cobro EMITIDA por el propio cliente.
+    // Doble check: (a) NIT extraído coincide con nit_cliente, O (b) nombre del
+    // proveedor extraído por el LLM coincide con el nombre del cliente normalizado.
+    // El (b) es importante cuando el LLM no extrae el NIT pero sí el nombre.
+    if (isSelfEmitted(extracted.proveedor, extracted.nit, nitCliente, nombreClienteNorm)) {
+      console.log(`[skip-self-emitted-docx] proveedor="${extracted.proveedor}" nit="${extracted.nit}" → cliente=emisor`);
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      return { skip: true, reason: "docx-self-emitted (cliente es emisor)", subject };
     }
 
     // 4. Year/month del documento
@@ -2085,6 +2094,7 @@ async function processGenericPdf(
   pushToCache: (tabName: string, row: any[]) => void,
   llmTracker: LlmTracker,
   nitCliente: string | null,
+  nombreClienteNorm: string | null,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -2150,16 +2160,12 @@ async function processGenericPdf(
       };
     }
 
-    // Skip si el PDF es factura/recibo EMITIDO por el propio cliente
-    // (NIT extraído coincide con nit_cliente).
-    if (nitCliente) {
-      const extractedNit = String(extracted.nit ?? "").replace(/\D+/g, "");
-      const nitClienteClean = String(nitCliente).replace(/\D+/g, "");
-      if (extractedNit && extractedNit === nitClienteClean) {
-        console.log(`[skip-self-emitted-pdf] proveedor=${extracted.proveedor} nit=${extractedNit} === nitCliente`);
-        await markEmailProcessed(gmail, messageId, labelProcesadoId);
-        return { skip: true, reason: "pdf-self-emitted (cliente es emisor)", subject };
-      }
+    // Skip si el PDF es factura/recibo EMITIDO por el propio cliente.
+    // Doble check: NIT extraído O nombre del proveedor coinciden con el cliente.
+    if (isSelfEmitted(extracted.proveedor, extracted.nit, nitCliente, nombreClienteNorm)) {
+      console.log(`[skip-self-emitted-pdf] proveedor="${extracted.proveedor}" nit="${extracted.nit}" → cliente=emisor`);
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      return { skip: true, reason: "pdf-self-emitted (cliente es emisor)", subject };
     }
 
     // 5. Year/month + skip pre-año-actual
@@ -2245,4 +2251,61 @@ async function processGenericPdf(
   } finally {
     cleanupTmp(tmpPaths);
   }
+}
+
+// ===== Helpers: detección de auto-facturas (cliente=emisor) ==================
+
+/**
+ * Normaliza nombre de proveedor para fuzzy matching contra el cliente.
+ * Quita acentos, signos, sufijos legales (S.A.S, Ltda, etc), espacios extra.
+ *
+ * Ejemplos:
+ *   "DENTILANDIA S.A.S"     → "dentilandia"
+ *   "DENTILANDIA SAS"       → "dentilandia"
+ *   "Tomás Ramírez Villa"   → "tomas ramirez villa"
+ */
+function normalizeProveedorName(s: string): string {
+  if (!s) return "";
+  return s
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/\bs\.?\s*a\.?\s*s?\.?\b/gi, "")
+    .replace(/\bltda\.?\b/gi, "")
+    .replace(/\bsociedad\b/gi, "")
+    .replace(/\bp\.?\s*h\.?\b/gi, "")
+    .replace(/[.,;:|()/\-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Detecta si una factura/recibo extraído por el LLM corresponde al propio
+ * cliente como emisor. 2 caminos (cualquiera detecta):
+ *   1. NIT extraído === nit_cliente (filtro principal, exacto)
+ *   2. Nombre del proveedor normalizado matches nombreClienteNorm
+ *      (backup cuando LLM no extrae NIT)
+ */
+function isSelfEmitted(
+  proveedor: string | undefined,
+  nitExtracted: string | undefined,
+  nitCliente: string | null,
+  nombreClienteNorm: string | null,
+): boolean {
+  if (nitCliente) {
+    const nitClean = String(nitExtracted ?? "").replace(/\D+/g, "");
+    const clienteClean = String(nitCliente).replace(/\D+/g, "");
+    if (nitClean && nitClean === clienteClean) return true;
+  }
+  if (nombreClienteNorm && proveedor) {
+    const provNorm = normalizeProveedorName(proveedor);
+    if (provNorm && (
+      provNorm === nombreClienteNorm ||
+      provNorm.includes(nombreClienteNorm) ||
+      nombreClienteNorm.includes(provNorm)
+    )) {
+      return true;
+    }
+  }
+  return false;
 }

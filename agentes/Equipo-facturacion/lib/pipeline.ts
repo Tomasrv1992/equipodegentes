@@ -1376,9 +1376,53 @@ async function getOrCreateNamedFolder(drive: any, parentFolderId: string, name: 
   return created.data.id;
 }
 
-async function uploadFile(drive: any, localPath: string, parentId: string, name: string) {
+/**
+ * Sube un archivo a Drive con deduplicación opcional.
+ *
+ * Si se pasa `uniqueKey`, primero busca en el `parentId` si ya existe un
+ * archivo con `appProperties.unique_key = uniqueKey`. Si existe, lo retorna
+ * sin crear uno nuevo. Si no existe, crea con esa appProperty.
+ *
+ * Esto previene los duplicados visibles en Drive cuando el cron re-procesa
+ * un mismo email (force=true, dobles disparos) — antes creaba archivos
+ * nuevos cada vez con consecutivo distinto (1. Foo.pdf, 2. Foo.pdf, etc).
+ *
+ * Para DIAN, uniqueKey = CUFE del XML.
+ * Para Word/PDF no-DIAN, uniqueKey = `{messageId}:{filename}` del Gmail.
+ */
+async function uploadFile(
+  drive: any,
+  localPath: string,
+  parentId: string,
+  name: string,
+  uniqueKey?: string,
+) {
+  // Si hay uniqueKey, chequear si ya existe
+  if (uniqueKey) {
+    try {
+      const safeKey = uniqueKey.replace(/'/g, "\\'");
+      const q = `'${parentId}' in parents and trashed=false and appProperties has { key='unique_key' and value='${safeKey}' }`;
+      const existing = await drive.files.list({
+        q,
+        fields: "files(id, name, webViewLink)",
+        spaces: "drive",
+        pageSize: 1,
+      });
+      if (existing.data.files && existing.data.files.length > 0) {
+        console.log(`[upload-dedup] cliente=${parentId.slice(0, 8)} → reusando archivo existente "${existing.data.files[0].name}" (key=${uniqueKey.slice(0, 20)}...)`);
+        return existing.data.files[0];
+      }
+    } catch (err: any) {
+      console.warn(`[upload-dedup] query falló, sigo con upload normal: ${err.message}`);
+    }
+  }
+
   const res = await drive.files.create({
-    requestBody: { name, parents: [parentId] },
+    requestBody: {
+      name,
+      parents: [parentId],
+      ...(uniqueKey ? { appProperties: { unique_key: uniqueKey } } : {}),
+    },
     media: { body: fs.createReadStream(localPath) },
     fields: "id, webViewLink",
   });
@@ -1600,13 +1644,16 @@ async function processOne(
     // XMLs: "{N}.1. {Proveedor}.xml", "{N}.2. {Proveedor}.xml"...
     // {N}.3 reservado para comprobante de pago (futuro sub-pipeline).
     const baseName = buildFileBaseName(consecutivo, data.proveedor);
+    // uniqueKey para DIAN: el CUFE es identificador único oficial de la DIAN.
+    const dianUniqueKey = data.cufe ? `dian:${data.cufe}` : undefined;
     if (pdfPath) {
-      const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
+      const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`, dianUniqueKey);
       driveLink = uploaded.webViewLink || "";
     }
     for (let j = 0; j < xmlPaths.length; j++) {
       const xmlName = buildFileBaseName(consecutivo, data.proveedor, j + 1);
-      await uploadFile(drive, xmlPaths[j], folderId, `${xmlName}.xml`);
+      const xmlUniqueKey = dianUniqueKey ? `${dianUniqueKey}:xml${j + 1}` : undefined;
+      await uploadFile(drive, xmlPaths[j], folderId, `${xmlName}.xml`, xmlUniqueKey);
     }
 
     const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
@@ -1738,7 +1785,10 @@ async function processPlanilla(
         const fileName = n === 0
           ? `${baseName}.pdf`
           : `${buildFileBaseName(consecutivo, proveedor, n + 1)}.pdf`;
-        const uploaded = await uploadFile(drive, tmpPath, folderId, fileName);
+        // uniqueKey para planillas: messageId + filename original (Gmail no
+        // re-genera adjuntos con mismo messageId, así garantizamos idempotencia).
+        const planillaKey = `gmail:${messageId}:${p.filename}`;
+        const uploaded = await uploadFile(drive, tmpPath, folderId, fileName, planillaKey);
         if (n === 0) driveLink = uploaded.webViewLink || "";
         n++;
       } catch (e: any) {
@@ -1919,7 +1969,10 @@ async function processCuentaCobroDocx(
 
     // 8. Subir el .docx al folder del mes
     const baseName = buildFileBaseName(consecutivo, extracted.proveedor);
-    const uploaded = await uploadFile(drive, docxPath, folderId, `${baseName}.docx`);
+    // uniqueKey: messageId del Gmail + filename original — el mismo email
+    // procesado dos veces va a reusar el archivo subido la primera vez.
+    const docxUniqueKey = `gmail:${messageId}:${d.filename}`;
+    const uploaded = await uploadFile(drive, docxPath, folderId, `${baseName}.docx`, docxUniqueKey);
     const driveLink = uploaded.webViewLink || "";
 
     // 9. Append al Sheet
@@ -2103,7 +2156,9 @@ async function processGenericPdf(
 
     // 9. Subir PDF a Drive
     const baseName = buildFileBaseName(consecutivo, extracted.proveedor);
-    const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`);
+    // uniqueKey: messageId Gmail + filename — re-procesar mismo email no duplica
+    const pdfUniqueKey = `gmail:${messageId}:${p.filename}`;
+    const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`, pdfUniqueKey);
     const driveLink = uploaded.webViewLink || "";
 
     // 10. Append al Sheet — anota moneda en concepto si != COP

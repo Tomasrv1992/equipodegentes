@@ -498,37 +498,65 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
   // 3. SIEMPRE regenerar Dashboard (delete + recreate). Idempotente y permite que
   //    futuros cambios al template (fórmulas, formato) se propaguen sin que el
   //    cliente tenga que borrar la pestaña manualmente.
+  //
+  //    CONCURRENCIA: en multi-pass, 12 invocaciones intentan recrear el
+  //    Dashboard al mismo tiempo. Wrappamos las operaciones con try/catch
+  //    para tolerar errores "ya existe" / "no existe" cuando otra invocación
+  //    ya hizo el trabajo. Idempotencia robusta.
   const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
   const existingDashboard = meta.data.sheets?.find(
     (s: any) => s.properties?.title === DASHBOARD_TAB,
   );
   if (existingDashboard) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: sheetId,
-      requestBody: {
-        requests: [{
-          deleteSheet: { sheetId: existingDashboard.properties.sheetId },
-        }],
-      },
-    });
+    try {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+          requests: [{
+            deleteSheet: { sheetId: existingDashboard.properties.sheetId },
+          }],
+        },
+      });
+    } catch (e: any) {
+      // Si otra invocación ya borró → ignorar ("No sheet with id...")
+      if (!/No sheet|not found/i.test(e.message ?? "")) throw e;
+      console.log(`[ensureSheetSetup] dashboard ya borrado por otra invocación — skip`);
+    }
   }
 
   // Crear Dashboard como PRIMERA pestaña (index: 0)
-  const created = await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: sheetId,
-    requestBody: {
-      requests: [{
-        addSheet: {
-          properties: {
-            title: DASHBOARD_TAB,
-            index: 0,
-            gridProperties: { rowCount: 60, columnCount: 6 },
+  let dashSheetId: number | null | undefined;
+  try {
+    const created = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [{
+          addSheet: {
+            properties: {
+              title: DASHBOARD_TAB,
+              index: 0,
+              gridProperties: { rowCount: 60, columnCount: 6 },
+            },
           },
-        },
-      }],
-    },
-  });
-  const dashSheetId = created.data.replies?.[0]?.addSheet?.properties?.sheetId;
+        }],
+      },
+    });
+    dashSheetId = created.data.replies?.[0]?.addSheet?.properties?.sheetId;
+  } catch (e: any) {
+    // Si otra invocación ya lo creó, buscarlo
+    if (!/already exists|Ya existe/i.test(e.message ?? "")) throw e;
+    console.log(`[ensureSheetSetup] dashboard ya creado por otra invocación — buscando ID`);
+    const meta2 = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const existing = meta2.data.sheets?.find(
+      (s: any) => s.properties?.title === DASHBOARD_TAB,
+    );
+    dashSheetId = existing?.properties?.sheetId;
+    if (dashSheetId == null) {
+      // Race condition pierde — otra invocación lo manejará. Skip resto.
+      console.warn(`[ensureSheetSetup] no encontró dashSheetId, skip resto de setup`);
+      return;
+    }
+  }
 
   // 3. Llenar el contenido (fórmulas vivas — leen de las 12 pestañas mensuales)
   // Spec del MVP:
@@ -633,16 +661,21 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["Bruto facturado mes", `=B6+B54`, "(Total a Pagar mes + Total retenido mes)", "", "", ""],
   ];
 
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: sheetId,
-    range: `'${DASHBOARD_TAB}'!A1:F${content.length}`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: content },
-  });
+  try {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: `'${DASHBOARD_TAB}'!A1:F${content.length}`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: content },
+    });
+  } catch (e: any) {
+    console.warn(`[ensureSheetSetup] update dashboard content falló (concurrencia): ${e.message}`);
+  }
 
-  // 4. Formato visual
+  // 4. Formato visual (tolerante a concurrencia)
   if (dashSheetId != null) {
-    await sheets.spreadsheets.batchUpdate({
+    try {
+      await sheets.spreadsheets.batchUpdate({
       spreadsheetId: sheetId,
       requestBody: {
         requests: [
@@ -828,6 +861,11 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
         ],
       },
     });
+    } catch (e: any) {
+      // Concurrencia: el dashboard puede estar siendo modificado por otra
+      // invocación. Idempotente — la próxima ejecución completará el formato.
+      console.warn(`[ensureSheetSetup] formato Dashboard falló (concurrencia): ${e.message}`);
+    }
   }
 }
 
@@ -855,30 +893,45 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
     }
     // Esquema viejo (12 o 16 cols) → DROP y recrear con esquema nuevo (15 cols).
     console.log(`[migrate-tab] ${tabName}: ${existingCols} cols → drop + recreate (${SHEET_HEADERS_COUNT} cols)`);
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: sheetId,
-      requestBody: {
-        requests: [{ deleteSheet: { sheetId: existing.properties.sheetId } }],
-      },
-    });
+    try {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+          requests: [{ deleteSheet: { sheetId: existing.properties.sheetId } }],
+        },
+      });
+    } catch (e: any) {
+      // Concurrencia: otra invocación ya borró/migró el tab. Re-leer estado.
+      if (!/No sheet|not found/i.test(e.message ?? "")) throw e;
+      console.log(`[migrate-tab] ${tabName} ya migrado por otra invocación`);
+      return tabName;
+    }
     // Fallthrough al bloque de creación abajo
   }
 
   // Crear desde cero con 15 cols + formato completo
-  const created = await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: sheetId,
-    requestBody: {
-      requests: [{
-        addSheet: {
-          properties: {
-            title: tabName,
-            gridProperties: { frozenRowCount: 1, columnCount: SHEET_HEADERS_COUNT },
+  let newTabId: number | null | undefined;
+  try {
+    const created = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [{
+          addSheet: {
+            properties: {
+              title: tabName,
+              gridProperties: { frozenRowCount: 1, columnCount: SHEET_HEADERS_COUNT },
+            },
           },
-        },
-      }],
-    },
-  });
-  const newTabId = created.data.replies?.[0]?.addSheet?.properties?.sheetId;
+        }],
+      },
+    });
+    newTabId = created.data.replies?.[0]?.addSheet?.properties?.sheetId;
+  } catch (e: any) {
+    // Concurrencia: otra invocación ya creó el tab.
+    if (!/already exists|Ya existe/i.test(e.message ?? "")) throw e;
+    console.log(`[migrate-tab] ${tabName} ya creado por otra invocación — skip creación`);
+    return tabName;
+  }
 
   // Escribir headers
   const endColLetter = String.fromCharCode("A".charCodeAt(0) + SHEET_HEADERS_COUNT - 1); // "O"

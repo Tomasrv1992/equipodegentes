@@ -84,8 +84,10 @@ export default async (req: Request) => {
       return new Response("missing URL env", { status: 500 });
     }
     const target = `${baseUrl}/.netlify/functions/facturacion-background`;
+    console.log(`[multi-pass] cliente=${body.customerId} → disparando 12 invocaciones con stagger 1.5s`);
     const dispatches: Array<Promise<any>> = [];
     for (let mes = 1; mes <= 12; mes++) {
+      if (mes > 1) await new Promise((r) => setTimeout(r, 1500));
       dispatches.push(
         fetch(target, {
           method: "POST",
@@ -97,13 +99,12 @@ export default async (req: Request) => {
           body: JSON.stringify({
             customerId: body.customerId,
             force: body.force ?? false,
-            silent: body.silent ?? true, // silent por default en multi-pass (12 emails es spam)
+            silent: body.silent ?? true,
             monthFilter: mes,
           }),
         }).catch((e) => console.warn(`[multi-pass] dispatch mes ${mes} failed: ${e.message}`)),
       );
     }
-    console.log(`[multi-pass] cliente=${body.customerId} → disparando 12 invocaciones paralelas`);
     await Promise.all(dispatches);
     return new Response(
       JSON.stringify({ ok: true, multiPass: true, monthsDispatched: 12 }),
@@ -134,8 +135,13 @@ export default async (req: Request) => {
     const baseUrl = process.env.URL;
     if (baseUrl) {
       const target = `${baseUrl}/.netlify/functions/facturacion-background`;
+      console.log(`[auto-fan-out] cliente=${body.customerId} (${wasFirstRun ? "first_run" : "force"}) → disparando 12 invocaciones con stagger 1.5s`);
       const dispatches: Array<Promise<any>> = [];
+      // Stagger 1.5s entre dispatches para evitar choque concurrente en
+      // Sheet API (quota Read requests + race en ensureSheetSetup).
+      // 12 dispatches × 1.5s = 18s de stagger total. Aceptable.
       for (let mes = 1; mes <= 12; mes++) {
+        if (mes > 1) await new Promise((r) => setTimeout(r, 1500));
         dispatches.push(
           fetch(target, {
             method: "POST",
@@ -147,13 +153,12 @@ export default async (req: Request) => {
             body: JSON.stringify({
               customerId: body.customerId,
               force: body.force ?? false,
-              silent: true, // siempre silent en fan-out (sino 12 emails al cliente)
+              silent: true,
               monthFilter: mes,
             }),
           }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
         );
       }
-      console.log(`[auto-fan-out] cliente=${body.customerId} (${wasFirstRun ? "first_run" : "force"}) → disparando 12 invocaciones paralelas (1 por mes)`);
       await Promise.all(dispatches);
       // Marcar first_run_done para que próxima vez NO vuelva a hacer fan-out
       if (wasFirstRun && credBefore) {

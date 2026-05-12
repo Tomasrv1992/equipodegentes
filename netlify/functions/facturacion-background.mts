@@ -54,6 +54,11 @@ interface RequestBody {
    * El dispatcher recibe este request y abre 12 fan-outs paralelos.
    */
   multiPass?: boolean;
+  /**
+   * Si true, NO ejecuta ensureSheetSetup. Lo usa el dispatcher multi-pass
+   * para que solo el primer mes haga setup y los otros 11 lo skip.
+   */
+  skipSheetSetup?: boolean;
 }
 
 export default async (req: Request) => {
@@ -87,7 +92,11 @@ export default async (req: Request) => {
     console.log(`[multi-pass] cliente=${body.customerId} → disparando 12 invocaciones con stagger 1.5s`);
     const dispatches: Array<Promise<any>> = [];
     for (let mes = 1; mes <= 12; mes++) {
-      if (mes > 1) await new Promise((r) => setTimeout(r, 1500));
+      // Stagger 3.5s entre dispatches para evitar Google Sheets quota
+      // "Read requests" exceeded (300/min). 12 × 3.5s = 42s total — los
+      // dispatches arrancan distribuidos en el tiempo, reduciendo el pico
+      // inicial de ~120 reads/min a ~30 reads/min.
+      if (mes > 1) await new Promise((r) => setTimeout(r, 3500));
       dispatches.push(
         fetch(target, {
           method: "POST",
@@ -101,6 +110,8 @@ export default async (req: Request) => {
             force: body.force ?? false,
             silent: body.silent ?? true,
             monthFilter: mes,
+            // Solo el primer mes ejecuta setup; los otros 11 skipean.
+            skipSheetSetup: mes !== 1,
           }),
         }).catch((e) => console.warn(`[multi-pass] dispatch mes ${mes} failed: ${e.message}`)),
       );
@@ -141,7 +152,11 @@ export default async (req: Request) => {
       // Sheet API (quota Read requests + race en ensureSheetSetup).
       // 12 dispatches × 1.5s = 18s de stagger total. Aceptable.
       for (let mes = 1; mes <= 12; mes++) {
-        if (mes > 1) await new Promise((r) => setTimeout(r, 1500));
+        // Stagger 3.5s entre dispatches para evitar Google Sheets quota
+      // "Read requests" exceeded (300/min). 12 × 3.5s = 42s total — los
+      // dispatches arrancan distribuidos en el tiempo, reduciendo el pico
+      // inicial de ~120 reads/min a ~30 reads/min.
+      if (mes > 1) await new Promise((r) => setTimeout(r, 3500));
         dispatches.push(
           fetch(target, {
             method: "POST",
@@ -155,6 +170,9 @@ export default async (req: Request) => {
               force: body.force ?? false,
               silent: true,
               monthFilter: mes,
+              // Solo el primer mes ejecuta ensureSheetSetup. Los otros 11 skip
+              // para evitar quota exceeded y race conditions en Sheet API.
+              skipSheetSetup: mes !== 1,
             }),
           }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
         );
@@ -483,6 +501,7 @@ async function buildConfig(
         window: resolvedWindow,
         force: body.force ?? false,
         monthFilter: body.monthFilter,
+        skipSheetSetup: (body as any).skipSheetSetup ?? false,
       },
     };
   }

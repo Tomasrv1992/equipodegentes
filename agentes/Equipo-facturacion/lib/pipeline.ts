@@ -71,6 +71,13 @@ export interface PipelineConfig {
      * de Netlify Background Functions.
      */
     monthFilter?: number;
+    /**
+     * Si true, NO ejecuta ensureSheetSetup. Usado por el multi-pass: solo
+     * el primer dispatch (mes=1) hace el setup, los otros 11 saltean
+     * porque ya está hecho. Evita race conditions + reduce drásticamente
+     * las llamadas concurrentes a Google Sheets API.
+     */
+    skipSheetSetup?: boolean;
   };
 }
 
@@ -235,7 +242,7 @@ const PROCESSED_LABEL = "Procesado";
 
 export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const { google: g, options = {} } = cfg;
-  const { dryRun = false, limit = null, window = "30d", force = false, monthFilter } = options;
+  const { dryRun = false, limit = null, window = "30d", force = false, monthFilter, skipSheetSetup = false } = options;
 
   // Query amplia: facturas DIAN (ZIP) + planillas SS + Word/PDFs no-DIAN.
   // El processOne distingue qué tipo es y aplica el sub-pipeline correspondiente.
@@ -289,7 +296,15 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
 
   // Setup del Sheet: garantizar 12 pestañas mensuales + Dashboard.
   // Idempotente: si ya existen, no hace nada.
-  await ensureSheetSetup(sheets, g.sheetId);
+  // ensureSheetSetup hace muchas lecturas/escrituras al Sheet. En multi-pass
+  // con 12 invocaciones paralelas, esto causa "Quota exceeded for Read requests"
+  // y race conditions. Lo skippeamos en los 11 dispatches no-primero — el
+  // primer dispatch (mes=1) lo ejecuta solo.
+  if (!skipSheetSetup) {
+    await ensureSheetSetup(sheets, g.sheetId);
+  } else {
+    console.log(`[skip-setup] cliente ya tiene setup hecho por otra invocación`);
+  }
 
   let emails = await findInvoiceEmails(gmail, searchQuery);
   if (limit != null && limit > 0) emails = emails.slice(0, limit);
@@ -469,6 +484,34 @@ const DASHBOARD_TAB = "Dashboard";
  * Llamada al inicio de cada `run()` — primer run de cliente nuevo arma todo,
  * runs subsiguientes son no-op (chequeos baratos).
  */
+/**
+ * Wrapper de llamadas a Google Sheets API con retry para quota exceeded.
+ * Google Sheets Read API limit: 300/min/usuario. Cuando se excede, devuelve
+ * 429 ó 403 con mensaje "Quota exceeded". Retry con backoff exponencial.
+ */
+async function withSheetRetry<T>(fn: () => Promise<T>, label = "sheet-op"): Promise<T> {
+  const MAX_RETRIES = 4;
+  let lastError: any = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const code = err?.code ?? err?.response?.status ?? err?.status;
+      const msg = err?.message ?? "";
+      const isQuota =
+        code === 429 ||
+        (code === 403 && /quota/i.test(msg)) ||
+        /Quota exceeded|RATE_LIMIT_EXCEEDED/i.test(msg);
+      if (!isQuota || attempt === MAX_RETRIES) throw err;
+      const delayMs = Math.pow(2, attempt) * 2000 + Math.floor(Math.random() * 1000); // 2s, 4s, 8s, 16s + jitter
+      console.warn(`[${label}] quota exceeded — retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastError;
+}
+
 async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
   // 1. Crear las 12 pestañas mensuales si no existen (las fórmulas del Dashboard
   //    referencian todas, así que deben existir aunque vacías).

@@ -51,8 +51,22 @@ export default async (req: Request) => {
     const adminEmail = process.env.MONITOR_ADMIN_EMAIL ?? process.env.NOTIFY_EMAIL_TO;
     const resendKey = process.env.RESEND_API_KEY;
 
+    // Diagnóstico detallado (sin exponer valores sensibles)
+    console.log(
+      `[monitor] env check: NOTIFY_EMAIL_FROM=${fromAddr ? "✓ (" + fromAddr.slice(0, 25) + "...)" : "✗ FALTA"} | ` +
+      `MONITOR_ADMIN_EMAIL=${process.env.MONITOR_ADMIN_EMAIL ? "✓" : "✗"} | ` +
+      `NOTIFY_EMAIL_TO=${process.env.NOTIFY_EMAIL_TO ? "✓" : "✗"} | ` +
+      `resolved adminEmail=${adminEmail ? "✓ (" + adminEmail.slice(0, 5) + "...)" : "✗ FALTA"} | ` +
+      `RESEND_API_KEY=${resendKey ? "✓ (length=" + resendKey.length + ")" : "✗ FALTA"}`,
+    );
+
     if (!fromAddr || !adminEmail || !resendKey) {
-      console.warn("[monitor] email no enviado — falta NOTIFY_EMAIL_FROM, MONITOR_ADMIN_EMAIL/NOTIFY_EMAIL_TO o RESEND_API_KEY");
+      const faltantes = [
+        !fromAddr ? "NOTIFY_EMAIL_FROM" : null,
+        !adminEmail ? "MONITOR_ADMIN_EMAIL o NOTIFY_EMAIL_TO" : null,
+        !resendKey ? "RESEND_API_KEY" : null,
+      ].filter(Boolean).join(", ");
+      console.warn(`[monitor] email no enviado — falta(n): ${faltantes}`);
     } else {
       const { subject, html, text } = buildMonitorEmail(report);
       const resp = await fetch("https://api.resend.com/emails", {

@@ -55,6 +55,13 @@ export interface FilaSinPdf {
   mes: number;
 }
 
+export interface AutoRepair {
+  cliente_slug: string;
+  tipo: "link_actualizado" | "fila_insertada_desde_pdf";
+  num_factura: string;
+  detalle: string;
+}
+
 export interface ReparadorReport {
   fecha: string;
   ts_generated: string;
@@ -63,10 +70,12 @@ export interface ReparadorReport {
   clientes_skipped: number;   // sin OAuth o sin Sheet
   /** Etapa 1: filas re-insertadas en Sheet desde agent_events. */
   filas_reparadas: FilaReparadaSheet[];
-  /** Etapa 2 (detección): PDFs en Drive sin fila en Sheet. */
+  /** Etapa 2 (detección): PDFs en Drive sin fila en Sheet (residuales tras Etapa 3). */
   pdfs_huerfanos: PdfHuerfano[];
-  /** Etapa 2 (detección): filas en Sheet sin PDF en Drive. */
+  /** Etapa 2 (detección): filas en Sheet sin PDF en Drive (residuales tras Etapa 3). */
   filas_sin_pdf: FilaSinPdf[];
+  /** Etapa 3 (auto-repair): acciones tomadas para resolver huérfanos. */
+  auto_repairs: AutoRepair[];
   /** Errores por cliente (no detienen el run). */
   errores: Array<{ cliente_slug: string; error: string }>;
 }
@@ -85,8 +94,14 @@ export async function runReparador(): Promise<ReparadorReport> {
     filas_reparadas: [],
     pdfs_huerfanos: [],
     filas_sin_pdf: [],
+    auto_repairs: [],
     errores: [],
   };
+
+  // Límite total de auto-repairs por run (Etapa 3) para evitar timeout.
+  // Con 462 huérfanos en el primer run, si cada uno hace 1-2 queries Drive,
+  // 50 toma ~5-7 min. Si quedan más, próximo run los procesa.
+  const MAX_AUTO_REPAIRS_POR_RUN = 50;
 
   // 1. Cargar clientes activos con agente facturacion
   const { data: clientesActivos, error: cErr } = await supa
@@ -308,7 +323,15 @@ export async function runReparador(): Promise<ReparadorReport> {
 
           // 2d) Filas en Sheet sin PDF en Drive (link inválido o falta)
           const archivosIds = new Set(archivosMes.map((f) => f.id));
-          for (const r of rowsSheet) {
+          // También guardamos filas con su rowIndex para Etapa 3 (update)
+          const filasSinPdfConIndex: Array<{
+            rowIdx: number; // 0-based en rowsSheet
+            sheetRow: number; // fila real en Sheet (rowIdx + 2 porque skip header)
+            num: string;
+            proveedor: string;
+          }> = [];
+          for (let i = 0; i < rowsSheet.length; i++) {
+            const r = rowsSheet[i];
             const link = String(r[COL_LINK_PDF] ?? "");
             const numFactura = String(r[COL_NUMERO_DOCUMENTO] ?? "").trim();
             const proveedor = String(r[2] ?? ""); // col C
@@ -322,6 +345,192 @@ export async function runReparador(): Promise<ReparadorReport> {
                 proveedor,
                 mes: mesActual,
               });
+              filasSinPdfConIndex.push({
+                rowIdx: i,
+                sheetRow: i + 2,
+                num: numFactura,
+                proveedor,
+              });
+            }
+          }
+
+          // === ETAPA 3.A: Auto-repair filas sin PDF ==========================
+          // Para cada fila sin PDF: buscar archivo en TODO el Drive del cliente
+          // por nombre que contenga el N° factura. Si lo encuentra, update link
+          // en Sheet. Si no, queda como huérfano para revisión manual.
+          if (report.auto_repairs.length < MAX_AUTO_REPAIRS_POR_RUN) {
+            for (const f of filasSinPdfConIndex) {
+              if (report.auto_repairs.length >= MAX_AUTO_REPAIRS_POR_RUN) break;
+              try {
+                // Buscar archivo cuyo nombre contenga el N° factura
+                const numEscaped = f.num.replace(/'/g, "\\'");
+                const searchResp = await drive.files.list({
+                  q: `name contains '${numEscaped}' and trashed=false and mimeType!='application/vnd.google-apps.folder'`,
+                  fields: "files(id, name)",
+                  pageSize: 5,
+                });
+                const found = searchResp.data.files ?? [];
+                if (found.length === 0) continue; // no encontrado, deja como huérfano
+
+                // Tomar el primer match
+                const fileEncontrado = found[0];
+                const fileId = fileEncontrado.id;
+                if (!fileId) continue; // sin id no podemos updatear
+                const fileName = fileEncontrado.name ?? "(sin nombre)";
+                const newLink = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
+                // Update col O de la fila correspondiente
+                await sheets.spreadsheets.values.update({
+                  spreadsheetId: cred.sheet_id,
+                  range: `'${tabName}'!O${f.sheetRow}`,
+                  valueInputOption: "USER_ENTERED",
+                  requestBody: { values: [[newLink]] },
+                });
+                report.auto_repairs.push({
+                  cliente_slug: c.slug,
+                  tipo: "link_actualizado",
+                  num_factura: f.num,
+                  detalle: `Link actualizado al archivo "${fileName}" encontrado en Drive.`,
+                });
+                // Remover de filas_sin_pdf residuales
+                const idx = report.filas_sin_pdf.findIndex(
+                  (x) => x.cliente_slug === c.slug && x.num_factura === f.num,
+                );
+                if (idx >= 0) report.filas_sin_pdf.splice(idx, 1);
+                console.log(
+                  `[reparador-3A] cliente=${c.slug} fila ${f.sheetRow} #${f.num} → link actualizado a ${fileId.slice(0, 12)}…`,
+                );
+              } catch (err: any) {
+                console.warn(
+                  `[reparador-3A] falló para cliente=${c.slug} #${f.num}: ${err.message}`,
+                );
+              }
+            }
+          }
+
+          // === ETAPA 3.B: Auto-repair PDFs huérfanos ========================
+          // Para cada PDF huérfano: buscar event con N° factura matcheando el
+          // filename del PDF. Si match, insertar fila en Sheet con link al PDF.
+          if (report.auto_repairs.length < MAX_AUTO_REPAIRS_POR_RUN) {
+            // Cargar events del mes actual para matchear contra filenames
+            const monthStartCur = `${year}-${String(mesActual).padStart(2, "0")}-01`;
+            const monthEndCur =
+              mesActual === 12
+                ? `${year + 1}-01-01`
+                : `${year}-${String(mesActual + 1).padStart(2, "0")}-01`;
+            const { data: eventsCur } = await supa
+              .from("agent_events")
+              .select("payload")
+              .eq("cliente_id", c.id)
+              .eq("agente_id", "facturacion")
+              .eq("tipo", "factura_procesada")
+              .gte("payload->>fecha", monthStartCur)
+              .lt("payload->>fecha", monthEndCur);
+
+            const eventsByNum = new Map<string, any>();
+            for (const ev of (eventsCur ?? []) as Array<{ payload: any }>) {
+              const num = String(ev.payload?.numero ?? "").trim();
+              if (num) eventsByNum.set(num, ev.payload);
+            }
+
+            // Re-cargar Sheet (puede haber filas insertadas en 3.A)
+            let rowsActualizado: any[][] = [];
+            try {
+              const resp = await sheets.spreadsheets.values.get({
+                spreadsheetId: cred.sheet_id,
+                range: `'${tabName}'!A2:O1000`,
+              });
+              rowsActualizado = resp.data.values ?? [];
+            } catch {
+              /* skip */
+            }
+            const numsEnSheetCur = new Set(
+              rowsActualizado
+                .map((r) => String(r[COL_NUMERO_DOCUMENTO] ?? "").trim())
+                .filter(Boolean),
+            );
+
+            const huerfanosClient = report.pdfs_huerfanos.filter(
+              (h) => h.cliente_slug === c.slug,
+            );
+            const filasNuevasAdopt: any[][] = [];
+            for (const h of huerfanosClient) {
+              if (
+                report.auto_repairs.length + filasNuevasAdopt.length >=
+                MAX_AUTO_REPAIRS_POR_RUN
+              ) {
+                break;
+              }
+              // Intentar matchear filename contra eventsByNum
+              const fname = h.drive_file_name;
+              let matchedNum: string | null = null;
+              for (const num of eventsByNum.keys()) {
+                if (num && fname.includes(num)) {
+                  matchedNum = num;
+                  break;
+                }
+              }
+              if (!matchedNum) continue; // no se encontró match
+              if (numsEnSheetCur.has(matchedNum)) continue; // ya hay fila
+
+              const p = eventsByNum.get(matchedNum);
+              const subtotal = Number(p.subtotal ?? 0);
+              const iva = Number(p.iva ?? 0);
+              const rtf = Number(p.reteFuente ?? 0);
+              const riva = Number(p.reteIva ?? 0);
+              const rica = Number(p.reteIca ?? 0);
+              const totalAPagar = subtotal + iva - rtf - riva - rica;
+              const maxConsec =
+                rowsActualizado.length > 0
+                  ? Math.max(
+                      0,
+                      ...rowsActualizado.map(
+                        (r) => parseInt(r[COL_NUMERO_CONSECUTIVO] ?? "0", 10) || 0,
+                      ),
+                    )
+                  : 0;
+              const consec = maxConsec + 1 + filasNuevasAdopt.length;
+              const driveLink = `https://drive.google.com/file/d/${h.drive_file_id}/view?usp=drivesdk`;
+              filasNuevasAdopt.push([
+                consec,
+                p.fecha ?? "",
+                p.proveedor ?? "",
+                p.nit ?? "",
+                matchedNum,
+                subtotal,
+                iva,
+                rtf,
+                riva,
+                rica,
+                totalAPagar,
+                p.concepto ?? "",
+                p.categoria ?? "",
+                p.cuentaPyg ?? "",
+                driveLink,
+              ]);
+              numsEnSheetCur.add(matchedNum);
+              report.auto_repairs.push({
+                cliente_slug: c.slug,
+                tipo: "fila_insertada_desde_pdf",
+                num_factura: matchedNum,
+                detalle: `Insertada fila en Sheet enlazando al PDF huérfano "${fname}".`,
+              });
+              // Remover de pdfs_huerfanos residuales
+              const idxH = report.pdfs_huerfanos.findIndex(
+                (x) => x.cliente_slug === c.slug && x.drive_file_id === h.drive_file_id,
+              );
+              if (idxH >= 0) report.pdfs_huerfanos.splice(idxH, 1);
+            }
+
+            if (filasNuevasAdopt.length > 0) {
+              await sheets.spreadsheets.values.append({
+                spreadsheetId: cred.sheet_id,
+                range: `${tabName}!A:O`,
+                valueInputOption: "USER_ENTERED",
+                requestBody: { values: filasNuevasAdopt },
+              });
+              console.log(
+                `[reparador-3B] cliente=${c.slug} → ${filasNuevasAdopt.length} filas adoptadas desde PDFs huérfanos`,
+              );
             }
           }
         }

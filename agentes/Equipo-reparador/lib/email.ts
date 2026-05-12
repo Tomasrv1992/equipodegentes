@@ -8,11 +8,13 @@ export function buildReparadorEmail(report: ReparadorReport): {
   const totalReparadas = report.filas_reparadas.length;
   const totalHuerfanos = report.pdfs_huerfanos.length;
   const totalFilasSinPdf = report.filas_sin_pdf.length;
-  const totalAlertas = totalReparadas + totalHuerfanos + totalFilasSinPdf;
+  const totalAutoRepairs = report.auto_repairs.length;
+  const totalManualReview = totalHuerfanos + totalFilasSinPdf;
+  const totalAlertas = totalReparadas + totalAutoRepairs + totalManualReview;
 
   const subject =
     totalAlertas > 0
-      ? `Operatto Reparador · ${totalReparadas} reparadas, ${totalHuerfanos + totalFilasSinPdf} requieren revisión · ${report.fecha}`
+      ? `Operatto Reparador · ${totalReparadas + totalAutoRepairs} reparadas, ${totalManualReview} requieren revisión · ${report.fecha}`
       : `Operatto Reparador · todo OK · ${report.fecha}`;
 
   // === Resumen ==============================================================
@@ -23,25 +25,62 @@ export function buildReparadorEmail(report: ReparadorReport): {
       </div>
       <table style="width:100%;border-collapse:collapse;">
         <tr>
-          <td style="padding-right:16px;border-right:1px solid #e6e0d2;">
-            <div style="font-size:28px;font-weight:600;color:${totalReparadas > 0 ? "#1a8a4a" : "#1a1a1a"};">${totalReparadas}</div>
-            <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.06em;">filas auto-reparadas</div>
+          <td style="padding-right:14px;border-right:1px solid #e6e0d2;">
+            <div style="font-size:26px;font-weight:600;color:${totalReparadas > 0 ? "#1a8a4a" : "#1a1a1a"};">${totalReparadas}</div>
+            <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.06em;">Etapa 1: filas insertadas</div>
           </td>
-          <td style="padding:0 16px;border-right:1px solid #e6e0d2;">
-            <div style="font-size:28px;font-weight:600;color:${totalHuerfanos > 0 ? "#c4901c" : "#1a1a1a"};">${totalHuerfanos}</div>
-            <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.06em;">PDFs huérfanos</div>
+          <td style="padding:0 14px;border-right:1px solid #e6e0d2;">
+            <div style="font-size:26px;font-weight:600;color:${totalAutoRepairs > 0 ? "#1a8a4a" : "#1a1a1a"};">${totalAutoRepairs}</div>
+            <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.06em;">Etapa 3: auto-repairs</div>
           </td>
-          <td style="padding:0 16px;">
-            <div style="font-size:28px;font-weight:600;color:${totalFilasSinPdf > 0 ? "#c4901c" : "#1a1a1a"};">${totalFilasSinPdf}</div>
-            <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:0.06em;">filas sin PDF</div>
+          <td style="padding:0 14px;border-right:1px solid #e6e0d2;">
+            <div style="font-size:26px;font-weight:600;color:${totalHuerfanos > 0 ? "#c4901c" : "#1a1a1a"};">${totalHuerfanos}</div>
+            <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.06em;">PDFs huérfanos</div>
+          </td>
+          <td style="padding:0 14px;">
+            <div style="font-size:26px;font-weight:600;color:${totalFilasSinPdf > 0 ? "#c4901c" : "#1a1a1a"};">${totalFilasSinPdf}</div>
+            <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.06em;">Filas sin PDF</div>
           </td>
         </tr>
       </table>
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid #e6e0d2;font-size:11px;color:#666;">
-        Procesados ${report.clientes_procesados}/${report.clientes_total} clientes · ${report.clientes_skipped} skipped (sin OAuth/Sheet) · ${report.errores.length} errores
+        Procesados ${report.clientes_procesados}/${report.clientes_total} clientes · ${report.clientes_skipped} skipped · ${report.errores.length} errores
       </div>
     </div>
   `;
+
+  // === Etapa 3: Auto-repairs realizados ====================================
+  const autoRepairsBlock =
+    totalAutoRepairs === 0
+      ? ""
+      : `
+        <div style="margin-bottom:24px;">
+          <h2 style="font-size:14px;letter-spacing:0.05em;text-transform:uppercase;color:#1a8a4a;margin:0 0 12px 0;">
+            ✓ Auto-reparaciones (Etapa 3, ya aplicadas)
+          </h2>
+          <table style="width:100%;border-collapse:collapse;font-size:12px;">
+            <thead>
+              <tr style="border-bottom:1px solid #d8d3c8;">
+                <th style="text-align:left;padding:6px 10px;font-size:10px;text-transform:uppercase;color:#666;">Cliente</th>
+                <th style="text-align:left;padding:6px 10px;font-size:10px;text-transform:uppercase;color:#666;">Tipo</th>
+                <th style="text-align:left;padding:6px 10px;font-size:10px;text-transform:uppercase;color:#666;">N° Doc</th>
+                <th style="text-align:left;padding:6px 10px;font-size:10px;text-transform:uppercase;color:#666;">Acción</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${report.auto_repairs.slice(0, 50).map((r) => `
+                <tr style="border-bottom:1px solid #ebe8df;">
+                  <td style="padding:6px 10px;">${escapeHtml(r.cliente_slug)}</td>
+                  <td style="padding:6px 10px;font-family:monospace;font-size:10px;">${r.tipo === "link_actualizado" ? "Link Drive ↑" : "Fila ↑"}</td>
+                  <td style="padding:6px 10px;font-family:monospace;font-size:11px;">${escapeHtml(r.num_factura)}</td>
+                  <td style="padding:6px 10px;color:#555;font-size:11px;">${escapeHtml(r.detalle)}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+          ${totalAutoRepairs > 50 ? `<p style="font-size:10px;color:#999;margin-top:4px;">... y ${totalAutoRepairs - 50} más.</p>` : ""}
+        </div>
+      `;
 
   // === Filas reparadas (Etapa 1, auto) ======================================
   const reparadasBlock =
@@ -177,6 +216,7 @@ export function buildReparadorEmail(report: ReparadorReport): {
         </div>
         ${resumen}
         ${reparadasBlock}
+        ${autoRepairsBlock}
         ${huerfanosBlock}
         ${filasSinPdfBlock}
         ${erroresBlock}

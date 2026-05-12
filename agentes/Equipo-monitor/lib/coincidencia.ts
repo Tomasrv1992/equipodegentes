@@ -35,7 +35,13 @@ export interface CoincidenciaResult {
   error?: string;
 }
 
-const UMBRAL_DIFERENCIA = 0.15; // 15% de diferencia tolerada
+/**
+ * Tolerancia de diferencia entre Drive y Sheet (cada factura debe tener su PDF
+ * en Drive). Si difieren más de este % relativo, alerta.
+ * Gmail NO se compara (incluye emails procesados pero descartados como
+ * "no-factura" por el LLM → siempre será mucho mayor que Sheet/Drive).
+ */
+const UMBRAL_DIFERENCIA = 0.30;
 
 /**
  * Cuenta items en Gmail / Drive / Sheet del mes actual para un cliente.
@@ -90,6 +96,8 @@ export async function chequearCoincidencia(ctx: {
 
     // === 2) Drive: archivos en folder "YYYY-MM" hijo del folder principal ==
     // Estructura: driveFolderId / YYYY-MM / *.pdf
+    // IMPORTANTE: solo contamos archivos PDF/XML reales, EXCLUYENDO subcarpetas
+    // (sino el conteo se infla porque Drive trata folders como files).
     if (ctx.driveFolderId) {
       const year = bogotaYear();
       const mm = String(mesActual).padStart(2, "0");
@@ -105,8 +113,9 @@ export async function chequearCoincidencia(ctx: {
         let driveToken: string | undefined;
         do {
           const filesResp = await drive.files.list({
-            q: `'${monthFolderId}' in parents and trashed=false`,
-            fields: "files(id), nextPageToken",
+            // mimeType != folder → solo archivos reales (pdf, xml, docx)
+            q: `'${monthFolderId}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'`,
+            fields: "files(id, mimeType), nextPageToken",
             pageSize: 1000,
             pageToken: driveToken,
           });
@@ -129,20 +138,26 @@ export async function chequearCoincidencia(ctx: {
       result.sheet_count = rows.filter((r: any[]) => r[0] != null && r[0] !== "").length;
     }
 
-    // === 4) Evaluar diferencias =========================================
-    const counts = [result.gmail_count, result.drive_count, result.sheet_count];
-    const maxCount = Math.max(...counts);
-    const minCount = Math.min(...counts);
-    if (maxCount === 0) {
-      result.detalle = `Sin actividad este mes (Gmail/Drive/Sheet en 0).`;
+    // === 4) Evaluar diferencias ============================================
+    // Comparamos SOLO Drive vs Sheet (cada factura en Sheet debe tener su PDF
+    // en Drive — esos 2 sí deben coincidir).
+    // Gmail es siempre mayor porque incluye emails procesados PERO descartados
+    // por el LLM como "no factura" (newsletters con adjunto, recibos no
+    // facturables, etc). Solo lo mostramos como referencia, no genera alerta.
+    const drive = result.drive_count;
+    const sheet = result.sheet_count;
+    const max = Math.max(drive, sheet);
+    const min = Math.min(drive, sheet);
+    if (max === 0) {
+      result.detalle = `Sin actividad este mes (Drive y Sheet en 0).`;
       result.alerta = false;
     } else {
-      const diffRel = (maxCount - minCount) / maxCount;
+      const diffRel = (max - min) / max;
       if (diffRel > UMBRAL_DIFERENCIA) {
         result.alerta = true;
-        result.detalle = `Discrepancia: Gmail=${result.gmail_count}, Drive=${result.drive_count}, Sheet=${result.sheet_count} (${(diffRel * 100).toFixed(0)}% diferencia)`;
+        result.detalle = `Discrepancia Drive↔Sheet: Drive=${drive}, Sheet=${sheet} (${(diffRel * 100).toFixed(0)}% dif). Gmail=${result.gmail_count} (info, incluye no-facturas).`;
       } else {
-        result.detalle = `Gmail=${result.gmail_count}, Drive=${result.drive_count}, Sheet=${result.sheet_count} ✓`;
+        result.detalle = `Drive=${drive} ≈ Sheet=${sheet} ✓ · Gmail=${result.gmail_count} (incl. no-facturas).`;
       }
     }
   } catch (err: any) {

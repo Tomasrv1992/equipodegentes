@@ -144,20 +144,20 @@ export async function chequearCoincidencia(ctx: {
     // Gmail es siempre mayor porque incluye emails procesados PERO descartados
     // por el LLM como "no factura" (newsletters con adjunto, recibos no
     // facturables, etc). Solo lo mostramos como referencia, no genera alerta.
-    const drive = result.drive_count;
-    const sheet = result.sheet_count;
-    const max = Math.max(drive, sheet);
-    const min = Math.min(drive, sheet);
-    if (max === 0) {
+    const driveN = result.drive_count;
+    const sheetN = result.sheet_count;
+    const maxCount = Math.max(driveN, sheetN);
+    const minCount = Math.min(driveN, sheetN);
+    if (maxCount === 0) {
       result.detalle = `Sin actividad este mes (Drive y Sheet en 0).`;
       result.alerta = false;
     } else {
-      const diffRel = (max - min) / max;
+      const diffRel = (maxCount - minCount) / maxCount;
       if (diffRel > UMBRAL_DIFERENCIA) {
         result.alerta = true;
-        result.detalle = `Discrepancia Drive↔Sheet: Drive=${drive}, Sheet=${sheet} (${(diffRel * 100).toFixed(0)}% dif). Gmail=${result.gmail_count} (info, incluye no-facturas).`;
+        result.detalle = `Discrepancia Drive↔Sheet: Drive=${driveN}, Sheet=${sheetN} (${(diffRel * 100).toFixed(0)}% dif). Gmail=${result.gmail_count} (info, incluye no-facturas).`;
       } else {
-        result.detalle = `Drive=${drive} ≈ Sheet=${sheet} ✓ · Gmail=${result.gmail_count} (incl. no-facturas).`;
+        result.detalle = `Drive=${driveN} ≈ Sheet=${sheetN} ✓ · Gmail=${result.gmail_count} (incl. no-facturas).`;
       }
     }
   } catch (err: any) {

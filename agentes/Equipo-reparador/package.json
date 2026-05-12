@@ -1,0 +1,7 @@
+{
+  "name": "@equipodegentes/reparador",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agente: detecta y auto-repara discrepancias entre Gmail/Drive/Sheet/agent_events. Inserta filas faltantes en Sheet. Detecta PDFs huérfanos.",
+  "main": "lib/reparador.ts"
+}

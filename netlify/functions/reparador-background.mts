@@ -46,37 +46,35 @@ export default async (req: Request) => {
       errores: report.errores.length,
     }));
 
-    // Enviar email al admin
-    const fromAddr = process.env.NOTIFY_EMAIL_FROM;
-    const adminEmail =
-      process.env.MONITOR_ADMIN_EMAIL ??
-      process.env.NOTIFY_ADMIN_EMAIL ??
-      process.env.NOTIFY_EMAIL_TO;
-    const resendKey = process.env.RESEND_API_KEY;
-
-    if (!fromAddr || !adminEmail || !resendKey) {
-      console.warn("[reparador] email no enviado — faltan env vars (NOTIFY_EMAIL_FROM, MONITOR_ADMIN_EMAIL/NOTIFY_ADMIN_EMAIL/NOTIFY_EMAIL_TO, RESEND_API_KEY)");
+    // Email diario: DESACTIVADO por default — la info vive en el panel /diagnostico.
+    // Para reactivar (debug), setear AGENTS_DAILY_EMAILS_ENABLED=true en Netlify.
+    if (process.env.AGENTS_DAILY_EMAILS_ENABLED !== "true") {
+      console.log("[reparador] email diario desactivado (AGENTS_DAILY_EMAILS_ENABLED!=true) — ver /diagnostico");
     } else {
-      const { subject, html, text } = buildReparadorEmail(report);
-      const resp = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resendKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          from: fromAddr,
-          to: adminEmail,
-          subject,
-          html,
-          text,
-        }),
-      });
-      if (!resp.ok) {
-        const txt = await resp.text();
-        console.error(`[reparador] resend failed: ${txt}`);
+      const fromAddr = process.env.NOTIFY_EMAIL_FROM;
+      const adminEmail =
+        process.env.MONITOR_ADMIN_EMAIL ??
+        process.env.NOTIFY_ADMIN_EMAIL ??
+        process.env.NOTIFY_EMAIL_TO;
+      const resendKey = process.env.RESEND_API_KEY;
+
+      if (!fromAddr || !adminEmail || !resendKey) {
+        console.warn("[reparador] email no enviado — faltan env vars");
       } else {
-        console.log(`[reparador] email enviado a ${adminEmail}`);
+        const { subject, html, text } = buildReparadorEmail(report);
+        const resp = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${resendKey}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ from: fromAddr, to: adminEmail, subject, html, text }),
+        });
+        if (!resp.ok) {
+          console.error(`[reparador] resend failed: ${await resp.text()}`);
+        } else {
+          console.log(`[reparador] email enviado a ${adminEmail}`);
+        }
       }
     }
 

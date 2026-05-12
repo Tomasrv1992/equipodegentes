@@ -46,56 +46,35 @@ export default async (req: Request) => {
       zombies_cerrados: report.zombies_cerrados,
     }));
 
-    // 4. Enviar email al admin si hay email configurado.
-    // Aceptamos 3 nombres distintos (en orden de preferencia) para flexibilidad:
-    //   - MONITOR_ADMIN_EMAIL (nombre canónico del monitor)
-    //   - NOTIFY_ADMIN_EMAIL (alias)
-    //   - NOTIFY_EMAIL_TO (legacy del cron facturación)
-    const fromAddr = process.env.NOTIFY_EMAIL_FROM;
-    const adminEmail =
-      process.env.MONITOR_ADMIN_EMAIL ??
-      process.env.NOTIFY_ADMIN_EMAIL ??
-      process.env.NOTIFY_EMAIL_TO;
-    const resendKey = process.env.RESEND_API_KEY;
-
-    // Diagnóstico detallado (sin exponer valores sensibles)
-    console.log(
-      `[monitor] env check: NOTIFY_EMAIL_FROM=${fromAddr ? "✓ (" + fromAddr.slice(0, 25) + "...)" : "✗ FALTA"} | ` +
-      `MONITOR_ADMIN_EMAIL=${process.env.MONITOR_ADMIN_EMAIL ? "✓" : "✗"} | ` +
-      `NOTIFY_ADMIN_EMAIL=${process.env.NOTIFY_ADMIN_EMAIL ? "✓" : "✗"} | ` +
-      `NOTIFY_EMAIL_TO=${process.env.NOTIFY_EMAIL_TO ? "✓" : "✗"} | ` +
-      `resolved adminEmail=${adminEmail ? "✓ (" + adminEmail.slice(0, 5) + "...)" : "✗ FALTA"} | ` +
-      `RESEND_API_KEY=${resendKey ? "✓ (length=" + resendKey.length + ")" : "✗ FALTA"}`,
-    );
-
-    if (!fromAddr || !adminEmail || !resendKey) {
-      const faltantes = [
-        !fromAddr ? "NOTIFY_EMAIL_FROM" : null,
-        !adminEmail ? "MONITOR_ADMIN_EMAIL / NOTIFY_ADMIN_EMAIL / NOTIFY_EMAIL_TO" : null,
-        !resendKey ? "RESEND_API_KEY" : null,
-      ].filter(Boolean).join(", ");
-      console.warn(`[monitor] email no enviado — falta(n): ${faltantes}`);
+    // 4. Email diario: DESACTIVADO por default — la info vive en el panel /diagnostico.
+    // Para reactivar (debug), setear AGENTS_DAILY_EMAILS_ENABLED=true en Netlify.
+    if (process.env.AGENTS_DAILY_EMAILS_ENABLED !== "true") {
+      console.log("[monitor] email diario desactivado (AGENTS_DAILY_EMAILS_ENABLED!=true) — ver /diagnostico");
     } else {
-      const { subject, html, text } = buildMonitorEmail(report);
-      const resp = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resendKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          from: fromAddr,
-          to: adminEmail,
-          subject,
-          html,
-          text,
-        }),
-      });
-      if (!resp.ok) {
-        const txt = await resp.text();
-        console.error(`[monitor] resend failed: ${txt}`);
+      const fromAddr = process.env.NOTIFY_EMAIL_FROM;
+      const adminEmail =
+        process.env.MONITOR_ADMIN_EMAIL ??
+        process.env.NOTIFY_ADMIN_EMAIL ??
+        process.env.NOTIFY_EMAIL_TO;
+      const resendKey = process.env.RESEND_API_KEY;
+
+      if (!fromAddr || !adminEmail || !resendKey) {
+        console.warn("[monitor] email no enviado — faltan env vars");
       } else {
-        console.log(`[monitor] email enviado a ${adminEmail}`);
+        const { subject, html, text } = buildMonitorEmail(report);
+        const resp = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${resendKey}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ from: fromAddr, to: adminEmail, subject, html, text }),
+        });
+        if (!resp.ok) {
+          console.error(`[monitor] resend failed: ${await resp.text()}`);
+        } else {
+          console.log(`[monitor] email enviado a ${adminEmail}`);
+        }
       }
     }
 

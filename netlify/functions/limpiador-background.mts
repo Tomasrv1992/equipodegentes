@@ -41,31 +41,36 @@ export default async (req: Request) => {
       costo_llm: report.costo_llm_usd,
     }));
 
-    // Enviar email al admin
-    const fromAddr = process.env.NOTIFY_EMAIL_FROM;
-    const adminEmail =
-      process.env.MONITOR_ADMIN_EMAIL ??
-      process.env.NOTIFY_ADMIN_EMAIL ??
-      process.env.NOTIFY_EMAIL_TO;
-    const resendKey = process.env.RESEND_API_KEY;
-
-    if (fromAddr && adminEmail && resendKey) {
-      const { subject, html, text } = buildLimpiadorEmail(report);
-      const resp = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resendKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ from: fromAddr, to: adminEmail, subject, html, text }),
-      });
-      if (!resp.ok) {
-        console.error(`[limpiador] resend failed: ${await resp.text()}`);
-      } else {
-        console.log(`[limpiador] email enviado a ${adminEmail}`);
-      }
+    // Email diario: DESACTIVADO por default — la info vive en el panel /diagnostico.
+    // Para reactivar (debug), setear AGENTS_DAILY_EMAILS_ENABLED=true en Netlify.
+    if (process.env.AGENTS_DAILY_EMAILS_ENABLED !== "true") {
+      console.log("[limpiador] email diario desactivado (AGENTS_DAILY_EMAILS_ENABLED!=true) — ver /diagnostico");
     } else {
-      console.warn("[limpiador] email no enviado — faltan env vars");
+      const fromAddr = process.env.NOTIFY_EMAIL_FROM;
+      const adminEmail =
+        process.env.MONITOR_ADMIN_EMAIL ??
+        process.env.NOTIFY_ADMIN_EMAIL ??
+        process.env.NOTIFY_EMAIL_TO;
+      const resendKey = process.env.RESEND_API_KEY;
+
+      if (fromAddr && adminEmail && resendKey) {
+        const { subject, html, text } = buildLimpiadorEmail(report);
+        const resp = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${resendKey}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ from: fromAddr, to: adminEmail, subject, html, text }),
+        });
+        if (!resp.ok) {
+          console.error(`[limpiador] resend failed: ${await resp.text()}`);
+        } else {
+          console.log(`[limpiador] email enviado a ${adminEmail}`);
+        }
+      } else {
+        console.warn("[limpiador] email no enviado — faltan env vars");
+      }
     }
 
     const status: "ok" | "warn" | "fail" =

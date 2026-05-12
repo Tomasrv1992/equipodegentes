@@ -1,0 +1,7 @@
+{
+  "name": "@equipodegentes/limpiador",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agente: para cada PDF huérfano en Drive, descarga + LLM identifica + match contra agent_events. Si es duplicado → mover a folder duplicados. Si es factura nueva → crear event + fila en Sheet.",
+  "main": "lib/limpiador.ts"
+}

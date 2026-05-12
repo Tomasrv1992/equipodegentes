@@ -37,14 +37,15 @@ const COL_LINK_PDF = 14;
 /** Concurrencia: cuántos PDFs procesar en paralelo. */
 const CONCURRENCY = 5;
 
-/** Folder donde mover los duplicados verificados. Se crea si no existe. */
-const DUPLICADOS_FOLDER_NAME = "_duplicados_operatto";
-
 export interface AccionLimpiador {
   cliente_slug: string;
   drive_file_id: string;
   drive_file_name: string;
-  tipo: "duplicado" | "factura_recuperada" | "no_identificable";
+  tipo:
+    | "duplicado"
+    | "factura_recuperada"
+    | "no_identificable"
+    | "self_emitted_ignorado";
   detalle: string;
   /** Si recuperó: N° factura del event creado/insertado. */
   num_factura?: string;
@@ -62,6 +63,8 @@ export interface LimpiadorReport {
   duplicados_movidos: number;
   facturas_recuperadas: number;
   no_identificables: number;
+  /** PDFs ignorados porque el cliente es emisor (cuentas de cobro propias). */
+  self_emitted_ignorados: number;
   costo_llm_usd: number;
   acciones: AccionLimpiador[];
   errores: Array<{ cliente_slug: string; error: string }>;
@@ -85,6 +88,7 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
     duplicados_movidos: 0,
     facturas_recuperadas: 0,
     no_identificables: 0,
+    self_emitted_ignorados: 0,
     costo_llm_usd: 0,
     acciones: [],
     errores: [],
@@ -201,8 +205,10 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
 
       const events = (eventsCli ?? []).map((e: any) => e.payload);
 
-      // 6. Garantizar folder de duplicados (crear si no existe)
-      let dupFolderId = await ensureDuplicadosFolder(drive, cred.drive_folder_id);
+      // 6. NIT del cliente (para filtrar facturas self-emitted)
+      const nitCliente = (cred as any).nit_cliente
+        ? String((cred as any).nit_cliente).replace(/\D+/g, "")
+        : null;
 
       // 7. Procesar huérfanos en concurrencia
       console.log(
@@ -211,7 +217,7 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
       const queue = [...huerfanos];
       const workers: Array<Promise<void>> = [];
       for (let i = 0; i < CONCURRENCY; i++) {
-        workers.push(processWorker(queue, c, cred, drive, sheets, supa, events, dupFolderId, tabName, mesActual, year, report));
+        workers.push(processWorker(queue, c, cred, drive, sheets, supa, events, nitCliente, tabName, mesActual, year, report));
       }
       await Promise.all(workers);
 
@@ -235,7 +241,7 @@ async function processWorker(
   sheets: any,
   supa: any,
   events: any[],
-  dupFolderId: string | null,
+  nitCliente: string | null,
   tabName: string,
   mesActual: number,
   year: number,
@@ -245,7 +251,7 @@ async function processWorker(
     const h = queue.shift();
     if (!h) break;
     try {
-      await procesarHuerfano(h, c, cred, drive, sheets, supa, events, dupFolderId, tabName, mesActual, year, report);
+      await procesarHuerfano(h, c, cred, drive, sheets, supa, events, nitCliente, tabName, mesActual, year, report);
     } catch (err: any) {
       console.warn(`[limpiador] huerfano ${h.name} falló: ${err.message}`);
     }
@@ -260,7 +266,7 @@ async function procesarHuerfano(
   sheets: any,
   supa: any,
   events: any[],
-  dupFolderId: string | null,
+  nitCliente: string | null,
   tabName: string,
   mesActual: number,
   year: number,
@@ -385,7 +391,25 @@ async function procesarHuerfano(
     return;
   }
 
-  // 5. Match contra events: por número exacto, o por proveedor+monto (±5%)
+  // 5. Filtro nit_cliente: si el NIT extraído del PDF coincide con el del
+  //    cliente, significa que es una factura/cuenta de cobro que ÉL EMITIÓ.
+  //    No es un gasto suyo → no crear event ni fila. Marcar como ignorado.
+  if (nitCliente) {
+    const extractedNitClean = String(extracted.nit ?? "").replace(/\D+/g, "");
+    if (extractedNitClean && extractedNitClean === nitCliente) {
+      report.self_emitted_ignorados++;
+      report.acciones.push({
+        cliente_slug: c.slug,
+        drive_file_id: h.id,
+        drive_file_name: fname,
+        tipo: "self_emitted_ignorado",
+        detalle: `Cliente es emisor (NIT ${extractedNitClean}=cliente). Cuenta de cobro propia, no es un gasto. Archivo intacto.`,
+      });
+      return;
+    }
+  }
+
+  // 6. Match contra events: por número exacto, o por proveedor+monto (±5%)
   const provExt = normalizeText(String(extracted.proveedor ?? ""));
   const numExt = String(extracted.numero ?? "").trim();
   const totalExt = Number(extracted.total ?? 0);
@@ -409,17 +433,16 @@ async function procesarHuerfano(
   });
 
   if (matched) {
-    // === DUPLICADO: mover archivo a folder _duplicados ====================
-    if (dupFolderId) {
-      try {
-        await drive.files.update({
-          fileId: h.id,
-          addParents: dupFolderId,
-          removeParents: cred.drive_folder_id, // fallback: lo saca del folder raíz
-        });
-      } catch {
-        // Si falla mover, igual lo registramos como duplicado pero sin acción Drive
-      }
+    // === DUPLICADO: mover archivo a Papelera de Drive =====================
+    // Drive guarda en papelera 30 días antes de eliminar definitivamente.
+    // Esto da tiempo de recuperar si el LLM se equivocó, sin acumular basura.
+    try {
+      await drive.files.update({
+        fileId: h.id,
+        requestBody: { trashed: true },
+      });
+    } catch (err: any) {
+      console.warn(`[limpiador] no pude mover a papelera ${fname}: ${err.message}`);
     }
     report.duplicados_movidos++;
     report.acciones.push({
@@ -427,7 +450,7 @@ async function procesarHuerfano(
       drive_file_id: h.id,
       drive_file_name: fname,
       tipo: "duplicado",
-      detalle: `Duplicado verificado de ${matched.proveedor} #${matched.numero}. Movido a ${DUPLICADOS_FOLDER_NAME}.`,
+      detalle: `Duplicado verificado de ${matched.proveedor} #${matched.numero}. Movido a Papelera de Drive (recuperable 30 días).`,
       num_factura: String(matched.numero ?? ""),
       total: Number(matched.total ?? 0),
     });
@@ -558,30 +581,6 @@ async function procesarHuerfano(
     num_factura: numExt,
     total: totalExt,
   });
-}
-
-/** Crea/obtiene el folder "_duplicados_operatto" dentro del folder principal. */
-async function ensureDuplicadosFolder(drive: any, parentId: string): Promise<string | null> {
-  try {
-    const resp = await drive.files.list({
-      q: `name='${DUPLICADOS_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`,
-      fields: "files(id, name)",
-    });
-    if (resp.data.files && resp.data.files.length > 0) return resp.data.files[0].id ?? null;
-    // Crear
-    const created = await drive.files.create({
-      requestBody: {
-        name: DUPLICADOS_FOLDER_NAME,
-        mimeType: "application/vnd.google-apps.folder",
-        parents: [parentId],
-      },
-      fields: "id",
-    });
-    return created.data.id ?? null;
-  } catch (err: any) {
-    console.warn(`[limpiador] ensureDuplicadosFolder falló: ${err.message}`);
-    return null;
-  }
 }
 
 function normalizeText(s: string): string {

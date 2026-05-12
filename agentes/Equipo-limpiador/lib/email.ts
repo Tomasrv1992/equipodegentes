@@ -8,6 +8,7 @@ export function buildLimpiadorEmail(report: LimpiadorReport): {
   const dup = report.duplicados_movidos;
   const rec = report.facturas_recuperadas;
   const noid = report.no_identificables;
+  const self = report.self_emitted_ignorados;
   const total = report.total_huerfanos_analizados;
 
   const subject =
@@ -41,16 +42,23 @@ export function buildLimpiadorEmail(report: LimpiadorReport): {
         </tr>
       </table>
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid #e6e0d2;font-size:11px;color:#666;">
-        Analizados ${total} huérfanos · ${report.clientes_procesados}/${report.clientes_total} clientes · ${report.errores.length} errores
+        Analizados ${total} huérfanos · ${report.clientes_procesados}/${report.clientes_total} clientes · ${self} ignorados (cliente=emisor) · ${report.errores.length} errores
       </div>
     </div>
   `;
 
   const duplicadosBlock = buildBlock(
-    "📦 Duplicados (movidos a _duplicados_operatto en Drive)",
+    "🗑 Duplicados (movidos a Papelera de Drive)",
     "#c4901c",
     report.acciones.filter((a) => a.tipo === "duplicado"),
-    "Estos PDFs son copias de facturas ya registradas. El archivo original quedó intacto, solo se movió el duplicado al folder \"_duplicados_operatto\" para limpiar visual.",
+    "Estos PDFs son copias de facturas ya registradas. Se movieron a la Papelera de Drive — quedan recuperables durante 30 días por si el LLM se equivocó.",
+  );
+
+  const selfEmittedBlock = buildBlock(
+    "🚫 Ignorados — cliente es emisor",
+    "#666",
+    report.acciones.filter((a) => a.tipo === "self_emitted_ignorado"),
+    "El LLM identificó que el NIT del proveedor coincide con el del cliente. Son cuentas de cobro/planillas que el cliente EMITE, no facturas que recibe. Archivos intactos en Drive.",
   );
 
   const recuperadasBlock = buildBlock(
@@ -96,6 +104,7 @@ export function buildLimpiadorEmail(report: LimpiadorReport): {
         ${resumen}
         ${duplicadosBlock}
         ${recuperadasBlock}
+        ${selfEmittedBlock}
         ${noIdBlock}
         ${erroresBlock}
         <p style="font-size:11px;color:#999;margin:32px 0 0 0;">

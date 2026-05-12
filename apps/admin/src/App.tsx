@@ -9,6 +9,7 @@ import AgenteRoute from "./routes/agente";
 import AgentesList from "./routes/agentes";
 import NuevoCliente from "./routes/nuevo-cliente";
 import OnboardingPage from "./routes/onboarding";
+import DiagnosticoRoute from "./routes/diagnostico";
 
 function Placeholder({ name }: { name: string }) {
   return <h2 className="font-serif text-2xl">{name}</h2>;
@@ -33,6 +34,7 @@ export default function App() {
                 <Route path="/cliente/:slug" element={<ClienteRoute />} />
                 <Route path="/agentes" element={<AgentesList />} />
                 <Route path="/agente/:id" element={<AgenteRoute />} />
+                <Route path="/diagnostico" element={<DiagnosticoRoute />} />
                 <Route path="/nuevo-cliente" element={<NuevoCliente />} />
                 <Route path="*" element={<Placeholder name="404" />} />
               </Routes>

@@ -413,9 +413,12 @@ export async function runReparador(): Promise<ReparadorReport> {
             }
           }
 
-          // === ETAPA 3.B: Auto-repair PDFs huérfanos ========================
-          // Para cada PDF huérfano: buscar event con N° factura matcheando el
-          // filename del PDF. Si match, insertar fila en Sheet con link al PDF.
+          // === ETAPA 3.B + 4: Auto-repair PDFs huérfanos (multi-nivel) ======
+          // Estrategia de matching (en orden):
+          //   1. Por N° factura en filename (Etapa 3.B original)
+          //   2. Por proveedor parseado del filename (Etapa 4.A)
+          //   3. Por LLM extrayendo texto del PDF (Etapa 4.B) — solo si no
+          //      hay match en 1+2 y el filename parece factura
           if (report.auto_repairs.length < MAX_AUTO_REPAIRS_POR_RUN) {
             // Cargar events del mes actual para matchear contra filenames
             const monthStartCur = `${year}-${String(mesActual).padStart(2, "0")}-01`;
@@ -432,8 +435,9 @@ export async function runReparador(): Promise<ReparadorReport> {
               .gte("payload->>fecha", monthStartCur)
               .lt("payload->>fecha", monthEndCur);
 
+            const eventsAll = (eventsCur ?? []) as Array<{ payload: any }>;
             const eventsByNum = new Map<string, any>();
-            for (const ev of (eventsCur ?? []) as Array<{ payload: any }>) {
+            for (const ev of eventsAll) {
               const num = String(ev.payload?.numero ?? "").trim();
               if (num) eventsByNum.set(num, ev.payload);
             }
@@ -455,6 +459,15 @@ export async function runReparador(): Promise<ReparadorReport> {
                 .filter(Boolean),
             );
 
+            // Index por proveedor normalizado (para Etapa 4.A)
+            const eventsByProveedor = new Map<string, any[]>();
+            for (const ev of eventsAll) {
+              const prov = normalizeText(String(ev.payload?.proveedor ?? ""));
+              if (!prov) continue;
+              if (!eventsByProveedor.has(prov)) eventsByProveedor.set(prov, []);
+              eventsByProveedor.get(prov)!.push(ev.payload);
+            }
+
             const huerfanosClient = report.pdfs_huerfanos.filter(
               (h) => h.cliente_slug === c.slug,
             );
@@ -466,19 +479,80 @@ export async function runReparador(): Promise<ReparadorReport> {
               ) {
                 break;
               }
-              // Intentar matchear filename contra eventsByNum
               const fname = h.drive_file_name;
               let matchedNum: string | null = null;
+              let matchSource = "";
+
+              // === Etapa 3.B: match por N° factura en filename ============
               for (const num of eventsByNum.keys()) {
                 if (num && fname.includes(num)) {
                   matchedNum = num;
+                  matchSource = "numero_en_filename";
                   break;
                 }
               }
-              if (!matchedNum) continue; // no se encontró match
-              if (numsEnSheetCur.has(matchedNum)) continue; // ya hay fila
 
-              const p = eventsByNum.get(matchedNum);
+              // === Etapa 4.A: match por proveedor parseado ================
+              if (!matchedNum) {
+                const provFromFile = extractProveedorFromFilename(fname);
+                if (provFromFile) {
+                  const provNorm = normalizeText(provFromFile);
+                  // Buscar exacto primero
+                  let candidates = eventsByProveedor.get(provNorm);
+                  // Si no, buscar startsWith / includes
+                  if (!candidates) {
+                    for (const [k, evs] of eventsByProveedor.entries()) {
+                      if (k.startsWith(provNorm) || provNorm.startsWith(k)) {
+                        candidates = evs;
+                        break;
+                      }
+                    }
+                  }
+                  if (candidates && candidates.length > 0) {
+                    // Tomar el primero cuyo número no esté ya en Sheet
+                    for (const cand of candidates) {
+                      const candNum = String(cand?.numero ?? "").trim();
+                      if (candNum && !numsEnSheetCur.has(candNum)) {
+                        matchedNum = candNum;
+                        matchSource = "proveedor_en_filename";
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+
+              // === Etapa 4.B: LLM fallback (descargar PDF + identificar) ==
+              if (!matchedNum && process.env.ANTHROPIC_API_KEY) {
+                try {
+                  const llmMatchedNum = await matchHuerfanoConLlm(
+                    drive,
+                    h.drive_file_id,
+                    fname,
+                    eventsAll.map((e) => e.payload),
+                    numsEnSheetCur,
+                  );
+                  if (llmMatchedNum) {
+                    matchedNum = llmMatchedNum;
+                    matchSource = "llm";
+                  }
+                } catch (err: any) {
+                  console.warn(
+                    `[reparador-4B] LLM falló para ${fname}: ${err.message}`,
+                  );
+                }
+              }
+
+              if (!matchedNum) continue;
+              if (numsEnSheetCur.has(matchedNum)) continue;
+
+              const p = eventsByNum.get(matchedNum) ??
+                eventsAll.find((e) => String(e.payload?.numero ?? "").trim() === matchedNum)?.payload;
+              if (!p) continue;
+              // marcar source en log
+              console.log(
+                `[reparador-3B/4] cliente=${c.slug} #${matchedNum} ← ${fname} (${matchSource})`,
+              );
               const subtotal = Number(p.subtotal ?? 0);
               const iva = Number(p.iva ?? 0);
               const rtf = Number(p.reteFuente ?? 0);
@@ -568,4 +642,147 @@ function bogotaMonth(): number {
   const now = new Date();
   const bogotaMs = now.getTime() - 5 * 60 * 60 * 1000;
   return new Date(bogotaMs).getUTCMonth() + 1;
+}
+
+/**
+ * Normaliza texto para comparación fuzzy:
+ *   - lowercase
+ *   - sin tildes
+ *   - sin "S.A.", "S.A.S.", "Ltda", "LTDA", "SAS", "S.A.S"
+ *   - sin signos de puntuación / espacios extras
+ *   - colapsa espacios múltiples
+ */
+function normalizeText(s: string): string {
+  if (!s) return "";
+  return s
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "") // sin tildes
+    .toLowerCase()
+    .replace(/\bs\.?\s*a\.?\s*s?\.?\b/gi, "")     // S.A. / S.A.S. / SAS
+    .replace(/\bltda\.?\b/gi, "")                  // Ltda
+    .replace(/\bsociedad\b/gi, "")
+    .replace(/\bp\.?\s*h\.?\b/gi, "")              // P.H.
+    .replace(/[.,;:|()/\\-]/g, " ")                // puntuación
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Extrae el nombre del proveedor del filename siguiendo el patrón típico que
+ * usa el cron: "N. Proveedor Nombre.pdf" o "N. Proveedor Nombre - Detalle.pdf".
+ * Devuelve null si no matchea el patrón.
+ */
+function extractProveedorFromFilename(filename: string): string | null {
+  // Quitar extensión
+  const base = filename.replace(/\.(pdf|docx|xml)$/i, "");
+  // Patrón "N. Proveedor" o "N.M Proveedor" o "Proveedor" (sin N.)
+  const m = base.match(/^\s*\d+(?:\.\d+)?\.\s*(.+)$/);
+  if (m) return m[1].trim();
+  // Si no tiene N. prefix, devolver el base entero (puede ser solo proveedor)
+  return base.trim() || null;
+}
+
+/**
+ * Etapa 4.B: descarga el PDF, extrae texto, llama al LLM para identificar la
+ * factura, y matchea contra events del cliente.
+ *
+ * Retorna el N° factura del event matcheado, o null si no encuentra match.
+ */
+async function matchHuerfanoConLlm(
+  drive: any,
+  fileId: string,
+  fileName: string,
+  eventsPayloads: any[],
+  numsEnSheet: Set<string>,
+): Promise<string | null> {
+  // 1. Skip si filename termina en .docx (no soportamos por ahora — son cuentas de cobro)
+  if (fileName.toLowerCase().endsWith(".docx")) return null;
+  if (!fileName.toLowerCase().endsWith(".pdf")) return null;
+
+  // 2. Descargar el PDF a /tmp
+  const tmpPath = `/tmp/reparador-${fileId}.pdf`;
+  try {
+    const resp = await drive.files.get(
+      { fileId, alt: "media" },
+      { responseType: "arraybuffer" },
+    );
+    const fs = await import("node:fs");
+    fs.writeFileSync(tmpPath, Buffer.from(resp.data as ArrayBuffer));
+  } catch (err: any) {
+    console.warn(`[reparador-4B] download falló: ${err.message}`);
+    return null;
+  }
+
+  // 3. Extraer texto con pdf-parse (reusando helper del pipeline)
+  let text = "";
+  try {
+    const { extractTextFromPdf } = await import(
+      "../../../agentes/Equipo-facturacion/lib/doc-parsers"
+    );
+    text = await extractTextFromPdf(tmpPath);
+  } catch {
+    /* ignorar */
+  }
+  // Cleanup
+  try {
+    const fs = await import("node:fs");
+    fs.unlinkSync(tmpPath);
+  } catch {
+    /* ignorar */
+  }
+  if (!text || text.length < 30) return null;
+
+  // 4. Llamar al LLM para extraer datos del PDF
+  let extracted: { proveedor?: string; numero?: string; total?: number; fecha?: string } | null = null;
+  try {
+    const { extractInvoiceFromText } = await import(
+      "../../../agentes/Equipo-facturacion/lib/llm-extractor"
+    );
+    extracted = await extractInvoiceFromText({
+      text: text.slice(0, 8000),
+      presumedType: "recibo_servicio",
+      filename: fileName,
+      sender: "(unknown)",
+      subject: fileName,
+      emailDate: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    console.warn(`[reparador-4B] LLM extract falló: ${err.message}`);
+    return null;
+  }
+  if (!extracted || !extracted.proveedor) return null;
+
+  // 5. Matchear contra events: prioridad por número exacto, después por
+  //    proveedor + monto similar.
+  const provExtractedNorm = normalizeText(extracted.proveedor);
+  const totalExtracted = Number(extracted.total ?? 0);
+
+  // 5a) match exacto por número
+  if (extracted.numero) {
+    const nNorm = String(extracted.numero).trim();
+    for (const p of eventsPayloads) {
+      const pNum = String(p?.numero ?? "").trim();
+      if (pNum && pNum === nNorm && !numsEnSheet.has(pNum)) return pNum;
+    }
+  }
+
+  // 5b) match por proveedor + monto (±5% tolerancia)
+  for (const p of eventsPayloads) {
+    const pProvNorm = normalizeText(String(p?.proveedor ?? ""));
+    if (!pProvNorm) continue;
+    const provMatch =
+      pProvNorm === provExtractedNorm ||
+      pProvNorm.startsWith(provExtractedNorm) ||
+      provExtractedNorm.startsWith(pProvNorm);
+    if (!provMatch) continue;
+    const pTotal = Number(p?.total ?? 0);
+    if (totalExtracted > 0 && pTotal > 0) {
+      const diff = Math.abs(pTotal - totalExtracted) / Math.max(pTotal, totalExtracted);
+      if (diff > 0.05) continue; // > 5% diferencia → skip
+    }
+    const pNum = String(p?.numero ?? "").trim();
+    if (pNum && !numsEnSheet.has(pNum)) return pNum;
+  }
+
+  return null;
 }

@@ -19,6 +19,8 @@
  */
 
 import { getServerClient } from "../../../shared/agents-runtime/src/supabase-server";
+import { loadCredentials } from "../../../shared/agents-runtime/src/credentials";
+import { chequearCoincidencia, type CoincidenciaResult } from "./coincidencia";
 
 export interface ClienteCheckResult {
   cliente_id: string;
@@ -40,6 +42,8 @@ export interface ClienteCheckResult {
   ultimo_run_started_at?: string;
   error_message?: string | null;
   oauth_status?: string | null;
+  /** Coincidencia Gmail/Drive/Sheet del mes (opcional, solo si OAuth OK). */
+  coincidencia?: CoincidenciaResult;
   /** Texto corto para el email. */
   detalle: string;
 }
@@ -51,9 +55,18 @@ export interface MonitorReport {
   clientes_ok: number;
   clientes_con_alerta: number;
   zombies_cerrados: number;
+  /** Costo Anthropic del día (USD) sumando todos los runs. */
+  costo_anthropic_usd: number;
+  /** Cantidad de llamadas LLM del día (todos los runs). */
+  llm_calls_dia: number;
+  /** Si costo_anthropic_usd supera umbral, true. */
+  costo_alerta: boolean;
   /** Detalle por cliente, ordenado por estado (alertas primero). */
   clientes: ClienteCheckResult[];
 }
+
+/** Umbral de alerta de costo Anthropic por día (USD). */
+const COSTO_ANTHROPIC_UMBRAL_USD = 2.0;
 
 const RUNNING_TIMEOUT_MIN = 30; // runs en running > 30min se consideran zombies
 
@@ -227,10 +240,68 @@ export async function runMonitor(): Promise<MonitorReport> {
   };
   results.sort((a, b) => orderRank[a.estado] - orderRank[b.estado]);
 
+  // === 3.5) Coincidencia Gmail/Drive/Sheet (Etapa 2) =========================
+  // Solo para clientes con OAuth válido. Best-effort: si falla el chequeo de un
+  // cliente, lo registramos pero no rompemos el reporte.
+  const oauthClientId = process.env.GOOGLE_OAUTH_WEB_CLIENT_ID ?? "";
+  const oauthClientSecret = process.env.GOOGLE_OAUTH_WEB_CLIENT_SECRET ?? "";
+  const vaultKey = process.env.CREDENTIALS_VAULT_KEY ?? "";
+  if (oauthClientId && oauthClientSecret && vaultKey) {
+    for (const r of results) {
+      if (r.estado === "oauth_broken" || r.estado === "no_agente") continue;
+      try {
+        const cred = await loadCredentials(r.cliente_id, "facturacion");
+        if (!cred || !cred.google_refresh_token) continue;
+        // El refresh_token ya viene desencriptado por loadCredentials (que usa el RPC)
+        r.coincidencia = await chequearCoincidencia({
+          clientId: oauthClientId,
+          clientSecret: oauthClientSecret,
+          refreshToken: cred.google_refresh_token,
+          driveFolderId: cred.drive_folder_id,
+          sheetId: cred.sheet_id,
+        });
+
+        // Si coincidencia detectó alerta y el cliente estaba OK, escalarlo a warn
+        if (r.coincidencia.alerta && r.estado === "ok") {
+          r.estado = "warn";
+          r.detalle = r.coincidencia.detalle;
+        }
+      } catch (err: any) {
+        console.warn(
+          `[monitor] coincidencia falló para ${r.slug}: ${err.message}`,
+        );
+      }
+    }
+  } else {
+    console.log("[monitor] coincidencia skip — faltan env vars OAuth/vault");
+  }
+
   const clientesConAlerta = results.filter((r) =>
     ["fail", "oauth_broken", "no_run", "warn"].includes(r.estado),
   ).length;
   const clientesOk = results.filter((r) => r.estado === "ok").length;
+
+  // === 4) Costo Anthropic del día ============================================
+  // Suma el costo estimado de TODOS los runs del día (incluye reprocessos manuales).
+  // El cron escribe llmStats al payload del run (ver pipeline.ts result.llmStats).
+  const dayStartUtc = bogotaDayStartUtc(ts);
+  const { data: runsHoyAll } = await supa
+    .from("agent_runs")
+    .select("payload")
+    .eq("agente_id", "facturacion")
+    .gte("started_at", dayStartUtc);
+
+  let costoAnthropicUsd = 0;
+  let llmCallsDia = 0;
+  for (const r of (runsHoyAll ?? []) as Array<{ payload: any }>) {
+    const stats = r.payload?.llmStats;
+    if (stats) {
+      costoAnthropicUsd += Number(stats.estimatedCostUsd ?? 0);
+      llmCallsDia += Number(stats.calls ?? 0);
+    }
+  }
+  costoAnthropicUsd = Math.round(costoAnthropicUsd * 10000) / 10000;
+  const costoAlerta = costoAnthropicUsd >= COSTO_ANTHROPIC_UMBRAL_USD;
 
   return {
     fecha,
@@ -239,6 +310,9 @@ export async function runMonitor(): Promise<MonitorReport> {
     clientes_ok: clientesOk,
     clientes_con_alerta: clientesConAlerta,
     zombies_cerrados: zombiesCerrados,
+    costo_anthropic_usd: costoAnthropicUsd,
+    llm_calls_dia: llmCallsDia,
+    costo_alerta: costoAlerta,
     clientes: results,
   };
 }

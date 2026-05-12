@@ -18,6 +18,8 @@ export function buildMonitorEmail(report: MonitorReport): {
       : `Operatto · ${okCount}/${total} OK · ${report.fecha}`;
 
   // === Bloque resumen superior ==============================================
+  const costoStr = `$${report.costo_anthropic_usd.toFixed(3)}`;
+  const costoColor = report.costo_alerta ? "#c44b27" : "#1a8a4a";
   const resumen = `
     <div style="background:#f7f5f0;border:1px solid #d8d3c8;padding:20px;border-radius:8px;margin-bottom:24px;">
       <div style="font-size:11px;letter-spacing:0.1em;color:#666;text-transform:uppercase;margin-bottom:8px;">
@@ -33,6 +35,12 @@ export function buildMonitorEmail(report: MonitorReport): {
           </td>
         </tr>
       </table>
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid #e6e0d2;display:flex;gap:16px;font-size:12px;color:#555;">
+        <span><strong style="color:${costoColor};">${costoStr}</strong> costo Anthropic hoy</span>
+        <span>·</span>
+        <span><strong>${report.llm_calls_dia}</strong> llamadas LLM</span>
+        ${report.costo_alerta ? '<span style="color:#c44b27;">⚠ supera umbral</span>' : ""}
+      </div>
     </div>
   `;
 
@@ -115,6 +123,9 @@ function rowHtml(c: ClienteCheckResult): string {
     no_agente: "#999",
   };
   const color = badgeColor[c.estado] ?? "#666";
+  const coincidenciaHtml = c.coincidencia
+    ? `<br><span style="font-size:10px;color:#999;font-family:monospace;">${escapeHtml(c.coincidencia.detalle)}</span>`
+    : "";
   return `
     <tr style="border-bottom:1px solid #ebe8df;">
       <td style="padding:10px 12px;font-weight:500;">${escapeHtml(c.nombre)}</td>
@@ -123,7 +134,10 @@ function rowHtml(c: ClienteCheckResult): string {
           ${c.estado.replace("_", " ")}
         </span>
       </td>
-      <td style="padding:10px 12px;color:#555;font-size:12px;">${escapeHtml(c.detalle)}</td>
+      <td style="padding:10px 12px;color:#555;font-size:12px;">
+        ${escapeHtml(c.detalle)}
+        ${coincidenciaHtml}
+      </td>
     </tr>
   `;
 }
@@ -145,6 +159,8 @@ function buildPlainText(report: MonitorReport): string {
     `Clientes: ${report.clientes_ok}/${report.clientes_total} OK`,
     `Alertas: ${report.clientes_con_alerta}`,
     `Zombies cerrados: ${report.zombies_cerrados}`,
+    `Costo Anthropic hoy: $${report.costo_anthropic_usd.toFixed(3)} (${report.llm_calls_dia} llamadas)`,
+    report.costo_alerta ? `⚠ Costo supera umbral` : "",
     ``,
   ];
   const alertas = report.clientes.filter((c) =>

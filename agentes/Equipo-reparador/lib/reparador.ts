@@ -310,7 +310,13 @@ export async function runReparador(): Promise<ReparadorReport> {
           }
 
           // 2c) PDFs en Drive sin link en Sheet (huérfanos)
+          // IMPORTANTE: ignoramos archivos .xml — son los XMLs DIAN extraídos
+          // del ZIP que el cron guarda como auxiliares. NO son facturas
+          // independientes (el link del Sheet apunta al .pdf principal).
+          // Tampoco contamos archivos sin nombre.
           for (const f of archivosMes) {
+            const fname = (f.name ?? "").toLowerCase();
+            if (!fname || fname.endsWith(".xml")) continue;
             if (!linksEnSheet.has(f.id)) {
               report.pdfs_huerfanos.push({
                 cliente_slug: c.slug,

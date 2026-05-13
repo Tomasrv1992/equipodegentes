@@ -134,9 +134,15 @@ export async function runSupervisor(): Promise<SupervisorReport> {
       );
       report.chequeos.push(chequeo);
 
-      // Retrigger si hay duplicados (limpiador) o gaps (reparador)
+      // SUPERVISOR EXIGENTE — no ser paisaje:
+      //   1. Si hay duplicados Drive → retrigger limpiador
+      //   2. Si gap events-vs-sheet → retrigger reparador
+      //   3. Si las 4 fuentes (gmail/drive/sheet/events) NO cuadran → FAIL crítico
+      //   4. requiere_atencion_critica si quedan cosas tras retriggers
       const tieneDuplicados = chequeo.duplicados_drive.length > 0;
       const gapSheetEvents = Math.abs(chequeo.events_count - chequeo.sheet_count) > 0;
+      const gapDriveSheet = Math.abs(chequeo.drive_count - chequeo.sheet_count) > 0;
+      const fuentesNoCuadran = gapSheetEvents || gapDriveSheet;
 
       if (tieneDuplicados && baseUrl && internalSecret) {
         try {
@@ -157,12 +163,36 @@ export async function runSupervisor(): Promise<SupervisorReport> {
         }
       }
 
+      // EXIGENCIA: si las fuentes no cuadran, escalar a FAIL aunque
+      // los conteos individuales se vieran OK. Sirley necesita que TODO
+      // cuadre — no podemos ser paisaje.
+      if (fuentesNoCuadran && chequeo.estado === "ok") {
+        chequeo.estado = "warn";
+        chequeo.detalle += ` ⚠ Fuentes desalineadas (Drive=${chequeo.drive_count}, Sheet=${chequeo.sheet_count}, Events=${chequeo.events_count})`;
+      }
+      if (tieneDuplicados && chequeo.estado === "ok") {
+        chequeo.estado = "warn";
+        chequeo.detalle += ` ⚠ ${chequeo.duplicados_drive.length} grupos duplicados en Drive`;
+      }
+      // Si el cliente tiene > 5% de gap → CRÍTICO (no warn)
+      const totalMayor = Math.max(chequeo.drive_count, chequeo.sheet_count, chequeo.events_count, 1);
+      const gapMaximo = Math.max(
+        Math.abs(chequeo.drive_count - chequeo.sheet_count),
+        Math.abs(chequeo.events_count - chequeo.sheet_count),
+      );
+      if (gapMaximo / totalMayor > 0.05) {
+        chequeo.estado = "fail";
+        chequeo.detalle += ` 🚨 Gap > 5% — REQUIERE INTERVENCIÓN`;
+      }
+
       // Recalcular estado final
       if (chequeo.estado === "fail") {
         report.clientes_fail++;
         report.requiere_atencion_critica = true;
       } else if (chequeo.estado === "warn") {
         report.clientes_warn++;
+        // EXIGENCIA: warn también puede ser crítico si afecta a varios clientes
+        if (fuentesNoCuadran) report.requiere_atencion_critica = true;
       } else if (chequeo.estado === "ok") {
         report.clientes_ok++;
       }

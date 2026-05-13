@@ -73,15 +73,49 @@ export default async (req: Request) => {
       }
     }
 
-    const status: "ok" | "warn" | "fail" =
-      report.errores.length === 0 ? "ok" : "warn";
+    // STATUS EXIGENTE (no ser paisaje):
+    //   fail = errores graves del agente
+    //   warn = quedaron items pendientes que requieren atención humana:
+    //     - no_identificables que NO se pudieron clasificar
+    //     - filas_sheet_duplicadas con accion='solo_reportar_por_diferencia_monto'
+    //       (mismo número pero monto distinto → ambiguo, requiere ojo humano)
+    //   ok   = todo limpio
+    const duplicadosNoResueltos = (report.filas_sheet_duplicadas ?? []).filter(
+      (d) => d.accion === "solo_reportar_por_diferencia_monto",
+    ).length;
+    const duplicadosBorrados = (report.filas_sheet_duplicadas ?? [])
+      .filter((d) => d.accion === "borradas_auto")
+      .reduce((s, d) => s + d.filas_borradas.length, 0);
+    const requiereAtencionHumana =
+      report.no_identificables > 0 || duplicadosNoResueltos > 0;
+
+    let status: "ok" | "warn" | "fail";
+    if (report.errores.length > 0) {
+      status = "fail";
+    } else if (requiereAtencionHumana) {
+      status = "warn";
+    } else {
+      status = "ok";
+    }
+
+    const summary = [
+      `${duplicadosBorrados} filas duplicadas BORRADAS del Sheet`,
+      `${report.duplicados_movidos} PDFs duplicados a Papelera`,
+      `${report.facturas_recuperadas} recuperadas`,
+      `${report.no_identificables} no identificables → REVISAR_MANUAL`,
+      duplicadosNoResueltos > 0
+        ? `⚠ ${duplicadosNoResueltos} grupos con monto distinto requieren revisión`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
 
     if (runId) {
       await recordRunEnd({
         runId,
         status,
         durationMs: Date.now() - startedAt,
-        summary: `${report.duplicados_movidos} duplicados, ${report.facturas_recuperadas} recuperadas, ${report.no_identificables} no id.`,
+        summary,
         payload: report as any,
       });
     }

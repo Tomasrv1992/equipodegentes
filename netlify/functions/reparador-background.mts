@@ -78,15 +78,38 @@ export default async (req: Request) => {
       }
     }
 
-    const status: "ok" | "warn" | "fail" =
-      report.errores.length === 0 ? "ok" : "warn";
+    // STATUS EXIGENTE (no ser paisaje):
+    //   fail = quedan clientes con las 5 fuentes desalineadas tras auto-reparar
+    //   warn = hubo errores no críticos O hay huérfanos/sin-pdf residuales
+    //   ok   = TODO cuadra para TODOS los clientes (Bloque B validó)
+    const tieneInconsistentes = report.clientes_inconsistentes.length > 0;
+    const tieneResiduales =
+      report.pdfs_huerfanos.length > 0 || report.filas_sin_pdf.length > 0;
+    const tieneErrores = report.errores.length > 0;
+
+    let status: "ok" | "warn" | "fail";
+    if (tieneInconsistentes) {
+      status = "fail"; // los 5 fuentes NO cuadran → SUPER crítico
+    } else if (tieneErrores || tieneResiduales) {
+      status = "warn";
+    } else {
+      status = "ok";
+    }
+
+    const summary = [
+      `${report.filas_reparadas.length} reparadas`,
+      `${report.pdfs_huerfanos.length + report.filas_sin_pdf.length} para revisar`,
+      tieneInconsistentes
+        ? `⚠ ${report.clientes_inconsistentes.length} clientes con 5 fuentes desalineadas: ${report.clientes_inconsistentes.join(", ")}`
+        : "✓ todos los clientes con fuentes alineadas",
+    ].join(" · ");
 
     if (runId) {
       await recordRunEnd({
         runId,
         status,
         durationMs: Date.now() - startedAt,
-        summary: `${report.filas_reparadas.length} reparadas, ${report.pdfs_huerfanos.length + report.filas_sin_pdf.length} para revisar`,
+        summary,
         payload: report as any,
       });
     }

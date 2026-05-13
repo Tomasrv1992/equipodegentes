@@ -54,6 +54,22 @@ export interface AccionLimpiador {
 }
 
 /**
+ * Detalle de fila basura detectada en Sheet (Bloque G).
+ * Fila con número inválido, fecha futura, o monto raro.
+ * El limpiador la marca y la mueve a pestaña "Revisar_Manual" si existe.
+ */
+export interface FilaBasura {
+  cliente_slug: string;
+  mes: string;
+  fila_sheet: number; // 1-based
+  numero: string;
+  proveedor: string;
+  total: number;
+  motivos: string[]; // ["numero: ..."]
+  accion: "borrada" | "marcada" | "solo_reportar";
+}
+
+/**
  * Detalle de filas Sheet duplicadas detectadas y borradas (Bloque C).
  * Misma factura registrada N veces en el Sheet del cliente.
  *
@@ -97,6 +113,8 @@ export interface LimpiadorReport {
   acciones: AccionLimpiador[];
   /** Bloque C: filas duplicadas detectadas en Sheet (mismo num+NIT+proveedor). */
   filas_sheet_duplicadas: FilaSheetDuplicada[];
+  /** Bloque G: filas con datos inválidos detectadas en Sheet (basura). */
+  filas_basura: FilaBasura[];
   errores: Array<{ cliente_slug: string; error: string }>;
 }
 
@@ -125,6 +143,7 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
     costo_llm_usd: 0,
     acciones: [],
     filas_sheet_duplicadas: [],
+    filas_basura: [],
     errores: [],
   };
 
@@ -285,6 +304,27 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
         }
       } catch (err: any) {
         console.warn(`[limpiador-9] detección duplicados falló: ${err.message}`);
+      }
+
+      // 10. BLOQUE G: detectar filas BASURA en Sheet (número inválido, fecha rara, etc.)
+      // Estos son rows que tienen datos malos del cron viejo o capturas manuales:
+      //   - "0,00E+00" como número
+      //   - "mayo de 2026" como número
+      //   - "PRUEBA 002" como número
+      //   - Fechas futuras
+      //   - Montos negativos
+      // Las marcamos en col concepto con "[REVISAR-BASURA: motivo]" para que el
+      // operador humano las vea fácilmente en el Sheet y decida.
+      try {
+        const basura = await detectarFilasBasura(sheets, cred.sheet_id!, tabName, c.slug, mesActual, year);
+        if (basura.length > 0) {
+          report.filas_basura.push(...basura);
+          console.log(
+            `[limpiador-10] cliente=${c.slug} → ${basura.length} filas con datos inválidos detectadas en ${tabName}`,
+          );
+        }
+      } catch (err: any) {
+        console.warn(`[limpiador-10] detección basura falló: ${err.message}`);
       }
 
       report.clientes_procesados++;
@@ -916,6 +956,108 @@ function normalizeProveedor(s: string): string {
     .replace(/\b(sas|s\.a\.s\.?|ltda|s\.a\.|sa)\b/gi, "")
     .replace(/[^\w]/g, "")
     .trim();
+}
+
+/**
+ * BLOQUE G: detecta filas BASURA en el Sheet del cliente.
+ *
+ * Casos típicos de basura encontrados en producción:
+ *   - Número de factura inválido ("0,00E+00", "mayo de 2026", "PRUEBA 002")
+ *   - Fecha futura o muy antigua
+ *   - Monto negativo o excesivo
+ *
+ * No las borra. Las marca añadiendo "[REVISAR-BASURA: motivo]" al inicio
+ * de la columna L (Concepto), para que el operador humano las vea fácilmente
+ * en el Sheet y decida si borrar o corregir.
+ *
+ * Cols 15 nueva estructura:
+ *   B=Fecha(1), D=NIT(3), E=#Doc(4), K=Total(10), L=Concepto(11)
+ */
+async function detectarFilasBasura(
+  sheets: any,
+  sheetId: string,
+  tabName: string,
+  clienteSlug: string,
+  mesActual: number,
+  year: number,
+): Promise<FilaBasura[]> {
+  const { validarFacturaCompleta } = await import(
+    "../../../agentes/Equipo-facturacion/lib/validations"
+  );
+
+  const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+  let rows: any[][] = [];
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `${tabRange}!A2:O1000`,
+    });
+    rows = res.data.values ?? [];
+  } catch {
+    return [];
+  }
+
+  const basura: FilaBasura[] = [];
+  const actualizacionesBatch: Array<{ range: string; values: string[][] }> = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const numero = String(r[4] || "").trim();
+    if (!numero) continue; // fila vacía: ignorar
+
+    const fecha = String(r[1] || "").trim();
+    const nit = String(r[3] || "").trim();
+    const proveedor = String(r[2] || "").trim();
+    const total = parseMonto(r[10]);
+    const conceptoActual = String(r[11] || "").trim();
+
+    const resultado = validarFacturaCompleta({ numero, fecha, nit, total, proveedor });
+    if (resultado.esValida) continue; // todo OK
+
+    // Skip si ya está marcado como REVISAR (evitar re-marcar y crear loops)
+    if (conceptoActual.startsWith("[REVISAR")) continue;
+
+    const sheetRow = i + 2;
+    const nuevoConcepto = `[REVISAR-BASURA: ${resultado.motivos.join("; ")}] ${conceptoActual}`;
+
+    basura.push({
+      cliente_slug: clienteSlug,
+      mes: `${year}-${String(mesActual).padStart(2, "0")}`,
+      fila_sheet: sheetRow,
+      numero,
+      proveedor,
+      total,
+      motivos: resultado.motivos,
+      accion: "marcada",
+    });
+
+    actualizacionesBatch.push({
+      range: `${tabRange}!L${sheetRow}`,
+      values: [[nuevoConcepto]],
+    });
+  }
+
+  // Aplicar las marcas en bulk
+  if (actualizacionesBatch.length > 0) {
+    try {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+          valueInputOption: "RAW",
+          data: actualizacionesBatch,
+        },
+      });
+      console.log(
+        `[limpiador-10] cliente=${clienteSlug} → ${basura.length} filas basura MARCADAS con [REVISAR-BASURA] en col L`,
+      );
+    } catch (err: any) {
+      console.warn(`[limpiador-10] error marcando filas: ${err.message}`);
+      // Si falla el update, cambiar accion a "solo_reportar"
+      for (const b of basura) b.accion = "solo_reportar";
+    }
+  }
+
+  return basura;
 }
 
 /** Parsea monto del Sheet (formato $1.234.567 o $1,234,567.89). */

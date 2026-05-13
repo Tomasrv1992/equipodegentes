@@ -1804,6 +1804,28 @@ async function processOne(
     }
     if (!data) return { skip: true, reason: "no-es-factura-dian", subject };
 
+    // BLOQUE I — Validación preventiva exigente.
+    // Antes de meter la factura al Sheet, validamos formato del número,
+    // fecha, monto, etc. Si falla, NO se procesa y queda en Gmail con label
+    // de Procesado para evitar reprocesos infinitos.
+    const { validarFacturaCompleta } = await import("./validations");
+    const validacion = validarFacturaCompleta({
+      numero: data.numero,
+      fecha: data.fecha,
+      nit: data.nit,
+      total: data.total,
+      proveedor: data.proveedor,
+    });
+    if (!validacion.esValida) {
+      await markEmailProcessed(gmail, messageId, labelId);
+      console.log(`[skip-validacion-dian] factura inválida: ${validacion.motivos.join("; ")}`);
+      return {
+        skip: true,
+        reason: `factura-invalida: ${validacion.motivos.join("; ")}`,
+        subject,
+      };
+    }
+
     // year/month derivados del IssueDate del XML (no del header del email).
     const issue = data.fecha ? new Date(data.fecha) : new Date();
     const year = issue.getFullYear();
@@ -2124,6 +2146,27 @@ async function processCuentaCobroDocx(
       };
     }
 
+    // BLOQUE I — Validación preventiva exigente para cuentas de cobro
+    {
+      const { validarFacturaCompleta } = await import("./validations");
+      const v = validarFacturaCompleta({
+        numero: extracted.numero,
+        fecha: extracted.fecha,
+        nit: extracted.nit,
+        total: extracted.total,
+        proveedor: extracted.proveedor,
+      });
+      if (!v.esValida) {
+        await markEmailProcessed(gmail, messageId, labelProcesadoId);
+        console.log(`[skip-validacion-docx] cuenta-cobro inválida: ${v.motivos.join("; ")}`);
+        return {
+          skip: true,
+          reason: `docx-invalida: ${v.motivos.join("; ")}`,
+          subject,
+        };
+      }
+    }
+
     // Skip si el documento es una cuenta de cobro EMITIDA por el propio cliente.
     // Doble check: (a) NIT extraído coincide con nit_cliente, O (b) nombre del
     // proveedor extraído por el LLM coincide con el nombre del cliente normalizado.
@@ -2312,6 +2355,27 @@ async function processGenericPdf(
         reason: `pdf-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
         subject,
       };
+    }
+
+    // BLOQUE I — Validación preventiva exigente para PDFs
+    {
+      const { validarFacturaCompleta } = await import("./validations");
+      const v = validarFacturaCompleta({
+        numero: extracted.numero,
+        fecha: extracted.fecha,
+        nit: extracted.nit,
+        total: extracted.total,
+        proveedor: extracted.proveedor,
+      });
+      if (!v.esValida) {
+        await markEmailProcessed(gmail, messageId, labelProcesadoId);
+        console.log(`[skip-validacion-pdf] pdf inválido: ${v.motivos.join("; ")}`);
+        return {
+          skip: true,
+          reason: `pdf-invalido: ${v.motivos.join("; ")}`,
+          subject,
+        };
+      }
     }
 
     // Skip si el PDF es factura/recibo EMITIDO por el propio cliente.

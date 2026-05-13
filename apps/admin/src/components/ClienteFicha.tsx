@@ -18,6 +18,7 @@ import Pill from "./Pill";
 import Sparkline from "./Sparkline";
 import Kpis from "./Kpis";
 import MonthlyBars from "./MonthlyBars";
+import OnboardingProgress from "./OnboardingProgress";
 import { sparkRunsByDay } from "../lib/timeline";
 import type { Cliente, AgentRun, ClientAgent, Agente } from "../types";
 
@@ -214,6 +215,9 @@ export default function ClienteFicha({ slug }: { slug: string }) {
           </div>
         </div>
       </div>
+
+      {/* Panel LIVE del onboarding (solo aparece si está en proceso o terminó recién) */}
+      <OnboardingProgress clienteId={cliente.id} />
 
       {/* KPIs — orden operacional: día → mes → histórico */}
       <Kpis

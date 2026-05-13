@@ -198,6 +198,7 @@ export async function runMonitor(): Promise<MonitorReport> {
     const procesadas = Number(payload.procesadas ?? 0);
     const errores = Number(payload.errores ?? 0);
     const saltadas = Number(payload.saltadas ?? 0);
+    const repetidas = Number(payload.repetidas ?? 0);
 
     let estado: ClienteCheckResult["estado"];
     if (lastRun.status === "ok") estado = "ok";
@@ -209,6 +210,7 @@ export async function runMonitor(): Promise<MonitorReport> {
       procesadas,
       errores,
       saltadas,
+      repetidas,
       error_message: lastRun.error_message,
     });
 
@@ -323,14 +325,15 @@ function buildDetalle(
     procesadas: number;
     errores: number;
     saltadas: number;
+    repetidas: number;
     error_message: string | null;
   },
 ): string {
   if (estado === "ok") {
-    return `OK — ${ctx.procesadas} procesadas, ${ctx.saltadas} saltadas.`;
+    return `OK — ${ctx.procesadas} procesadas, ${ctx.repetidas} repetidas, ${ctx.saltadas} saltadas.`;
   }
   if (estado === "warn") {
-    return `WARN — ${ctx.procesadas} procesadas, ${ctx.errores} errores, ${ctx.saltadas} saltadas. ${ctx.error_message ?? ""}`;
+    return `WARN — ${ctx.procesadas} procesadas, ${ctx.errores} errores, ${ctx.repetidas} repetidas, ${ctx.saltadas} saltadas. ${ctx.error_message ?? ""}`;
   }
   if (estado === "fail") {
     return `FAIL — ${ctx.error_message ?? "sin mensaje"}`;

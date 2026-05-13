@@ -26,9 +26,6 @@ export default function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/diagnostico" className={navClass}>
               Diagnóstico
             </NavLink>
-            <NavLink to="/feed" className={navClass}>
-              Feed
-            </NavLink>
           </nav>
 
           <div className="ml-auto flex items-center gap-3">

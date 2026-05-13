@@ -200,7 +200,10 @@ export interface ErrorRow {
 export interface PipelineResult {
   procesadas: ProcessedRow[];
   errores: ErrorRow[];
+  /** Saltadas: no es factura (filtro pre-LLM, sender/subject, LLM dice "no es factura"). */
   saltadas: SkippedRow[];
+  /** Repetidas: factura válida pero YA estaba en el Sheet (dedup contra cache). */
+  repetidas: SkippedRow[];
   /**
    * Estadísticas de uso del LLM en este run.
    * Permite trackear el costo por cliente desde el panel admin.
@@ -325,6 +328,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
       procesadas: [],
       errores: [],
       saltadas: [],
+      repetidas: [],
       dryRun: { query: searchQuery, total: emails.length, sample: detailed },
     };
   }
@@ -350,7 +354,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     }
   };
 
-  const result: PipelineResult = { procesadas: [], errores: [], saltadas: [] };
+  const result: PipelineResult = { procesadas: [], errores: [], saltadas: [], repetidas: [] };
   const llmTracker: LlmTracker = { calls: 0, preFilteredOut: 0 };
 
   // Contexto de retenciones para pasar a processOne (puede ser null si cliente
@@ -405,7 +409,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
         if ("ok" in r && r.ok) {
           result.procesadas.push(r);
         } else if ("dup" in r && r.dup) {
-          result.saltadas.push({ messageId: e.id!, motivo: r.motivo, asunto: r.subject });
+          result.repetidas.push({ messageId: e.id!, motivo: r.motivo, asunto: r.subject });
         } else if ("skip" in r && r.skip) {
           result.saltadas.push({ messageId: e.id!, motivo: r.reason, asunto: r.subject });
         }
@@ -418,7 +422,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   console.log(`[concurrency] processing ${emails.length} emails with ${CONCURRENCY} workers`);
   const startTime = Date.now();
   await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-  console.log(`[concurrency] done in ${Math.round((Date.now() - startTime) / 1000)}s · ${result.procesadas.length} procesadas, ${result.saltadas.length} saltadas, ${result.errores.length} errores`);
+  console.log(`[concurrency] done in ${Math.round((Date.now() - startTime) / 1000)}s · ${result.procesadas.length} procesadas, ${result.saltadas.length} saltadas, ${result.repetidas.length} repetidas, ${result.errores.length} errores`);
 
   // Adjuntar stats LLM al result (importante: aunque sea 0 si nunca llamó)
   result.llmStats = {

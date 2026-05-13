@@ -2,7 +2,6 @@ import { Routes, Route } from "react-router-dom";
 import LoginGate from "./components/LoginGate";
 import Layout from "./components/Layout";
 import Home from "./routes/home";
-import FeedRoute from "./routes/feed";
 import RunRoute from "./routes/run";
 import ClienteRoute from "./routes/cliente";
 import AgenteRoute from "./routes/agente";
@@ -29,7 +28,6 @@ export default function App() {
             <Layout>
               <Routes>
                 <Route path="/" element={<Home />} />
-                <Route path="/feed" element={<FeedRoute />} />
                 <Route path="/run/:id" element={<RunRoute />} />
                 <Route path="/cliente/:slug" element={<ClienteRoute />} />
                 <Route path="/agentes" element={<AgentesList />} />

@@ -21,6 +21,10 @@
   function = "admin-update-retention-rules"
   path = "/api/admin/update-retention-rules"
 
+[[edge_functions]]
+  function = "diagnostico-reporte"
+  path = "/api/diagnostico-reporte"
+
 # OAuth flow del cliente (Fase 3)
 [[edge_functions]]
   function = "auth-google-start"

@@ -282,6 +282,7 @@ export default async (req: Request) => {
     procesadas: result.procesadas.length,
     errores: result.errores.length,
     saltadas: result.saltadas.length,
+    repetidas: result.repetidas.length,
     sample: result.procesadas.slice(0, 3),
   }));
 
@@ -291,8 +292,9 @@ export default async (req: Request) => {
       const status: "ok" | "warn" = result.errores.length > 0 ? "warn" : "ok";
       const summary =
         `${result.procesadas.length} procesadas` +
-        (result.errores.length ? ` · ${result.errores.length} errores` : "") +
-        (result.saltadas.length ? ` · ${result.saltadas.length} saltadas` : "");
+        (result.repetidas.length ? ` · ${result.repetidas.length} repetidas` : "") +
+        (result.saltadas.length ? ` · ${result.saltadas.length} saltadas` : "") +
+        (result.errores.length ? ` · ${result.errores.length} errores` : "");
       await recordRunEnd({
         runId,
         status,
@@ -302,6 +304,7 @@ export default async (req: Request) => {
           procesadas: result.procesadas.length,
           errores: result.errores.length,
           saltadas: result.saltadas.length,
+          repetidas: result.repetidas.length,
           // Tracking de uso LLM para visibilidad de costo por cliente/run
           llm_calls: result.llmStats?.calls ?? 0,
           llm_cost_usd: result.llmStats?.estimatedCostUsd ?? 0,

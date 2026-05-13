@@ -21,18 +21,24 @@ import {
 } from "../lib/metrics";
 
 // Definición de la jerarquía. Si un agente no aparece acá, se muestra "standalone".
+// Slugs de agentes que NO se muestran en "Otros agentes" porque están
+// inactivos o no son parte del producto actual.
+const AGENTES_OCULTOS = new Set(["cartera"]);
+
 const EQUIPOS: Array<{
   id: string;
-  nombre: string;
+  categoria: string;
+  agenteNombre: string;
   descripcion: string;
   agentePrincipal: string;
   agentesInternos: Array<{ id: string; nombre: string; rol: string; hora: string }>;
 }> = [
   {
     id: "equipo-facturacion",
-    nombre: "Equipo Facturación",
+    categoria: "Equipo Facturación",
+    agenteNombre: "Procesador facturas de compra",
     descripcion:
-      "Pipeline automático de cuentas por pagar: lee Gmail, identifica facturas DIAN y no-DIAN, organiza en Drive y registra en Sheet. Los 4 agentes internos garantizan que el resultado final sea consistente.",
+      "Pipeline automático de cuentas por pagar: lee Gmail, identifica facturas DIAN y no-DIAN, organiza en Drive y registra en Sheet. Los 4 agentes administrativos validan y reparan el resultado.",
     agentePrincipal: "facturacion",
     agentesInternos: [
       { id: "monitor", nombre: "Monitor", rol: "Detecta gaps y zombies", hora: "08:00" },
@@ -65,7 +71,8 @@ export default function AgentesList() {
   }
 
   // Standalone: agentes que existen en DB pero no están listados en ningún equipo
-  const standalone = agentes.filter((a) => !idsAgrupados.has(a.id));
+  // ni en AGENTES_OCULTOS (inactivos, en desarrollo)
+  const standalone = agentes.filter((a) => !idsAgrupados.has(a.id) && !AGENTES_OCULTOS.has(a.id));
 
   return (
     <div>
@@ -104,10 +111,13 @@ export default function AgentesList() {
               to={`/agente/${principal.id}`}
               className="card card-hover no-underline text-ink block mb-3"
             >
+              <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-accent font-medium mb-1.5">
+                {eq.categoria}
+              </div>
               <div className="flex items-baseline gap-2 mb-2">
                 <span className="w-2 h-2 rounded-full bg-accent translate-y-[-2px]" />
                 <h2 className="font-display text-2xl font-semibold tracking-tighter text-ink m-0">
-                  {eq.nombre}
+                  {eq.agenteNombre}
                 </h2>
                 {!principal.activo && (
                   <span className="pill pill-off ml-auto">Inactivo</span>
@@ -137,7 +147,7 @@ export default function AgentesList() {
             {/* Agentes internos del equipo */}
             <div className="ml-6 pl-4 border-l-2 border-edge-2">
               <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase mb-2">
-                Agentes internos · disparados después de Facturación
+                Agentes administrativos · validan y reparan el resultado del procesador
               </div>
               <div className="grid grid-cols-4 gap-2">
                 {eq.agentesInternos.map((sub) => {

@@ -153,36 +153,52 @@ Generá un reporte ejecutivo de máximo 250 palabras, en español rioplatense/co
 
 Tono: directo, sin floritura, como hablándole a un dueño de empresa que tiene 5 minutos. NO uses markdown headings (### etc), usá negritas con asteriscos. Empezá YA con el reporte, sin preámbulo.`;
 
+  // Modelos a intentar en orden (si uno falla con 404/400, probar el siguiente)
+  const modelosFallback = ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "claude-3-5-haiku-latest"];
   let modelText = "";
-  try {
-    const claudeResp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5",
-        max_tokens: 800,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    if (!claudeResp.ok) {
-      const errTxt = await claudeResp.text();
-      return new Response(
-        JSON.stringify({ error: `Anthropic ${claudeResp.status}: ${errTxt.slice(0, 200)}` }),
-        { status: 502, headers: { "content-type": "application/json" } },
-      );
+  let lastError = "";
+  for (const model of modelosFallback) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 25_000); // edge functions tienen ~30s
+      const claudeResp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model, max_tokens: 800, messages: [{ role: "user", content: prompt }] }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!claudeResp.ok) {
+        const errTxt = await claudeResp.text();
+        lastError = `Anthropic ${claudeResp.status} con modelo=${model}: ${errTxt.slice(0, 200)}`;
+        console.error("[diagnostico-reporte]", lastError);
+        if (claudeResp.status === 404 || claudeResp.status === 400) continue; // probar siguiente modelo
+        return new Response(JSON.stringify({ error: lastError }), {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const json = (await claudeResp.json()) as any;
+      const block = (json.content ?? []).find((b: any) => b.type === "text");
+      modelText = block?.text ?? "(sin contenido)";
+      break; // éxito
+    } catch (err: any) {
+      lastError = `Claude failed con modelo=${model}: ${err.message}`;
+      console.error("[diagnostico-reporte]", lastError);
+      continue;
     }
-    const json = (await claudeResp.json()) as any;
-    const block = (json.content ?? []).find((b: any) => b.type === "text");
-    modelText = block?.text ?? "(sin contenido)";
-  } catch (err: any) {
-    return new Response(JSON.stringify({ error: `Claude failed: ${err.message}` }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
+  }
+
+  if (!modelText) {
+    return new Response(
+      JSON.stringify({ error: `Todos los modelos fallaron. Último: ${lastError}` }),
+      { status: 502, headers: { "content-type": "application/json" } },
+    );
   }
 
   return new Response(

@@ -36,7 +36,7 @@ type ClienteRow = {
 };
 
 const AGENTES_ORDEN = [
-  { id: "facturacion", nombre: "Facturación", hora: "07:00", emoji: "📥" },
+  { id: "facturacion", nombre: "Procesador facturas de compra", hora: "07:00", emoji: "📥" },
   { id: "monitor", nombre: "Monitor", hora: "08:00", emoji: "🔍" },
   { id: "reparador", nombre: "Reparador", hora: "08:15", emoji: "🔧" },
   { id: "limpiador", nombre: "Limpiador", hora: "08:30", emoji: "🧹" },
@@ -209,11 +209,23 @@ export default function DiagnosticoPage() {
       {/* === Botón reporte ejecutivo === */}
       <ReporteEjecutivoSection />
 
-      {/* === 5 cards de agentes con stats integradas === */}
+      {/* === Card principal: el Procesador === */}
+      <section className="mb-3">
+        <h2 className="label mb-3">Procesador · agente principal</h2>
+        <FacturacionCard
+          agente={AGENTES_ORDEN[0]}
+          agg={aggFact}
+          clientesOp={clientesOp.length}
+          big
+        />
+      </section>
+
+      {/* === 4 cards administrativos === */}
       <section className="mb-8">
-        <h2 className="label mb-3">Agentes diarios</h2>
-        <div className="grid grid-cols-5 gap-3">
-          <FacturacionCard agente={AGENTES_ORDEN[0]} agg={aggFact} clientesOp={clientesOp.length} />
+        <div className="flex items-baseline justify-between mb-3">
+          <h2 className="label">Agentes administrativos · validan y reparan después del procesador</h2>
+        </div>
+        <div className="grid grid-cols-4 gap-3">
           <MonitorCard agente={AGENTES_ORDEN[1]} run={monitorRun} />
           <ReparadorCard agente={AGENTES_ORDEN[2]} run={reparadorRun} payload={aggRep} />
           <LimpiadorCard agente={AGENTES_ORDEN[3]} run={limpiadorRun} payload={aggLimp} />
@@ -368,39 +380,105 @@ function FacturacionCard({
   agente,
   agg,
   clientesOp,
+  big = false,
 }: {
   agente: { nombre: string; hora: string; emoji: string };
   agg: ReturnType<typeof aggregateFacturacion>;
   clientesOp: number;
+  big?: boolean;
 }) {
   const tieneRun = agg.clientesConRun > 0;
   const status: "ok" | "warn" | "fail" = !tieneRun ? "fail" : agg.errores > 0 ? "warn" : "ok";
+  const totalCorreos = agg.procesadas + agg.repetidas + agg.saltadas + agg.errores;
+
+  if (!big) {
+    // Versión compacta (no se usa actualmente, pero queda por si)
+    return (
+      <div className="card">
+        <CardHeader agente={agente} run={undefined} />
+        <div className="mt-3 pt-2.5 border-t border-edge-2 space-y-1.5">
+          <StatLine label="Procesadas" value={agg.procesadas} colorIfPos="ok" />
+        </div>
+      </div>
+    );
+  }
+
+  // Versión grande (1 fila, 6 columnas con stats)
   return (
     <div className="card">
-      <div className="flex items-baseline justify-between mb-2">
-        <div>
-          <div className="text-base mb-0.5">{agente.emoji}</div>
-          <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase">{agente.hora}</div>
-          <div className="font-display text-sm font-semibold tracking-tighter">{agente.nombre}</div>
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-start gap-3">
+          <div className="text-2xl">{agente.emoji}</div>
+          <div>
+            <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase mb-1">
+              {agente.hora} · agente principal
+            </div>
+            <div className="font-display text-xl font-semibold tracking-tighter">{agente.nombre}</div>
+            <div className="font-mono text-[10px] text-ink-4 tracking-[0.04em] mt-1">
+              {agg.clientesConRun}/{clientesOp} clientes corrieron hoy
+              {agg.ultimaHora
+                ? ` · último ${new Date(agg.ultimaHora).toLocaleTimeString("es-CO", {
+                    timeZone: "America/Bogota",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}`
+                : ""}
+            </div>
+          </div>
         </div>
         {tieneRun ? <Pill status={status} /> : <span className="font-mono text-[9px] text-ink-4 uppercase">sin run</span>}
       </div>
-      <div className="mt-3 pt-2.5 border-t border-edge-2 space-y-1.5">
-        <StatLine label="Clientes" value={`${agg.clientesConRun}/${clientesOp}`} />
-        <StatLine label="Procesadas" value={agg.procesadas} colorIfPos="ok" />
-        <StatLine label="Repetidas" value={agg.repetidas} colorIfPos="muted" />
-        <StatLine label="Saltadas" value={agg.saltadas} colorIfPos="muted" />
-        <StatLine label="Errores" value={agg.errores} colorIfPos="warn" />
-        <div className="font-mono text-[9px] text-ink-4 mt-2">
-          {agg.ultimaHora
-            ? `Último: ${new Date(agg.ultimaHora).toLocaleTimeString("es-CO", {
-                timeZone: "America/Bogota",
-                hour: "2-digit",
-                minute: "2-digit",
-              })}`
-            : "Aún no corrió"}
-        </div>
+      <div className="grid grid-cols-6 gap-3 pt-3 border-t border-edge-2">
+        <BigStat label="Procesadas" value={agg.procesadas} colorIfPos="ok" sub="facturas nuevas en Sheet" />
+        <BigStat label="Repetidas" value={agg.repetidas} colorIfPos="muted" sub="ya estaban (dedup OK)" />
+        <BigStat label="Saltadas" value={agg.saltadas} colorIfPos="muted" sub="correos no-factura" />
+        <BigStat label="Errores" value={agg.errores} colorIfPos="warn" sub="revisar" />
+        <BigStat label="Correos leídos" value={totalCorreos} sub="total = suma izquierda" muted />
+        <BigStat
+          label="Costo LLM"
+          value={`$${agg.llmCostUsd.toFixed(3)}`}
+          sub={`${agg.llmCalls} llamadas Claude`}
+          muted
+        />
       </div>
+    </div>
+  );
+}
+
+function BigStat({
+  label,
+  value,
+  colorIfPos = "ink",
+  sub,
+  muted,
+}: {
+  label: string;
+  value: number | string;
+  colorIfPos?: "ok" | "warn" | "muted" | "ink";
+  sub?: string;
+  muted?: boolean;
+}) {
+  const numeric = typeof value === "number" ? value : Number(String(value).replace(/[^\d.]/g, ""));
+  const isPositive = numeric > 0;
+  const color =
+    muted || !isPositive
+      ? "text-ink"
+      : colorIfPos === "ok"
+        ? "text-ok"
+        : colorIfPos === "warn"
+          ? "text-accent"
+          : colorIfPos === "muted"
+            ? "text-ink-3"
+            : "text-ink";
+  return (
+    <div>
+      <div className="label-tight text-ink-3 mb-1">{label}</div>
+      <div className={`font-display text-2xl font-medium tracking-[-0.02em] tabular-nums leading-none mb-1 ${color}`}>
+        {value}
+      </div>
+      {sub && (
+        <div className="font-mono text-[9px] text-ink-4 tracking-[0.04em] uppercase">{sub}</div>
+      )}
     </div>
   );
 }
@@ -408,13 +486,14 @@ function FacturacionCard({
 function MonitorCard({ agente, run }: { agente: { nombre: string; hora: string; emoji: string }; run: RunRow | undefined }) {
   const p = run?.payload ?? {};
   return (
-    <div className="card">
+    <div className="card" title="Monitor no usa LLM — solo consulta agent_runs">
       <CardHeader agente={agente} run={run} />
       <div className="mt-3 pt-2.5 border-t border-edge-2 space-y-1.5">
         <StatLine label="Total" value={p.clientes_total ?? 0} />
         <StatLine label="OK" value={p.clientes_ok ?? 0} colorIfPos="ok" />
         <StatLine label="Alertas" value={p.clientes_con_alerta ?? 0} colorIfPos="warn" />
         <StatLine label="Zombies" value={p.zombies_cerrados ?? 0} colorIfPos="muted" />
+        <StatLine label="Costo LLM" value="—" colorIfPos="muted" />
         <CardFooter run={run} />
       </div>
     </div>
@@ -434,12 +513,19 @@ function ReparadorCard({
   const huerfanos = payload.pdfs_huerfanos?.length ?? 0;
   const sinPdf = payload.filas_sin_pdf?.length ?? 0;
   return (
-    <div className="card">
+    <div className="card" title="Reparador no usa LLM — matching textual proveedor/número">
       <CardHeader agente={agente} run={run} />
       <div className="mt-3 pt-2.5 border-t border-edge-2 space-y-1.5">
         <StatLine label="Reparadas" value={reparadas} colorIfPos="ok" />
-        <StatLine label="Huérfanos" value={huerfanos} colorIfPos="warn" />
-        <StatLine label="Sin PDF" value={sinPdf} colorIfPos="warn" />
+        <StatLine
+          label="Huérfanos"
+          value={huerfanos}
+          colorIfPos="warn"
+        />
+        <div title="Filas en Sheet sin PDF correspondiente en Drive">
+          <StatLine label="Sin PDF" value={sinPdf} colorIfPos="warn" />
+        </div>
+        <StatLine label="Costo LLM" value="—" colorIfPos="muted" />
         <CardFooter run={run} />
       </div>
     </div>
@@ -489,13 +575,14 @@ function SupervisorCard({
   const fail = payload.clientes_fail ?? 0;
   const retriggers = payload.retriggers_disparados ?? 0;
   return (
-    <div className="card">
+    <div className="card" title="Supervisor no usa LLM — valida con SQL queries">
       <CardHeader agente={agente} run={supRun} />
       <div className="mt-3 pt-2.5 border-t border-edge-2 space-y-1.5">
         <StatLine label="OK" value={ok} colorIfPos="ok" />
         <StatLine label="Warn" value={warn} colorIfPos="warn" />
         <StatLine label="Fail" value={fail} colorIfPos="warn" />
         <StatLine label="Retriggers" value={retriggers} colorIfPos="muted" />
+        <StatLine label="Costo LLM" value="—" colorIfPos="muted" />
         <CardFooter run={run} />
       </div>
     </div>
@@ -606,14 +693,26 @@ function DrilldownSection({
 
   const huerfanos = reparadorPayload.pdfs_huerfanos ?? [];
   const sinPdf = reparadorPayload.filas_sin_pdf ?? [];
-  const noId = limpiadorPayload.no_identificables_lista ?? [];
-  const retriggers = supervisorPayload.retriggers ?? supervisorPayload.acciones ?? [];
+
+  // No identificables: vienen en limpiador.acciones[] con tipo='no_identificable'
+  const accionesLimp = (limpiadorPayload.acciones ?? []) as Array<any>;
+  const noId = accionesLimp.filter((a) => a.tipo === "no_identificable");
+
+  // Retriggers: vienen en supervisor.chequeos[].acciones_tomadas (array de strings)
+  // Aplanamos a lista con cliente_slug + descripción
+  const chequeosSup = (supervisorPayload.chequeos ?? []) as Array<any>;
+  const retriggers: Array<{ cliente_slug: string; motivo: string }> = [];
+  for (const ch of chequeosSup) {
+    for (const accion of ch.acciones_tomadas ?? []) {
+      retriggers.push({ cliente_slug: ch.cliente_slug, motivo: accion });
+    }
+  }
 
   const items = [
-    { id: "huerfanos", label: "PDFs huérfanos", count: huerfanos.length, list: huerfanos, color: "warn" },
-    { id: "sin_pdf", label: "Filas sin PDF", count: sinPdf.length, list: sinPdf, color: "warn" },
-    { id: "no_id", label: "No identificables", count: noId.length || (limpiadorPayload.no_identificables ?? 0), list: noId, color: "warn" },
-    { id: "retriggers", label: "Retriggers automáticos", count: retriggers.length || (supervisorPayload.retriggers_disparados ?? 0), list: retriggers, color: "muted" },
+    { id: "huerfanos", label: "PDFs huérfanos", count: huerfanos.length, list: huerfanos, color: "warn", help: "PDFs en Drive sin fila correspondiente en Sheet" },
+    { id: "sin_pdf", label: "Filas sin PDF", count: sinPdf.length, list: sinPdf, color: "warn", help: "Filas en Sheet sin archivo PDF en Drive" },
+    { id: "no_id", label: "No identificables", count: noId.length, list: noId, color: "warn", help: "PDFs huérfanos que el LLM no pudo clasificar" },
+    { id: "retriggers", label: "Retriggers automáticos", count: retriggers.length, list: retriggers, color: "muted", help: "Acciones que el supervisor disparó automáticamente" },
   ];
 
   // Sin items para mostrar
@@ -639,6 +738,7 @@ function DrilldownSection({
             <button
               key={it.id}
               onClick={() => setOpen(isOpen ? null : it.id)}
+              title={it.help}
               className={`card text-left transition-all ${isOpen ? "ring-2 ring-accent" : "hover:ring-1 hover:ring-edge"}`}
             >
               <div className="label-tight text-ink-3 mb-1.5">{it.label}</div>
@@ -721,12 +821,21 @@ function DrilldownDetail({
                   )}
                 </td>
                 <td className="py-2 px-4 text-right font-mono tabular-nums">{items.length}</td>
-                <td className="py-2 px-4 font-mono text-[10px] text-ink-3 truncate max-w-[400px]">
+                <td className="py-2 px-4 font-mono text-[10px] text-ink-3 truncate max-w-[480px]">
                   {items
-                    .slice(0, 2)
-                    .map((it) => it.nombre_archivo ?? it.numero ?? it.proveedor ?? it.motivo ?? JSON.stringify(it).slice(0, 60))
+                    .slice(0, 3)
+                    .map(
+                      (it) =>
+                        it.nombre_archivo ??
+                        it.drive_file_name ??
+                        it.numero ??
+                        it.proveedor ??
+                        it.motivo ??
+                        it.detalle ??
+                        JSON.stringify(it).slice(0, 80),
+                    )
                     .join(" · ")}
-                  {items.length > 2 ? ` …+${items.length - 2}` : ""}
+                  {items.length > 3 ? ` …+${items.length - 3}` : ""}
                 </td>
               </tr>
             );

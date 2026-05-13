@@ -197,6 +197,8 @@ export default function ClienteFicha({ slug }: { slug: string }) {
               <span className="text-ink-4">agentes</span>{" "}
               {activaciones.filter((a) => a.activo).length}
             </span>
+            <span className="text-ink-4">·</span>
+            <ToggleClienteActivo cliente={cliente} />
           </div>
         </div>
 
@@ -1111,5 +1113,45 @@ function RetentionRulesSection({
         </div>
       </div>
     </div>
+  );
+}
+
+// ============================================================================
+// Toggle activo/inactivo del cliente
+// ============================================================================
+
+function ToggleClienteActivo({ cliente }: { cliente: Cliente }) {
+  const qc = useQueryClient();
+  const mut = useMutation({
+    mutationFn: async (nuevoEstado: boolean) => {
+      const { error } = await supabase
+        .from("clientes")
+        .update({ activo: nuevoEstado })
+        .eq("id", cliente.id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["cliente-by-slug"] });
+      qc.invalidateQueries({ queryKey: ["clientes"] });
+    },
+  });
+
+  const yaInactivo = !cliente.activo;
+  const label = yaInactivo ? "reactivar cliente" : "inactivar cliente";
+  const confirmMsg = yaInactivo
+    ? `Reactivar a ${cliente.nombre}?`
+    : `Inactivar a ${cliente.nombre}? Los crons no lo procesarán, pero los datos quedan intactos. Podés reactivarlo cuando quieras.`;
+
+  return (
+    <button
+      onClick={() => {
+        if (window.confirm(confirmMsg)) mut.mutate(yaInactivo);
+      }}
+      disabled={mut.isPending}
+      className="font-mono text-[11px] text-accent hover:underline tracking-[0.04em] disabled:opacity-50"
+      title="Pausa los crons sin borrar datos. Reversible."
+    >
+      {mut.isPending ? "guardando…" : yaInactivo ? `[INACTIVO] · ${label}` : label}
+    </button>
   );
 }

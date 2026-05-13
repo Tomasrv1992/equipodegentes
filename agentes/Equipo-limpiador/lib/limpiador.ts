@@ -363,7 +363,7 @@ async function procesarHuerfano(
     return;
   }
 
-  // 4. LLM identifica
+  // 4. LLM identifica (con contexto del cliente para evitar extraer al deudor)
   let extracted: any = null;
   try {
     const { extractInvoiceFromText } = await import("../../../agentes/Equipo-facturacion/lib/llm-extractor");
@@ -374,6 +374,8 @@ async function procesarHuerfano(
       sender: "(unknown)",
       subject: fname,
       emailDate: new Date().toISOString(),
+      nitCliente,
+      nombreCliente: c.nombre ?? null,
     });
   } catch (err: any) {
     report.no_identificables++;

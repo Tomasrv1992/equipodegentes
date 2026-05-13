@@ -47,6 +47,10 @@ interface ExtractionContext {
   subject?: string;
   /** Fecha del email recibido (fallback si no se extrae del texto). */
   emailDate?: string;
+  /** NIT del cliente (para evitar extraer al cliente como proveedor — self-emitted). */
+  nitCliente?: string | null;
+  /** Nombre del cliente (para reforzar el filtro self-emitted). */
+  nombreCliente?: string | null;
 }
 
 /**
@@ -106,15 +110,34 @@ export async function extractInvoiceFromText(
     const json = parseLlmJson(textBlock.text);
     if (!json) return null;
 
+    // Skip certificados de retención (no son facturas de compra)
+    if (json.es_certificado_retencion === true) {
+      console.log("[llm-extractor] skip: es certificado de retención");
+      return null;
+    }
+
     // Validación mínima
     if (!json.fecha || !json.total || json.total <= 0) {
       return null; // no parece factura válida
     }
 
+    // Validación self-emitted: si el NIT extraído coincide con el del cliente,
+    // significa que el LLM se confundió (probable que extrajo al deudor en vez del proveedor).
+    const nitExtraido = String(json.nit || "").replace(/\D+/g, "");
+    const nitClienteNorm = ctx.nitCliente
+      ? String(ctx.nitCliente).replace(/\D+/g, "")
+      : null;
+    if (nitClienteNorm && nitExtraido && nitExtraido === nitClienteNorm) {
+      console.log(
+        `[llm-extractor] skip self-emitted: NIT extraído ${nitExtraido} = NIT cliente ${nitClienteNorm}`,
+      );
+      return null;
+    }
+
     return {
       fecha: normalizeFecha(json.fecha, ctx.emailDate),
       proveedor: String(json.proveedor || "Sin nombre").trim(),
-      nit: String(json.nit || "").replace(/\D+/g, ""),
+      nit: nitExtraido,
       numero: String(json.numero || "").trim(),
       cufe: "", // no aplica para no-DIAN
       subtotal: Number(json.subtotal) || Number(json.total),
@@ -141,6 +164,38 @@ function buildExtractionPrompt(ctx: ExtractionContext): string {
     email_body: "el cuerpo de un email con información de pago/factura",
   }[ctx.presumedType];
 
+  // Información del cliente (para evitar self-emitted)
+  const clienteInfo =
+    ctx.nitCliente || ctx.nombreCliente
+      ? `\nINFORMACIÓN DEL CLIENTE (el deudor — NUNCA es el proveedor):
+- Nombre cliente: ${ctx.nombreCliente ?? "(desconocido)"}
+- NIT cliente: ${ctx.nitCliente ?? "(desconocido)"}
+⚠️ El proveedor extraído NO puede ser el cliente. Si el cliente aparece en el documento, es el DEUDOR (quien debe pagar), NUNCA el proveedor.`
+      : "";
+
+  // Regla específica de cuenta de cobro
+  const reglaCuentaCobro =
+    ctx.presumedType === "cuenta_cobro"
+      ? `
+REGLA CRÍTICA PARA CUENTAS DE COBRO:
+Una cuenta de cobro típica colombiana tiene esta estructura:
+   Nota de cobro No 143
+   [NOMBRE EMPRESA CLIENTE]            ← ESTE ES EL CLIENTE (deudor)
+   NIT 9XX.XXX.XXX-X
+   Debe A:
+   [NOMBRE PERSONA/EMPRESA PROVEEDOR]  ← ESTE ES EL PROVEEDOR (acreedor, quien va a recibir el pago)
+   C.C. XX.XXX.XXX  o  NIT XXX.XXX.XXX
+
+El PROVEEDOR es **QUIEN COBRA** (después de "Debe a:" o "Cobra a:" o similar).
+El CLIENTE es **QUIEN DEBE PAGAR** (aparece primero, con NIT empresarial).
+
+EJEMPLO de mal extraído (NO HAGAS ESTO):
+  Documento dice "DENTILANDIA SAS NIT 901... Debe A: MARIA GLADYS C.C. 43076121"
+  ❌ MAL: proveedor="DENTILANDIA SAS", nit="901..."
+  ✅ BIEN: proveedor="MARIA GLADYS URIBE YARCE", nit="43076121"
+`
+      : "";
+
   return `
 Sos un extractor de datos contables. Te paso el texto de ${tipoLabel}.
 
@@ -149,21 +204,26 @@ ${ctx.filename ? `Filename: ${ctx.filename}` : ""}
 ${ctx.sender ? `Sender: ${ctx.sender}` : ""}
 ${ctx.subject ? `Subject: ${ctx.subject}` : ""}
 ${ctx.emailDate ? `Email recibido: ${ctx.emailDate}` : ""}
+${clienteInfo}
+${reglaCuentaCobro}
 
 TEXTO DEL DOCUMENTO:
 """
 ${ctx.text.slice(0, 6000)}
 """
 
-EXTRAÉ los siguientes campos en JSON puro (sin markdown, sin comentarios). Si NO es una factura/cuenta de cobro válida (ej: es una notificación de Stripe diciendo "tu pago se procesó" sin detalle), devolvé el objeto con "es_factura": false.
+EXTRAÉ los siguientes campos en JSON puro (sin markdown, sin comentarios). Si NO es una factura/cuenta de cobro válida (ej: es una notificación de Stripe diciendo "tu pago se procesó" sin detalle, o es un CERTIFICADO DE RETENCIÓN — no una factura), devolvé el objeto con "es_factura": false.
+
+⚠️ CERTIFICADOS DE RETENCIÓN NO son facturas — son comprobantes de retención ya practicada. Si el texto contiene "Certificado de Retención", "Certificado RTE", "Retención en la Fuente practicada", marcá "es_factura": false con "notas": "Certificado de retención, no es factura".
 
 Schema esperado:
 {
   "es_factura": true|false,
+  "es_certificado_retencion": true|false (opcional, true si es certificado RTE),
   "fecha": "YYYY-MM-DD" (fecha de emisión del documento, no del email),
-  "proveedor": "nombre razón social del proveedor",
-  "nit": "número NIT/Cédula sin puntos ni guiones (Colombia) o tax id internacional",
-  "numero": "número de factura/recibo/cuenta de cobro",
+  "proveedor": "nombre razón social del proveedor (QUIEN COBRA, NUNCA el cliente)",
+  "nit": "número NIT/Cédula del PROVEEDOR sin puntos ni guiones",
+  "numero": "número de factura/recibo/cuenta de cobro (consecutivo)",
   "subtotal": número (sin moneda, sin separadores),
   "iva": número (0 si no aplica),
   "total": número,
@@ -174,13 +234,16 @@ Schema esperado:
   "notas": "opcional: si confianza < 0.5 o algo está raro, explicá brevemente"
 }
 
-REGLAS:
+REGLAS GENERALES:
 - Devolvé SOLO el JSON, sin texto antes ni después.
 - Si "es_factura": false, omití el resto de campos.
-- Para cuentas de cobro Colombia: el "proveedor" es la persona/empresa que emite el cobro.
+- Si el documento es un certificado de retención (de años anteriores o del año actual), "es_factura": false y "es_certificado_retencion": true.
+- Para cuentas de cobro Colombia: el "proveedor" es **QUIEN COBRA** (la persona o empresa que recibe el pago). El cliente que paga NUNCA es el proveedor.
 - Para recibos Stripe/PayPal: el "proveedor" es la plataforma + el merchant si se menciona.
 - Si el documento no tiene IVA explícito, IVA = 0 (no asumas 19%).
 - Si la fecha está en formato "8 de enero de 2026", convertilo a "2026-01-08".
+- "numero" debe ser el consecutivo del documento (factura, recibo, nota de cobro). Es la fuente de la verdad para deduplicación.
+${ctx.nitCliente ? `- Si el "nit" extraído coincide con el NIT del cliente (${ctx.nitCliente}), revisá: probablemente extrajiste mal. Devolvé "es_factura": false con notas explicando.` : ""}
 
 JSON:`;
 }

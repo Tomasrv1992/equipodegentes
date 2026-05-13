@@ -2048,7 +2048,10 @@ async function processCuentaCobroDocx(
       };
     }
 
-    // 3. Llamar al LLM para extraer campos estructurados
+    // 3. Llamar al LLM para extraer campos estructurados.
+    // Pasamos el NIT y nombre del cliente para que el LLM:
+    //   a) NO confunda al cliente con el proveedor en cuentas de cobro
+    //   b) Skip si extracción detecta NIT cliente como proveedor (self-emitted)
     const { extractInvoiceFromText } = await import("./llm-extractor");
     const sender = getHeader(msg, "From") || "";
     const dateHeader = getHeader(msg, "Date") || "";
@@ -2060,6 +2063,8 @@ async function processCuentaCobroDocx(
       sender,
       subject,
       emailDate: dateHeader,
+      nitCliente,
+      nombreCliente: nombreClienteNorm,
     });
     if (!extracted) {
       return { skip: true, reason: "docx-no-es-factura (LLM)", subject };
@@ -2238,7 +2243,7 @@ async function processGenericPdf(
       ? "recibo_internacional"
       : "recibo_servicio";
 
-    // 4. LLM
+    // 4. LLM (con contexto del cliente para evitar self-emitted)
     const { extractInvoiceFromText } = await import("./llm-extractor");
     llmTracker.calls++;
     const extracted = await extractInvoiceFromText({
@@ -2248,6 +2253,8 @@ async function processGenericPdf(
       sender,
       subject,
       emailDate: dateHeader,
+      nitCliente,
+      nombreCliente: nombreClienteNorm,
     });
     if (!extracted) {
       return { skip: true, reason: `pdf-no-es-factura (LLM: ${presumedType})`, subject };

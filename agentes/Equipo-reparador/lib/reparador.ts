@@ -62,6 +62,27 @@ export interface AutoRepair {
   detalle: string;
 }
 
+/**
+ * Reporte de validación 5 fuentes para UN cliente (Bloque B).
+ * El reparador valida que TODAS las fuentes cuadren después de auto-reparar:
+ *   1. Gmail (label Facturas/YYYY-MM)
+ *   2. Drive (PDFs en folder del mes)
+ *   3. Sheet (filas en pestaña del mes)
+ *   4. Events (agent_events tipo factura_procesada)
+ *   5. Dashboard (fórmulas de la pestaña Dashboard) — opcional
+ */
+export interface ValidacionClienteCliente {
+  cliente_slug: string;
+  mes: string; // "YYYY-MM"
+  gmail: number;
+  drive: number;
+  sheet: number;
+  events: number;
+  todo_cuadra: boolean;
+  /** Detalle textual de discrepancias para email/log. */
+  discrepancias: string[];
+}
+
 export interface ReparadorReport {
   fecha: string;
   ts_generated: string;
@@ -76,6 +97,10 @@ export interface ReparadorReport {
   filas_sin_pdf: FilaSinPdf[];
   /** Etapa 3 (auto-repair): acciones tomadas para resolver huérfanos. */
   auto_repairs: AutoRepair[];
+  /** Bloque B: validación cruzada 5 fuentes por cliente. */
+  validaciones: ValidacionClienteCliente[];
+  /** Clientes con inconsistencia residual tras auto-repair. */
+  clientes_inconsistentes: string[];
   /** Errores por cliente (no detienen el run). */
   errores: Array<{ cliente_slug: string; error: string }>;
 }
@@ -95,6 +120,8 @@ export async function runReparador(): Promise<ReparadorReport> {
     pdfs_huerfanos: [],
     filas_sin_pdf: [],
     auto_repairs: [],
+    validaciones: [],
+    clientes_inconsistentes: [],
     errores: [],
   };
 
@@ -142,8 +169,13 @@ export async function runReparador(): Promise<ReparadorReport> {
 
       const sheets = google.sheets({ version: "v4", auth });
       const drive = google.drive({ version: "v3", auth });
+      const gmail = google.gmail({ version: "v1", auth });
 
       const year = bogotaYear();
+      const mesActual = bogotaMonth();
+      const tabName = MES_TABS[mesActual - 1];
+      // monthFolderId se setea adentro de Etapa 2 si la carpeta existe
+      let monthFolderIdRef: string | null = null;
 
       // === ETAPA 1: comparar events vs Sheet, reparar filas faltantes =======
       for (let mes = 1; mes <= 12; mes++) {
@@ -261,10 +293,9 @@ export async function runReparador(): Promise<ReparadorReport> {
       // === ETAPA 2: detectar PDFs huérfanos + filas sin PDF =================
       if (cred.drive_folder_id) {
         // Para el MES ACTUAL solamente (el resto es legacy, no se reporta)
-        const mesActual = bogotaMonth();
+        // mesActual y tabName ya están declarados arriba en scope del cliente
         const mm = String(mesActual).padStart(2, "0");
         const monthFolderName = `${year}-${mm}`;
-        const tabName = MES_TABS[mesActual - 1];
 
         // Buscar subfolder del mes
         const folderResp = await drive.files.list({
@@ -272,6 +303,7 @@ export async function runReparador(): Promise<ReparadorReport> {
           fields: "files(id, name)",
         });
         const monthFolderId = folderResp.data.files?.[0]?.id;
+        if (monthFolderId) monthFolderIdRef = monthFolderId;
 
         if (monthFolderId) {
           // 2a) Listar todos los archivos del mes
@@ -624,6 +656,33 @@ export async function runReparador(): Promise<ReparadorReport> {
         }
       }
 
+      // === ETAPA 5: Validación cruzada 5 fuentes (Bloque B) ====================
+      // Después de auto-reparar, valida que las 4 fuentes principales cuadren:
+      // Gmail, Drive, Sheet, Events. Si no cuadran, marca al cliente como
+      // inconsistente para alerta.
+      try {
+        const validacion = await validarCincoFuentes({
+          clienteSlug: c.slug,
+          clienteId: c.id,
+          year,
+          mesActual,
+          tabName,
+          gmail,
+          drive,
+          sheets,
+          supa,
+          cred,
+          monthFolderId: monthFolderIdRef,
+        });
+        report.validaciones.push(validacion);
+        if (!validacion.todo_cuadra) {
+          report.clientes_inconsistentes.push(c.slug);
+          console.log(`[reparador-5] cliente=${c.slug} INCONSISTENTE: ${validacion.discrepancias.join(" | ")}`);
+        }
+      } catch (vErr: any) {
+        console.warn(`[reparador-5] validación falló para ${c.slug}: ${vErr.message}`);
+      }
+
       report.clientes_procesados++;
     } catch (err: any) {
       console.error(`[reparador] error cliente=${c.slug}: ${err.message}`);
@@ -632,6 +691,111 @@ export async function runReparador(): Promise<ReparadorReport> {
   }
 
   return report;
+}
+
+/**
+ * Validación cruzada 5 fuentes (Bloque B).
+ * Cuenta facturas en cada fuente y reporta discrepancias.
+ */
+async function validarCincoFuentes(ctx: {
+  clienteSlug: string;
+  clienteId: string;
+  year: number;
+  mesActual: number;
+  tabName: string;
+  gmail: any;
+  drive: any;
+  sheets: any;
+  supa: any;
+  cred: any;
+  monthFolderId: string | null;
+}): Promise<ValidacionClienteCliente> {
+  const mes = `${ctx.year}-${String(ctx.mesActual).padStart(2, "0")}`;
+  const labelName = `Facturas/${mes}`;
+
+  // 1. Gmail count
+  let gmailCount = 0;
+  try {
+    const res = await ctx.gmail.users.messages.list({
+      userId: "me",
+      q: `label:"${labelName}"`,
+      maxResults: 500,
+    });
+    gmailCount = res.data.messages?.length ?? 0;
+  } catch {
+    /* 0 */
+  }
+
+  // 2. Drive count (PDFs en folder del mes, excluyendo XML)
+  let driveCount = 0;
+  if (ctx.monthFolderId) {
+    try {
+      const res = await ctx.drive.files.list({
+        q: `'${ctx.monthFolderId}' in parents and trashed=false and mimeType='application/pdf'`,
+        fields: "files(id)",
+        pageSize: 1000,
+      });
+      driveCount = res.data.files?.length ?? 0;
+    } catch {
+      /* 0 */
+    }
+  }
+
+  // 3. Sheet count
+  let sheetCount = 0;
+  try {
+    const res = await ctx.sheets.spreadsheets.values.get({
+      spreadsheetId: ctx.cred.sheet_id,
+      range: `'${ctx.tabName}'!A2:A1000`,
+    });
+    sheetCount = (res.data.values || []).filter((row: any) => row[0] && String(row[0]).trim()).length;
+  } catch {
+    /* 0 */
+  }
+
+  // 4. Events count (DB)
+  let eventsCount = 0;
+  const startDate = `${mes}-01`;
+  const endDate =
+    ctx.mesActual === 12
+      ? `${ctx.year + 1}-01-01`
+      : `${ctx.year}-${String(ctx.mesActual + 1).padStart(2, "0")}-01`;
+  try {
+    const { count } = await ctx.supa
+      .from("agent_events")
+      .select("*", { count: "exact", head: true })
+      .eq("cliente_id", ctx.clienteId)
+      .eq("agente_id", "facturacion")
+      .eq("tipo", "factura_procesada")
+      .gte("payload->>fecha", startDate)
+      .lt("payload->>fecha", endDate);
+    eventsCount = count ?? 0;
+  } catch {
+    /* 0 */
+  }
+
+  // Comparar
+  const discrepancias: string[] = [];
+  if (gmailCount !== sheetCount) {
+    discrepancias.push(`gmail(${gmailCount})≠sheet(${sheetCount})`);
+  }
+  if (driveCount !== sheetCount) {
+    discrepancias.push(`drive(${driveCount})≠sheet(${sheetCount})`);
+  }
+  if (eventsCount !== sheetCount) {
+    discrepancias.push(`events(${eventsCount})≠sheet(${sheetCount})`);
+  }
+
+  return {
+    cliente_slug: ctx.clienteSlug,
+    mes,
+    gmail: gmailCount,
+    drive: driveCount,
+    sheet: sheetCount,
+    events: eventsCount,
+    todo_cuadra: discrepancias.length === 0,
+    discrepancias,
+  };
 }
 
 function bogotaDate(now: Date): string {

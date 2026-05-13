@@ -137,29 +137,116 @@ export async function runSupervisor(): Promise<SupervisorReport> {
       // SUPERVISOR EXIGENTE — no ser paisaje:
       //   1. Si hay duplicados Drive → retrigger limpiador
       //   2. Si gap events-vs-sheet → retrigger reparador
-      //   3. Si las 4 fuentes (gmail/drive/sheet/events) NO cuadran → FAIL crítico
-      //   4. requiere_atencion_critica si quedan cosas tras retriggers
+      //   3. Si gap Drive-vs-Sheet → retrigger PROCESADOR (Idea 2: re-disparar)
+      //   4. Si las fuentes NO cuadran → FAIL crítico
+      //
+      // CAPA 3 — Anti-loop: cada retrigger se cuenta en audit_log.
+      // Si un cliente ya fue retrigger > MAX_RETRIGGERS_POR_DIA veces →
+      // escala a 'intervencion_humana_requerida' y NO retrigger más.
       const tieneDuplicados = chequeo.duplicados_drive.length > 0;
       const gapSheetEvents = Math.abs(chequeo.events_count - chequeo.sheet_count) > 0;
       const gapDriveSheet = Math.abs(chequeo.drive_count - chequeo.sheet_count) > 0;
       const fuentesNoCuadran = gapSheetEvents || gapDriveSheet;
 
-      if (tieneDuplicados && baseUrl && internalSecret) {
-        try {
-          await disparar(`${baseUrl}/.netlify/functions/limpiador-background`, internalSecret);
-          chequeo.acciones_tomadas.push(`Retrigger LIMPIADOR (${chequeo.duplicados_drive.length} grupos dup)`);
-          report.retriggers_disparados++;
-        } catch (err: any) {
-          console.warn(`[supervisor] retrigger limpiador falló: ${err.message}`);
+      // Importar helpers de audit + anti-loop
+      const { auditLog, contarRetriggersHoy, MAX_RETRIGGERS_POR_DIA } = await import(
+        "../../../shared/agents-runtime/src/audit-log"
+      );
+
+      const retriggersHoyCliente = await contarRetriggersHoy(c.slug);
+      const puedeRetrigger = retriggersHoyCliente < MAX_RETRIGGERS_POR_DIA;
+
+      if (!puedeRetrigger && (tieneDuplicados || fuentesNoCuadran)) {
+        // CAPA 3: escalar a intervención humana
+        chequeo.estado = "fail";
+        chequeo.acciones_tomadas.push(
+          `🚨 LÍMITE de retriggers alcanzado (${retriggersHoyCliente}/${MAX_RETRIGGERS_POR_DIA}) — REQUIERE INTERVENCIÓN HUMANA`,
+        );
+        chequeo.detalle += ` 🚨 Anti-loop activado: ya fue retrigger ${retriggersHoyCliente} veces hoy`;
+        await auditLog({
+          agente: "supervisor",
+          accion: "supervisor.escalar_intervencion_humana",
+          clienteSlug: c.slug,
+          clienteId: c.id,
+          motivo: `Cliente alcanzó ${retriggersHoyCliente} retriggers HOY — no se retrigger más`,
+          detalles: {
+            retriggers_hoy: retriggersHoyCliente,
+            limite: MAX_RETRIGGERS_POR_DIA,
+            gap_sheet_events: chequeo.events_count - chequeo.sheet_count,
+            gap_drive_sheet: chequeo.drive_count - chequeo.sheet_count,
+            duplicados: chequeo.duplicados_drive.length,
+          },
+        });
+        report.requiere_atencion_critica = true;
+      } else {
+        // Retriggers normales con audit
+        if (tieneDuplicados && baseUrl && internalSecret) {
+          try {
+            await disparar(`${baseUrl}/.netlify/functions/limpiador-background`, internalSecret);
+            chequeo.acciones_tomadas.push(`Retrigger LIMPIADOR (${chequeo.duplicados_drive.length} grupos dup)`);
+            report.retriggers_disparados++;
+            await auditLog({
+              agente: "supervisor",
+              accion: "supervisor.retrigger_agente",
+              clienteSlug: c.slug,
+              clienteId: c.id,
+              motivo: `${chequeo.duplicados_drive.length} grupos duplicados en Drive`,
+              detalles: { agente_destino: "limpiador" },
+            });
+          } catch (err: any) {
+            console.warn(`[supervisor] retrigger limpiador falló: ${err.message}`);
+          }
         }
-      }
-      if (gapSheetEvents && baseUrl && internalSecret) {
-        try {
-          await disparar(`${baseUrl}/.netlify/functions/reparador-background`, internalSecret);
-          chequeo.acciones_tomadas.push(`Retrigger REPARADOR (${Math.abs(chequeo.events_count - chequeo.sheet_count)} filas faltan)`);
-          report.retriggers_disparados++;
-        } catch (err: any) {
-          console.warn(`[supervisor] retrigger reparador falló: ${err.message}`);
+        if (gapSheetEvents && baseUrl && internalSecret) {
+          try {
+            await disparar(`${baseUrl}/.netlify/functions/reparador-background`, internalSecret);
+            chequeo.acciones_tomadas.push(
+              `Retrigger REPARADOR (${Math.abs(chequeo.events_count - chequeo.sheet_count)} filas faltan)`,
+            );
+            report.retriggers_disparados++;
+            await auditLog({
+              agente: "supervisor",
+              accion: "supervisor.retrigger_agente",
+              clienteSlug: c.slug,
+              clienteId: c.id,
+              motivo: `Gap events vs sheet: ${chequeo.events_count} vs ${chequeo.sheet_count}`,
+              detalles: { agente_destino: "reparador" },
+            });
+          } catch (err: any) {
+            console.warn(`[supervisor] retrigger reparador falló: ${err.message}`);
+          }
+        }
+        // IDEA 2 — Re-disparar PROCESADOR si hay gap Drive < Sheet o Gmail > Sheet.
+        // Significa que llegaron correos al Gmail pero el procesador no los procesó
+        // (probable: cron timeout, error temporal, etc). force=true re-procesa.
+        const gapGmailSheet = chequeo.drive_count < chequeo.sheet_count;
+        if ((gapDriveSheet || gapGmailSheet) && baseUrl && internalSecret) {
+          try {
+            const procUrl = `${baseUrl}/.netlify/functions/facturacion-background`;
+            await fetch(procUrl, {
+              method: "POST",
+              headers: {
+                "x-internal-secret": internalSecret,
+                "x-trigger": "supervisor-retrigger",
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({ customerId: c.slug, force: true, silent: true }),
+            });
+            chequeo.acciones_tomadas.push(
+              `Retrigger PROCESADOR force=true (gap Drive=${chequeo.drive_count} vs Sheet=${chequeo.sheet_count})`,
+            );
+            report.retriggers_disparados++;
+            await auditLog({
+              agente: "supervisor",
+              accion: "supervisor.retrigger_agente",
+              clienteSlug: c.slug,
+              clienteId: c.id,
+              motivo: `Gap Drive vs Sheet: ${chequeo.drive_count} vs ${chequeo.sheet_count}`,
+              detalles: { agente_destino: "facturacion", force: true },
+            });
+          } catch (err: any) {
+            console.warn(`[supervisor] retrigger procesador falló: ${err.message}`);
+          }
         }
       }
 

@@ -316,11 +316,21 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
       // Las marcamos en col concepto con "[REVISAR-BASURA: motivo]" para que el
       // operador humano las vea fácilmente en el Sheet y decida.
       try {
-        const basura = await detectarFilasBasura(sheets, cred.sheet_id!, tabName, c.slug, mesActual, year);
+        const basura = await detectarFilasBasura(
+          sheets,
+          cred.sheet_id!,
+          tabName,
+          c.slug,
+          c.id,
+          mesActual,
+          year,
+        );
         if (basura.length > 0) {
           report.filas_basura.push(...basura);
+          const auto_reparadas = basura.filter((b) => b.accion === "borrada").length;
+          const marcadas = basura.filter((b) => b.accion === "marcada").length;
           console.log(
-            `[limpiador-10] cliente=${c.slug} → ${basura.length} filas con datos inválidos detectadas en ${tabName}`,
+            `[limpiador-10] cliente=${c.slug} → ${basura.length} filas basura: ${auto_reparadas} AUTO-REPARADAS, ${marcadas} marcadas REVISAR`,
           );
         }
       } catch (err: any) {
@@ -959,33 +969,44 @@ function normalizeProveedor(s: string): string {
 }
 
 /**
- * BLOQUE G: detecta filas BASURA en el Sheet del cliente.
+ * BLOQUE G + Idea 1: detecta filas BASURA en el Sheet y INTENTA AUTO-REPARAR.
  *
- * Casos típicos de basura encontrados en producción:
- *   - Número de factura inválido ("0,00E+00", "mayo de 2026", "PRUEBA 002")
- *   - Fecha futura o muy antigua
- *   - Monto negativo o excesivo
+ * Flujo nuevo (más exigente):
+ *   1. Detecta basura (número inválido, fecha rara, monto sospechoso)
+ *   2. INTENTA AUTO-REPARAR:
+ *      a) Si hay OTRA fila buena del mismo proveedor+fecha+monto → BORRAR la basura
+ *         (es duplicado mal escrito, la fila buena la suplanta)
+ *      b) (futuro: buscar agent_events del mismo proveedor para corregir número)
+ *   3. Si no se pudo reparar → MARCAR con [REVISAR-BASURA: motivo]
  *
- * No las borra. Las marca añadiendo "[REVISAR-BASURA: motivo]" al inicio
- * de la columna L (Concepto), para que el operador humano las vea fácilmente
- * en el Sheet y decida si borrar o corregir.
- *
- * Cols 15 nueva estructura:
- *   B=Fecha(1), D=NIT(3), E=#Doc(4), K=Total(10), L=Concepto(11)
+ * Todo queda registrado en audit_log para rollback.
  */
 async function detectarFilasBasura(
   sheets: any,
   sheetId: string,
   tabName: string,
   clienteSlug: string,
+  clienteId: string,
   mesActual: number,
   year: number,
 ): Promise<FilaBasura[]> {
   const { validarFacturaCompleta } = await import(
     "../../../agentes/Equipo-facturacion/lib/validations"
   );
+  const { auditLog } = await import("../../../shared/agents-runtime/src/audit-log");
 
   const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+
+  // Obtener sheetId interno (necesario para deleteDimension)
+  let tabSheetId: number | null = null;
+  try {
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const sheet = (meta.data.sheets ?? []).find((s: any) => s.properties?.title === tabName);
+    tabSheetId = sheet?.properties?.sheetId ?? null;
+  } catch {
+    /* ignore */
+  }
+
   let rows: any[][] = [];
   try {
     const res = await sheets.spreadsheets.values.get({
@@ -997,47 +1018,137 @@ async function detectarFilasBasura(
     return [];
   }
 
+  // Indexar todas las filas (incluso las válidas) para buscar "gemelas buenas"
+  const todasFilas = rows.map((r, i) => ({
+    sheetRow: i + 2,
+    numero: String(r[4] || "").trim(),
+    fecha: String(r[1] || "").trim(),
+    nit: String(r[3] || "").replace(/\D+/g, ""),
+    proveedor: String(r[2] || "").trim(),
+    proveedorNorm: normalizeProveedor(String(r[2] || "")),
+    total: parseMonto(r[10]),
+    concepto: String(r[11] || "").trim(),
+  }));
+
   const basura: FilaBasura[] = [];
   const actualizacionesBatch: Array<{ range: string; values: string[][] }> = [];
+  const filasABorrar: number[] = [];
 
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    const numero = String(r[4] || "").trim();
-    if (!numero) continue; // fila vacía: ignorar
+  for (const fila of todasFilas) {
+    if (!fila.numero) continue;
+    if (fila.concepto.startsWith("[REVISAR")) continue; // ya marcada
 
-    const fecha = String(r[1] || "").trim();
-    const nit = String(r[3] || "").trim();
-    const proveedor = String(r[2] || "").trim();
-    const total = parseMonto(r[10]);
-    const conceptoActual = String(r[11] || "").trim();
+    const resultado = validarFacturaCompleta({
+      numero: fila.numero,
+      fecha: fila.fecha,
+      nit: fila.nit,
+      total: fila.total,
+      proveedor: fila.proveedor,
+    });
+    if (resultado.esValida) continue;
 
-    const resultado = validarFacturaCompleta({ numero, fecha, nit, total, proveedor });
-    if (resultado.esValida) continue; // todo OK
-
-    // Skip si ya está marcado como REVISAR (evitar re-marcar y crear loops)
-    if (conceptoActual.startsWith("[REVISAR")) continue;
-
-    const sheetRow = i + 2;
-    const nuevoConcepto = `[REVISAR-BASURA: ${resultado.motivos.join("; ")}] ${conceptoActual}`;
-
-    basura.push({
-      cliente_slug: clienteSlug,
-      mes: `${year}-${String(mesActual).padStart(2, "0")}`,
-      fila_sheet: sheetRow,
-      numero,
-      proveedor,
-      total,
-      motivos: resultado.motivos,
-      accion: "marcada",
+    // IDEA 1: intentar auto-reparar buscando gemela buena
+    // Una "gemela buena" tiene: mismo proveedor (norm) + mismo monto (±$10) +
+    // fecha cercana (±3 días) Y es una fila VÁLIDA (número correcto).
+    const gemela = todasFilas.find((otra) => {
+      if (otra.sheetRow === fila.sheetRow) return false;
+      if (Math.abs(otra.total - fila.total) > 10) return false;
+      if (otra.proveedorNorm !== fila.proveedorNorm) return false;
+      // Validar que la gemela sea buena
+      const valGemela = validarFacturaCompleta({
+        numero: otra.numero,
+        fecha: otra.fecha,
+        nit: otra.nit,
+        total: otra.total,
+        proveedor: otra.proveedor,
+      });
+      return valGemela.esValida;
     });
 
-    actualizacionesBatch.push({
-      range: `${tabRange}!L${sheetRow}`,
-      values: [[nuevoConcepto]],
-    });
+    if (gemela) {
+      // AUTO-REPARAR: borrar la basura (la gemela buena la suplanta)
+      filasABorrar.push(fila.sheetRow);
+      basura.push({
+        cliente_slug: clienteSlug,
+        mes: `${year}-${String(mesActual).padStart(2, "0")}`,
+        fila_sheet: fila.sheetRow,
+        numero: fila.numero,
+        proveedor: fila.proveedor,
+        total: fila.total,
+        motivos: resultado.motivos,
+        accion: "borrada",
+      });
+      await auditLog({
+        agente: "limpiador",
+        accion: "limpiador.auto_reparar_fila",
+        clienteSlug,
+        clienteId,
+        datosAntes: { fila: fila.sheetRow, numero: fila.numero, fecha: fila.fecha, total: fila.total },
+        datosDespues: { borrada: true, gemela_fila: gemela.sheetRow, gemela_numero: gemela.numero },
+        motivo: `Basura con gemela válida en fila ${gemela.sheetRow}: ${resultado.motivos.join("; ")}`,
+      });
+    } else {
+      // No se pudo auto-reparar: marcar
+      const nuevoConcepto = `[REVISAR-BASURA: ${resultado.motivos.join("; ")}] ${fila.concepto}`;
+      basura.push({
+        cliente_slug: clienteSlug,
+        mes: `${year}-${String(mesActual).padStart(2, "0")}`,
+        fila_sheet: fila.sheetRow,
+        numero: fila.numero,
+        proveedor: fila.proveedor,
+        total: fila.total,
+        motivos: resultado.motivos,
+        accion: "marcada",
+      });
+      actualizacionesBatch.push({
+        range: `${tabRange}!L${fila.sheetRow}`,
+        values: [[nuevoConcepto]],
+      });
+      await auditLog({
+        agente: "limpiador",
+        accion: "limpiador.marcar_basura",
+        clienteSlug,
+        clienteId,
+        datosAntes: { fila: fila.sheetRow, numero: fila.numero, concepto: fila.concepto },
+        datosDespues: { concepto_nuevo: nuevoConcepto },
+        motivo: resultado.motivos.join("; "),
+      });
+    }
   }
 
-  // Aplicar las marcas en bulk
+  // Aplicar borrados primero (de mayor a menor sheetRow)
+  if (filasABorrar.length > 0 && tabSheetId !== null) {
+    const filasDesc = [...new Set(filasABorrar)].sort((a, b) => b - a);
+    const requests = filasDesc.map((sheetRow) => ({
+      deleteDimension: {
+        range: {
+          sheetId: tabSheetId,
+          dimension: "ROWS",
+          startIndex: sheetRow - 1,
+          endIndex: sheetRow,
+        },
+      },
+    }));
+    try {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: { requests },
+      });
+      console.log(
+        `[limpiador-10-auto-repair] cliente=${clienteSlug} → ${filasDesc.length} filas basura AUTO-REPARADAS (borradas, con gemela válida)`,
+      );
+    } catch (err: any) {
+      console.warn(`[limpiador-10] error borrando: ${err.message}`);
+      // Revertir acción de basura.borradas a marcadas
+      for (const b of basura) {
+        if (b.accion === "borrada") {
+          b.accion = "solo_reportar";
+        }
+      }
+    }
+  }
+
+  // Aplicar marcas
   if (actualizacionesBatch.length > 0) {
     try {
       await sheets.spreadsheets.values.batchUpdate({
@@ -1048,12 +1159,13 @@ async function detectarFilasBasura(
         },
       });
       console.log(
-        `[limpiador-10] cliente=${clienteSlug} → ${basura.length} filas basura MARCADAS con [REVISAR-BASURA] en col L`,
+        `[limpiador-10] cliente=${clienteSlug} → ${actualizacionesBatch.length} filas basura MARCADAS [REVISAR-BASURA]`,
       );
     } catch (err: any) {
       console.warn(`[limpiador-10] error marcando filas: ${err.message}`);
-      // Si falla el update, cambiar accion a "solo_reportar"
-      for (const b of basura) b.accion = "solo_reportar";
+      for (const b of basura) {
+        if (b.accion === "marcada") b.accion = "solo_reportar";
+      }
     }
   }
 

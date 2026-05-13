@@ -53,6 +53,34 @@ export interface AccionLimpiador {
   total?: number;
 }
 
+/**
+ * Detalle de filas Sheet duplicadas detectadas y borradas (Bloque C).
+ * Misma factura registrada N veces en el Sheet del cliente.
+ *
+ * Triple validación antes de borrar:
+ *   1. Mismo número de factura (string exact match)
+ *   2. Mismo NIT (si presente) o mismo proveedor normalizado
+ *   3. Mismo monto total (tolerancia ±$10 COP por redondeo)
+ *
+ * Si las 3 condiciones se cumplen → borra las extras manteniendo la primera.
+ * Si solo 2 → reporta sin borrar (action: "solo_reportar").
+ */
+export interface FilaSheetDuplicada {
+  cliente_slug: string;
+  mes: string;
+  numero: string;
+  nit: string;
+  proveedor: string;
+  total: number;
+  /** Filas Sheet (1-based, header=fila 1). La PRIMERA se mantiene, el resto se borra. */
+  filas: number[];
+  /** Filas que se borraron (todas excepto la primera). */
+  filas_borradas: number[];
+  /** Filas que NO se borraron por validación fallida. */
+  filas_no_borradas: number[];
+  accion: "borradas_auto" | "solo_reportar_por_diferencia_monto";
+}
+
 export interface LimpiadorReport {
   fecha: string;
   ts_generated: string;
@@ -67,6 +95,8 @@ export interface LimpiadorReport {
   self_emitted_ignorados: number;
   costo_llm_usd: number;
   acciones: AccionLimpiador[];
+  /** Bloque C: filas duplicadas detectadas en Sheet (mismo num+NIT+proveedor). */
+  filas_sheet_duplicadas: FilaSheetDuplicada[];
   errores: Array<{ cliente_slug: string; error: string }>;
 }
 
@@ -94,6 +124,7 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
     self_emitted_ignorados: 0,
     costo_llm_usd: 0,
     acciones: [],
+    filas_sheet_duplicadas: [],
     errores: [],
   };
 
@@ -238,6 +269,22 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
         } catch (err: any) {
           console.error(`[limpiador] error moviendo a REVISAR_MANUAL: ${err.message}`);
         }
+      }
+
+      // 9. BLOQUE C: detectar filas duplicadas en Sheet del mes actual.
+      // Regla Tomás: el consecutivo (número de factura) es la fuente de verdad.
+      // Si misma factura (numero + NIT, o numero + proveedor si NIT vacío)
+      // aparece en 2+ filas, reportar como duplicado.
+      try {
+        const duplicados = await detectarDuplicadosSheet(sheets, cred.sheet_id!, tabName, c.slug, mesActual, year);
+        if (duplicados.length > 0) {
+          report.filas_sheet_duplicadas.push(...duplicados);
+          console.log(
+            `[limpiador-9] cliente=${c.slug} → ${duplicados.length} grupos de filas duplicadas detectados en ${tabName}`,
+          );
+        }
+      } catch (err: any) {
+        console.warn(`[limpiador-9] detección duplicados falló: ${err.message}`);
       }
 
       report.clientes_procesados++;
@@ -684,4 +731,205 @@ async function moverARevisarManual(
       console.warn(`[limpiador] no pude mover ${accion.drive_file_name}: ${err.message}`);
     }
   }
+}
+
+/**
+ * BLOQUE C: detecta y BORRA filas duplicadas en el Sheet del cliente.
+ *
+ * Regla de negocio (Tomás): el CONSECUTIVO (numero de factura) es la fuente
+ * única de verdad. Si misma factura aparece en 2+ filas → borrar duplicados
+ * automáticamente, manteniendo la PRIMERA (más vieja por número de fila).
+ *
+ * VALIDACIÓN TRIPLE antes de borrar (defensa en profundidad):
+ *   1. Mismo número de factura (string exacto)
+ *   2. Mismo NIT (si presente en ambos) O mismo proveedor normalizado
+ *   3. Mismo monto total (tolerancia ±$10 COP por redondeo)
+ *
+ * Si las 3 cumplen → borra las extras. Si solo 1 o 2 → reporta sin borrar.
+ *
+ * Cols 15 nueva estructura:
+ *   A=#(0), B=Fecha(1), C=Proveedor(2), D=NIT(3), E=#Documento(4),
+ *   F=Subtotal(5), G=IVA(6), H=ReteF(7), I=ReteIVA(8), J=ReteICA(9),
+ *   K=Total(10), L=Concepto(11), M=Categoría(12), N=PYG(13), O=LinkPDF(14)
+ */
+async function detectarDuplicadosSheet(
+  sheets: any,
+  sheetId: string,
+  tabName: string,
+  clienteSlug: string,
+  mesActual: number,
+  year: number,
+): Promise<FilaSheetDuplicada[]> {
+  const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+
+  // 1. Obtener el sheetId numérico de la pestaña (necesario para deleteDimension)
+  let tabSheetId: number | null = null;
+  try {
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const sheet = (meta.data.sheets ?? []).find((s: any) => s.properties?.title === tabName);
+    tabSheetId = sheet?.properties?.sheetId ?? null;
+  } catch (err: any) {
+    console.warn(`[limpiador-9] no pude obtener sheetId interno: ${err.message}`);
+    return [];
+  }
+  if (tabSheetId === null) {
+    console.warn(`[limpiador-9] pestaña ${tabName} no encontrada`);
+    return [];
+  }
+
+  // 2. Cargar filas del Sheet
+  let rows: any[][] = [];
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `${tabRange}!A2:O1000`,
+    });
+    rows = res.data.values ?? [];
+  } catch {
+    return [];
+  }
+
+  // 3. Indexar filas y agrupar por (numero, nit/proveedor)
+  type FilaInfo = { sheetRow: number; numero: string; nit: string; proveedor: string; proveedorNorm: string; total: number };
+  const filasInfo: FilaInfo[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const numero = String(r[4] || "").trim();
+    if (!numero) continue;
+    const nit = String(r[3] || "").replace(/\D+/g, "");
+    const proveedor = String(r[2] || "").trim();
+    const proveedorNorm = normalizeProveedor(proveedor);
+    const total = parseMonto(r[10]);
+    filasInfo.push({ sheetRow: i + 2, numero, nit, proveedor, proveedorNorm, total });
+  }
+
+  // 4. Agrupar por clave (numero + nit) o (numero + proveedor norm)
+  const grupos = new Map<string, FilaInfo[]>();
+  for (const f of filasInfo) {
+    const key = f.nit ? `${f.numero}|${f.nit}` : `${f.numero}|prov:${f.proveedorNorm}`;
+    const arr = grupos.get(key) ?? [];
+    arr.push(f);
+    grupos.set(key, arr);
+  }
+
+  // 5. Para cada grupo con > 1 fila, validar y decidir
+  const duplicadosReporte: FilaSheetDuplicada[] = [];
+  const filasABorrar: number[] = []; // filas Sheet 1-based para borrar
+
+  for (const grupo of grupos.values()) {
+    if (grupo.length <= 1) continue;
+    // Mantener la primera (menor sheetRow), candidatas a borrar las demás
+    grupo.sort((a, b) => a.sheetRow - b.sheetRow);
+    const primera = grupo[0];
+    const candidatas = grupo.slice(1);
+
+    // Validar tripple: cada candidata debe coincidir con primera en numero+proveedor+monto
+    const validadas: FilaInfo[] = [];
+    const no_validadas: FilaInfo[] = [];
+    for (const c of candidatas) {
+      const mismoMonto = Math.abs(c.total - primera.total) <= 10; // tolerancia $10 COP
+      const mismoProveedor = primera.nit && c.nit
+        ? primera.nit === c.nit
+        : primera.proveedorNorm === c.proveedorNorm;
+      if (mismoMonto && mismoProveedor) {
+        validadas.push(c);
+      } else {
+        no_validadas.push(c);
+      }
+    }
+
+    if (validadas.length > 0) {
+      // Borrar las validadas
+      filasABorrar.push(...validadas.map((c) => c.sheetRow));
+      duplicadosReporte.push({
+        cliente_slug: clienteSlug,
+        mes: `${year}-${String(mesActual).padStart(2, "0")}`,
+        numero: primera.numero,
+        nit: primera.nit,
+        proveedor: primera.proveedor,
+        total: primera.total,
+        filas: grupo.map((g) => g.sheetRow),
+        filas_borradas: validadas.map((c) => c.sheetRow),
+        filas_no_borradas: no_validadas.map((c) => c.sheetRow),
+        accion: "borradas_auto",
+      });
+    } else if (no_validadas.length > 0) {
+      // Hay duplicados de numero pero monto/proveedor distinto: solo reportar
+      duplicadosReporte.push({
+        cliente_slug: clienteSlug,
+        mes: `${year}-${String(mesActual).padStart(2, "0")}`,
+        numero: primera.numero,
+        nit: primera.nit,
+        proveedor: primera.proveedor,
+        total: primera.total,
+        filas: grupo.map((g) => g.sheetRow),
+        filas_borradas: [],
+        filas_no_borradas: no_validadas.map((c) => c.sheetRow),
+        accion: "solo_reportar_por_diferencia_monto",
+      });
+    }
+  }
+
+  // 6. Borrar las filas validadas (de mayor a menor para no afectar índices)
+  if (filasABorrar.length > 0) {
+    const filasOrdenadasDesc = [...new Set(filasABorrar)].sort((a, b) => b - a);
+    const requests = filasOrdenadasDesc.map((sheetRow) => ({
+      deleteDimension: {
+        range: {
+          sheetId: tabSheetId,
+          dimension: "ROWS",
+          startIndex: sheetRow - 1, // 0-based
+          endIndex: sheetRow, // exclusive
+        },
+      },
+    }));
+    try {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: { requests },
+      });
+      console.log(
+        `[limpiador-9] cliente=${clienteSlug} → ${filasOrdenadasDesc.length} filas duplicadas BORRADAS del Sheet ${tabName}`,
+      );
+    } catch (err: any) {
+      console.error(`[limpiador-9] error borrando filas: ${err.message}`);
+      // Si falla el borrado, cambiar accion a "solo_reportar" en el reporte
+      for (const d of duplicadosReporte) {
+        if (d.accion === "borradas_auto") {
+          d.accion = "solo_reportar_por_diferencia_monto";
+          d.filas_no_borradas = d.filas_borradas;
+          d.filas_borradas = [];
+        }
+      }
+    }
+  }
+
+  return duplicadosReporte;
+}
+
+/** Normaliza nombre de proveedor para matching (case-insensitive, sin acentos, sin sufijos). */
+function normalizeProveedor(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "") // quita acentos
+    .replace(/\b(sas|s\.a\.s\.?|ltda|s\.a\.|sa)\b/gi, "")
+    .replace(/[^\w]/g, "")
+    .trim();
+}
+
+/** Parsea monto del Sheet (formato $1.234.567 o $1,234,567.89). */
+function parseMonto(v: unknown): number {
+  if (typeof v === "number") return v;
+  if (v == null || v === "") return 0;
+  let s = String(v).trim().replace(/[$\s]/g, "");
+  if (s.includes(",")) {
+    // Latino con decimales: "1.234.567,89"
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    // Solo puntos: separadores de miles
+    s = s.replace(/\./g, "");
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
 }

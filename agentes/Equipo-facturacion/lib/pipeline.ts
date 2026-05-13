@@ -1346,6 +1346,20 @@ function parseInvoiceXml(
   }
   if (!invoice) return null;
 
+  // Filtro tipo de documento DIAN:
+  //   01 = Factura electrónica (procesar)
+  //   02 = Documento equivalente
+  //   05 = Nota de retención / certificado RTE (NO es factura, skip)
+  //   07 = Comprobante de retención (skip)
+  //   91 = Nota crédito (skip — no es factura nueva)
+  //   92 = Nota débito (skip)
+  // Solo procesamos type 01 y 02 que son facturas reales de compra.
+  const tipoDoc = asString(pick(invoice, "InvoiceTypeCode") ?? "");
+  if (tipoDoc && tipoDoc !== "01" && tipoDoc !== "02") {
+    console.log(`[skip-tipo-doc] tipoDoc=${tipoDoc} (no es factura, es retención/nota crédito/débito)`);
+    return null;
+  }
+
   const supplier = invoice.AccountingSupplierParty?.Party;
   const proveedor = asString(
     pick(supplier, "PartyTaxScheme.RegistrationName") ??
@@ -1359,6 +1373,7 @@ function parseInvoiceXml(
 
   // Skip si el supplier es el mismo cliente actual: significa que es una factura
   // que el cliente emitió (cuenta de cobro hacia sus clientes), no un gasto.
+  // Comparamos por NIT y también por NOMBRE normalizado (caso donde NIT viene mal).
   if (nitCliente) {
     const nitClienteClean = String(nitCliente).replace(/\D+/g, "");
     if (nit && nit === nitClienteClean) {
@@ -1588,18 +1603,50 @@ async function uploadFile(
 
 // ===== Sheets =====
 
-function isDuplicate(rows: any[][], numero: string, nit: string): boolean {
+/**
+ * Detecta si una factura ya está en el Sheet.
+ *
+ * La REGLA DE NEGOCIO según Tomás:
+ *   - El CONSECUTIVO (numero) es la fuente única de verdad para identificar
+ *     una factura. Si el mismo proveedor emite dos facturas con MISMO número,
+ *     es duplicado. Si emite varias con números distintos, cada una es real
+ *     aunque sean el mismo día por el mismo monto.
+ *
+ * Estrategia (en orden):
+ *   1. Si NIT presente en ambos lados → match por (numero, NIT) [estricto]
+ *   2. Si alguno sin NIT → fallback por (numero, proveedor normalizado)
+ *      (caso típico: planillas SS sin NIT, cuentas de cobro persona natural)
+ *
+ * Cols 15: A=N°(0), B=Fecha(1), C=Proveedor(2), D=NIT(3), E=N°Doc(4), ...
+ */
+function isDuplicate(
+  rows: any[][],
+  numero: string,
+  nit: string,
+  proveedor?: string,
+): boolean {
   if (!numero) return false;
   const numTrim = String(numero).trim();
+  if (numTrim.length < 1) return false;
   const nitNorm = String(nit || "").replace(/\D+/g, "");
-  // Match estricto: ambos NITs deben existir e igualar.
-  // (La idempotencia primaria sigue siendo el label "Procesado" en Gmail.)
-  if (!nitNorm) return false;
-  // Cols nuevas (12): A=N°, B=Fecha, C=Proveedor, D=NIT, E=N°Factura, F..L resto
+  const proveedorNorm = proveedor ? normalizeProveedorName(proveedor) : "";
+
   return rows.some((r) => {
     const rowNum = String(r[4] || "").trim();
+    if (rowNum !== numTrim) return false;
+    // Mismo número — validar que sea el mismo proveedor:
     const rowNit = String(r[3] || "").replace(/\D+/g, "");
-    return rowNum === numTrim && rowNit === nitNorm;
+    if (nitNorm && rowNit) {
+      // Ambos NITs presentes: comparar NIT
+      return rowNit === nitNorm;
+    }
+    // Alguno sin NIT: comparar por nombre normalizado del proveedor
+    if (proveedorNorm) {
+      const rowProveedor = normalizeProveedorName(String(r[2] || ""));
+      return rowProveedor === proveedorNorm;
+    }
+    // Sin NIT ni proveedor → ser conservador y considerar duplicado si num idéntico
+    return true;
   });
 }
 
@@ -1780,7 +1827,7 @@ async function processOne(
     const tabRange = `'${tabName.replace(/'/g, "''")}'`;
 
     const sheetRows = await loadSheetRows(tabName);
-    if (isDuplicate(sheetRows, data.numero, data.nit)) {
+    if (isDuplicate(sheetRows, data.numero, data.nit, data.proveedor)) {
       await markEmailProcessed(gmail, messageId, labelId);
       await applyMonthLabel(gmail, messageId, year, month);
       return { dup: true, motivo: `${data.proveedor} ${data.numero} (ya en ${tabName})`, subject };
@@ -2110,7 +2157,7 @@ async function processCuentaCobroDocx(
 
     // 6. Dedup por NIT+número en el Sheet
     const sheetRows = await loadSheetRows(tabName);
-    if (extracted.nit && extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit)) {
+    if (extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit, extracted.proveedor)) {
       await markEmailProcessed(gmail, messageId, labelProcesadoId);
       await applyMonthLabel(gmail, messageId, year, month);
       return {
@@ -2296,7 +2343,7 @@ async function processGenericPdf(
 
     // 7. Dedup
     const sheetRows = await loadSheetRows(tabName);
-    if (extracted.nit && extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit)) {
+    if (extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit, extracted.proveedor)) {
       await markEmailProcessed(gmail, messageId, labelProcesadoId);
       await applyMonthLabel(gmail, messageId, year, month);
       return {

@@ -1,17 +1,40 @@
+/**
+ * /operacion (home) — Vista gerencial.
+ *
+ * No es operativa (eso es /diagnostico). Acá querés ver el negocio:
+ *   - KPIs de negocio con delta vs mes anterior
+ *   - Lo que requiere TU acción HOY (generado por Claude)
+ *   - Salud de clientes con sparkline 30d
+ *   - Pipeline de onboarding
+ *   - Charts comparativos últimos 6 meses
+ *   - Botón "Reporte ejecutivo del mes" (Claude resume el mes)
+ */
+
 import { Link } from "react-router-dom";
-import { useClientes, useAgentes, useLatestRuns, useClientAgents, useAllFacturas } from "../lib/queries";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { supabase } from "../lib/supabase";
 import {
-  runsToday,
-  totalErrores,
+  useClientes,
+  useAgentes,
+  useLatestRuns,
+  useClientAgents,
+  useAllFacturas,
+} from "../lib/queries";
+import {
+  facturasThisMonth,
   tiempoAhorradoHoras,
   formatHoras,
-  totalFacturas,
-  facturasThisMonth,
+  aggFacturasByMonth,
 } from "../lib/metrics";
-import Hero from "./Hero";
-import Kpis from "./Kpis";
-import ClientCard from "./ClientCard";
+import type { Cliente, AgentEvent } from "../types";
 import EmptyState from "./EmptyState";
+
+interface FacturaPayload {
+  fecha?: string;
+  total?: number;
+  proveedor?: string;
+}
 
 export default function Matriz() {
   const { data: clientes, isLoading: lc } = useClientes();
@@ -19,6 +42,7 @@ export default function Matriz() {
   const { data: runs, isLoading: lr } = useLatestRuns();
   const { data: activaciones, isLoading: lac } = useClientAgents();
   const { data: facturas, isLoading: lf } = useAllFacturas();
+  const onboarding = useOnboardingPipeline();
 
   if (lc || la || lr || lac || lf) {
     return (
@@ -29,238 +53,442 @@ export default function Matriz() {
   }
   if (!clientes || !agentes || !runs || !activaciones || !facturas) return null;
 
-  const agenteById = Object.fromEntries(agentes.map((a) => [a.id, a]));
-  const clienteById = Object.fromEntries(clientes.map((c) => [c.id, c]));
+  // ===== KPIs de NEGOCIO =====
+  const now = new Date();
+  const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
-  // Solo activaciones activas
-  const actsActivas = activaciones.filter((a) => a.activo);
+  const facturasMesActual = facturasThisMonth(facturas);
+  const facturasMesAnterior = facturasThisMonth(facturas, prevMonth);
+  const factMes = facturasMesActual.length;
+  const factMesPrev = facturasMesAnterior.length;
+  const deltaFactPct = factMesPrev > 0 ? ((factMes - factMesPrev) / factMesPrev) * 100 : null;
 
-  // KPIs globales — usan agent_events (fuente de verdad por FECHA REAL)
-  const facturasMes = totalFacturas(facturasThisMonth(facturas));
-  const facturasAllTime = totalFacturas(facturas);
-  const horasAhorradasMes = tiempoAhorradoHoras(facturasMes);
-  const horasAhorradasAllTime = tiempoAhorradoHoras(facturasAllTime);
-  // Runs hoy / errores siguen usando agent_runs (info técnica del cron)
-  const runsTodayList = runsToday(runs);
-  const runsHoyN = runsTodayList.length;
-  // Errores HOY (calendario) — errores de días pasados no son ruido operacional.
-  const erroresHoy = totalErrores(runsTodayList);
-  const lastFailRuns = runs
-    .filter((r) => r.status === "fail")
-    .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime());
-  const lastFail = lastFailRuns[0];
-  const lastFailWhen = lastFail ? timeAgo(lastFail.started_at) : null;
+  // Clientes activos = tienen al menos 1 factura este mes
+  const clientesActivosIds = new Set(facturasMesActual.map((f) => f.cliente_id));
+  const clientesActivosMesPrev = new Set(facturasMesAnterior.map((f) => f.cliente_id));
+  const totalClientes = clientes.length;
+  const deltaClientes = clientesActivosIds.size - clientesActivosMesPrev.size;
 
-  // Status global del hero — solo "fail" si hay errores HOY
-  const heroStatus: "ok" | "warn" | "fail" = erroresHoy > 0 ? "fail" : "ok";
+  // Costo Anthropic mes actual (suma de payload.llm_cost_usd en runs facturación)
+  let costoMes = 0;
+  for (const r of runs) {
+    if (r.agente_id !== "facturacion") continue;
+    const d = new Date(r.started_at);
+    if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()) {
+      costoMes += Number((r.payload as any)?.llm_cost_usd ?? 0);
+    }
+  }
+  const costoPorFactura = factMes > 0 ? costoMes / factMes : 0;
 
-  // Próximo cron (asumimos cron 7am Bogota; si ya pasó hoy, mañana)
-  const proxCron = nextCronAt(7);
-
-  // Contar agentes únicos activados
-  const agentesActivados = new Set(actsActivas.map((a) => a.agente_id)).size;
-
-  const heroEyebrow = heroStatus === "ok"
-    ? `Todo en orden · ${formatDateTitle(new Date())}`
-    : `Atención · ${formatDateTitle(new Date())}`;
-
-  const heroTitle = clientes.length === 0 ? (
-    <>Sin clientes <em className="italic font-normal text-ink-2">aún.</em></>
-  ) : (
-    <>
-      {clientes.length} {clientes.length === 1 ? "cliente" : "clientes"},
-      <br />
-      <em className="italic font-normal text-ink-2">
-        {heroStatus === "ok" ? "operación normal." : "revisar runs."}
-      </em>
-    </>
-  );
-
-  const lastRunGlobal = runs[0];
-  const heroDeck = lastRunGlobal ? (
-    <>
-      Último run <span className="font-mono text-ink-2">{timeAgo(lastRunGlobal.started_at)}</span>.
-      Próximo cron mañana <span className="font-mono text-ink-2">{proxCron}</span> Bogotá.
-      {agentesActivados === 1 ? " Un agente activo: Equipo-facturación." : ` ${agentesActivados} agentes activos.`}
-    </>
-  ) : null;
+  // Horas ahorradas
+  const horasAhorradasMes = tiempoAhorradoHoras(factMes);
+  const horasAhorradasMesPrev = tiempoAhorradoHoras(factMesPrev);
 
   return (
     <div>
-      <Hero
-        eyebrow={heroEyebrow}
-        eyebrowDot={heroStatus}
-        title={heroTitle}
-        deck={heroDeck}
-        statValue={facturasMes}
-        statLabel={
-          <>
-            facturas procesadas <span className="text-ink-4">· este mes</span>
-          </>
-        }
-      />
+      {/* === HERO: KPIs de negocio === */}
+      <section className="border-b border-edge pb-7 mb-9">
+        <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-ink-3 font-medium mb-2">
+          {formatDateTitle(now)} · operación
+        </div>
+        <h1 className="font-display text-5xl font-medium tracking-tightest text-ink leading-none mb-6">
+          {factMes > 0 ? (
+            <>
+              {factMes.toLocaleString("es-CO")} facturas
+              <br />
+              <em className="italic font-normal text-ink-2">
+                este mes.
+              </em>
+            </>
+          ) : (
+            <>
+              Mes recién empezado.
+              <br />
+              <em className="italic font-normal text-ink-2">Esperando primer batch.</em>
+            </>
+          )}
+        </h1>
 
-      <Kpis
-        items={[
-          {
-            label: "Runs hoy",
-            value: runsHoyN,
-            meta: runsHoyN > 0 ? <>último: <span className="text-ok">{lastRunGlobal ? timeAgo(lastRunGlobal.started_at) : ""}</span></> : "esperando primer cron",
-          },
-          {
-            label: "Errores hoy",
-            value: erroresHoy,
-            alert: erroresHoy > 0,
-            meta: lastFailWhen ? `último: ${lastFailWhen}` : "ninguno",
-          },
-          {
-            label: "Procesadas mes",
-            value: facturasMes,
-            unit: "facturas",
-            meta: facturasMes > 0 ? <>≈ {formatHoras(horasAhorradasMes)} ahorradas</> : "—",
-          },
-          {
-            label: "All-time",
-            value: facturasAllTime,
-            unit: "facturas",
-            meta: facturasAllTime > 0 ? <>≈ {formatHoras(horasAhorradasAllTime)} ahorradas</> : "desde que arrancó Operatto",
-          },
-        ]}
-      />
+        <div className="grid grid-cols-4 gap-3">
+          <KpiCard
+            label="Facturas mes"
+            value={factMes.toLocaleString("es-CO")}
+            delta={deltaFactPct}
+            subtitle={`vs ${factMesPrev} el mes pasado`}
+          />
+          <KpiCard
+            label="Clientes activos"
+            value={`${clientesActivosIds.size} / ${totalClientes}`}
+            deltaAbs={deltaClientes}
+            subtitle={
+              deltaClientes > 0
+                ? `+${deltaClientes} este mes`
+                : deltaClientes < 0
+                  ? `${deltaClientes} este mes`
+                  : "sin cambios"
+            }
+          />
+          <KpiCard
+            label="Horas ahorradas"
+            value={formatHoras(horasAhorradasMes)}
+            delta={
+              horasAhorradasMesPrev > 0
+                ? ((horasAhorradasMes - horasAhorradasMesPrev) / horasAhorradasMesPrev) * 100
+                : null
+            }
+            subtitle={`vs ${formatHoras(horasAhorradasMesPrev)} el mes pasado`}
+          />
+          <KpiCard
+            label="Costo / factura"
+            value={`$${costoPorFactura.toFixed(3)}`}
+            subtitle={`$${costoMes.toFixed(2)} en LLM este mes`}
+            invertColor
+          />
+        </div>
+      </section>
 
-      {/* === Resumen por agente (PRIMERO — visión global) === */}
-      {actsActivas.length > 0 && (
-        <section className="mb-9">
-          <div className="flex items-baseline justify-between mb-4">
-            <h2 className="section-title">Resumen por agente</h2>
-            <Link
-              to="/agentes"
-              className="font-mono text-[11px] text-accent hover:underline tracking-[0.04em]"
-            >
-              ver todos →
-            </Link>
+      {/* === LO QUE REQUIERE TU ACCIÓN HOY === */}
+      <ReporteEjecutivoMensual />
+
+      {/* === CLIENTES (resumen + link a tabla completa) === */}
+      <section className="mb-9">
+        <div className="flex items-baseline justify-between mb-4">
+          <h2 className="section-title">Clientes</h2>
+          <Link
+            to="/clientes"
+            className="font-mono text-[11px] text-accent hover:underline tracking-[0.04em]"
+          >
+            ver tabla completa →
+          </Link>
+        </div>
+        {clientes.length === 0 ? (
+          <EmptyState
+            title="Sin clientes todavía"
+            description="Cuando crees un cliente y actives el Procesador, aparecerán acá."
+            cta={{ label: "Crear primer cliente", to: "/nuevo-cliente" }}
+          />
+        ) : (
+          <div className="grid grid-cols-3 gap-3">
+            <ResumenClientesCard
+              label="Activos este mes"
+              value={clientesActivosIds.size}
+              total={totalClientes}
+              accent="ok"
+            />
+            <ResumenClientesCard
+              label="Sin actividad 7+ días"
+              value={contarSinActividad(clientes, facturas, 7)}
+              total={totalClientes}
+              accent="warn"
+            />
+            <ResumenClientesCard
+              label="Onboarding en curso"
+              value={onboarding.data?.enProgreso.length ?? 0}
+              total={totalClientes}
+              accent="neutral"
+            />
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            {Array.from(new Set(actsActivas.map((a) => a.agente_id))).map((agenteId) => {
-              const a = agenteById[agenteId];
-              // Métricas por fecha REAL de la factura (agent_events)
-              const facturasAg = facturas.filter((ev) => ev.agente_id === agenteId);
-              const proc = totalFacturas(facturasThisMonth(facturasAg));
-              const horas = tiempoAhorradoHoras(proc);
-              const allTime = totalFacturas(facturasAg);
-              const clientesQ = new Set(
-                actsActivas.filter((act) => act.agente_id === agenteId).map((act) => act.cliente_id),
-              ).size;
-              return (
-                <Link
-                  key={agenteId}
-                  to={`/agente/${agenteId}`}
-                  className="card card-hover no-underline text-ink"
-                >
-                  <div className="flex items-center gap-2 mb-3">
-                    <span className="w-1.5 h-1.5 rounded-full bg-accent" />
-                    <span className="font-display text-base font-semibold tracking-tighter">
-                      {a?.nombre ?? agenteId}
-                    </span>
-                    <span className="ml-auto font-mono text-[10px] text-ink-3 tracking-[0.04em]">
-                      {clientesQ} cliente{clientesQ === 1 ? "" : "s"}
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-3">
-                    <KpiInline label="Mes" value={proc} unit="facts" />
-                    <KpiInline label="All-time" value={allTime} unit="facts" />
-                    <KpiInline
-                      label="Ahorrado mes"
-                      value={formatHoras(horas).replace(/[hm]/, "")}
-                      unit={formatHoras(horas).endsWith("h") ? "h" : "min"}
-                    />
-                  </div>
-                </Link>
-              );
-            })}
-          </div>
-        </section>
-      )}
+        )}
+      </section>
 
-      {/* === Clientes en operación (DESPUÉS — detalle por cliente) === */}
-      <div className="flex items-baseline justify-between mb-4">
-        <h2 className="section-title">Clientes en operación</h2>
-        <span className="section-meta">
-          {actsActivas.length === 0
-            ? "ninguno activado"
-            : `${actsActivas.length} activación${actsActivas.length === 1 ? "" : "es"} · ordenado por última actividad`}
-        </span>
+      {/* === CHARTS COMPARATIVOS 6 MESES === */}
+      <section className="mb-9">
+        <div className="flex items-baseline justify-between mb-4">
+          <h2 className="section-title">Histórico · últimos 6 meses</h2>
+        </div>
+        <HistoricoMensual facturas={facturas} />
+      </section>
+    </div>
+  );
+}
+
+// ============================================================================
+// KPI Cards (con delta)
+// ============================================================================
+
+function KpiCard({
+  label,
+  value,
+  delta,
+  deltaAbs,
+  subtitle,
+  invertColor,
+}: {
+  label: string;
+  value: string | number;
+  delta?: number | null;
+  deltaAbs?: number;
+  subtitle?: string;
+  invertColor?: boolean;
+}) {
+  const hasDelta = delta !== undefined && delta !== null && !isNaN(delta);
+  const isPositive = hasDelta ? delta! > 0 : deltaAbs !== undefined ? deltaAbs > 0 : null;
+  const isNegative = hasDelta ? delta! < 0 : deltaAbs !== undefined ? deltaAbs < 0 : null;
+  // invertColor: para "costo por factura", bajar es bueno
+  const arrowColor = invertColor
+    ? isPositive
+      ? "text-accent"
+      : isNegative
+        ? "text-ok"
+        : "text-ink-4"
+    : isPositive
+      ? "text-ok"
+      : isNegative
+        ? "text-accent"
+        : "text-ink-4";
+
+  return (
+    <div className="card">
+      <div className="label-tight text-ink-3 mb-1.5">{label}</div>
+      <div className="flex items-baseline gap-2 mb-1">
+        <div className="font-display text-3xl font-medium tracking-[-0.02em] tabular-nums text-ink leading-none">
+          {value}
+        </div>
+        {hasDelta && (
+          <div className={`font-mono text-[11px] tabular-nums ${arrowColor}`}>
+            {delta! > 0 ? "↗" : delta! < 0 ? "↘" : "→"} {Math.abs(delta!).toFixed(0)}%
+          </div>
+        )}
+        {!hasDelta && deltaAbs !== undefined && deltaAbs !== 0 && (
+          <div className={`font-mono text-[11px] tabular-nums ${arrowColor}`}>
+            {deltaAbs > 0 ? `+${deltaAbs}` : deltaAbs}
+          </div>
+        )}
       </div>
-
-      {clientes.length === 0 ? (
-        <EmptyState
-          title="Sin clientes todavía"
-          description="Cuando crees un cliente y actives Equipo-facturación, aparecerán acá con su timeline operacional."
-          cta={{ label: "Crear primer cliente", to: "/nuevo-cliente" }}
-        />
-      ) : actsActivas.length === 0 ? (
-        <EmptyState
-          title="Sin agentes activados"
-          description="Tenés clientes pero ninguno tiene un agente activado todavía. Editá un cliente para activar Equipo-facturación."
-          cta={null}
-        />
-      ) : (
-        <div className="grid grid-cols-1 gap-3 mb-9">
-          {actsActivas.map((act) => {
-            const cliente = clienteById[act.cliente_id];
-            if (!cliente) return null;
-            const agente = agenteById[act.agente_id];
-            const runsCA = runs.filter(
-              (r) => r.cliente_id === cliente.id && r.agente_id === act.agente_id,
-            );
-            const facturasCA = facturas.filter(
-              (f) => f.cliente_id === cliente.id && f.agente_id === act.agente_id,
-            );
-            return (
-              <ClientCard
-                key={`${act.cliente_id}-${act.agente_id}`}
-                cliente={cliente}
-                activacion={act}
-                agente={agente}
-                runs={runsCA}
-                facturas={facturasCA}
-              />
-            );
-          })}
+      {subtitle && (
+        <div className="font-mono text-[9px] text-ink-4 tracking-[0.04em] uppercase">
+          {subtitle}
         </div>
       )}
     </div>
   );
 }
 
-function KpiInline({ label, value, unit }: { label: string; value: number | string; unit?: string }) {
+// ============================================================================
+// Reporte ejecutivo mensual (botón)
+// ============================================================================
+
+function ReporteEjecutivoMensual() {
+  const [reporte, setReporte] = useState<string | null>(null);
+  const mut = useMutation({
+    mutationFn: async () => {
+      const { data: sess } = await supabase.auth.getSession();
+      const accessToken = sess.session?.access_token;
+      const resp = await fetch("/api/operacion-reporte-mes", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({ fecha: new Date().toISOString() }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      const json = await resp.json();
+      return json.reporte as string;
+    },
+    onSuccess: (r) => setReporte(r),
+  });
+
   return (
-    <div>
-      <div className="font-mono text-[9px] uppercase tracking-[0.1em] text-ink-3 font-medium mb-0.5">
-        {label}
+    <section className="mb-9 card">
+      <div className="flex items-start justify-between mb-2 gap-4">
+        <div>
+          <h2 className="font-display text-base font-semibold tracking-tighter mb-0.5">
+            Lo que requiere tu atención
+          </h2>
+          <p className="font-mono text-[10px] text-ink-3 tracking-[0.04em] uppercase">
+            Claude analiza el mes y te dice qué decisiones tomar
+          </p>
+        </div>
+        <button
+          onClick={() => mut.mutate()}
+          disabled={mut.isPending}
+          className="btn-primary disabled:opacity-50 shrink-0"
+        >
+          {mut.isPending ? "Analizando…" : reporte ? "Regenerar" : "Generar análisis"}
+        </button>
       </div>
-      <div className="flex items-baseline gap-1">
-        <span className="font-display text-lg font-semibold tracking-tighter text-ink tabular-nums">
+      {mut.isError && (
+        <div className="font-mono text-[11px] text-accent mt-2">
+          Error: {(mut.error as Error).message}
+        </div>
+      )}
+      {reporte && (
+        <div className="mt-3 pt-3 border-t border-edge-2 font-sans text-[13px] text-ink whitespace-pre-wrap leading-relaxed">
+          {reporte}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ============================================================================
+// Resumen Clientes Card (gerencial)
+// ============================================================================
+
+function ResumenClientesCard({
+  label,
+  value,
+  total,
+  accent,
+}: {
+  label: string;
+  value: number;
+  total: number;
+  accent: "ok" | "warn" | "neutral";
+}) {
+  const colorClass =
+    value === 0
+      ? "text-ink-4"
+      : accent === "ok"
+        ? "text-ok"
+        : accent === "warn"
+          ? "text-accent"
+          : "text-ink";
+  return (
+    <Link to="/clientes" className="card card-hover no-underline text-ink">
+      <div className="label-tight text-ink-3 mb-1.5">{label}</div>
+      <div className="flex items-baseline gap-2">
+        <span
+          className={`font-display text-3xl font-medium tracking-[-0.02em] tabular-nums leading-none ${colorClass}`}
+        >
           {value}
         </span>
-        {unit && (
-          <span className="font-mono text-[9px] text-ink-3 tracking-[0.04em]">
-            {unit}
-          </span>
-        )}
+        <span className="font-mono text-[10px] text-ink-4">de {total}</span>
+      </div>
+    </Link>
+  );
+}
+
+function contarSinActividad(
+  clientes: Cliente[],
+  facturas: AgentEvent[],
+  dias: number,
+): number {
+  const cutoff = Date.now() - dias * 24 * 60 * 60 * 1000;
+  let count = 0;
+  for (const c of clientes) {
+    if (!c.activo) continue;
+    const factCliente = facturas.filter((f) => f.cliente_id === c.id);
+    const fechas = factCliente
+      .map((f) => (f.payload as FacturaPayload | null)?.fecha)
+      .filter((d): d is string => !!d)
+      .sort();
+    const ultima = fechas[fechas.length - 1];
+    if (!ultima) {
+      count++;
+      continue;
+    }
+    const ultimaMs = new Date(ultima + "T00:00:00").getTime();
+    if (ultimaMs < cutoff) count++;
+  }
+  return count;
+}
+
+
+function HistoricoMensual({ facturas }: { facturas: AgentEvent[] }) {
+  const meses = aggFacturasByMonth(facturas, 6);
+  const totalMonto = (events: AgentEvent[]): number => {
+    let total = 0;
+    for (const ev of events) {
+      const t = (ev.payload as FacturaPayload | null)?.total;
+      if (typeof t === "number") total += t;
+    }
+    return total;
+  };
+
+  // Calcular monto $ por mes
+  const mesesConMonto = meses.map((m) => {
+    const factDelMes = facturas.filter((f) => {
+      const fecha = (f.payload as FacturaPayload | null)?.fecha;
+      return fecha?.slice(0, 7) === m.key;
+    });
+    return { ...m, monto: totalMonto(factDelMes) };
+  });
+
+  const maxFact = Math.max(1, ...mesesConMonto.map((m) => m.procesadas));
+  const maxMonto = Math.max(1, ...mesesConMonto.map((m) => m.monto));
+
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      <div className="card">
+        <div className="flex items-baseline justify-between mb-3">
+          <div className="label-tight text-ink-3">Facturas por mes</div>
+          <div className="font-mono text-[10px] text-ink-3 tabular-nums">
+            {mesesConMonto.reduce((s, m) => s + m.procesadas, 0)} en 6 meses
+          </div>
+        </div>
+        <BarsMensuales data={mesesConMonto} valueKey="procesadas" max={maxFact} color="ink" />
+      </div>
+      <div className="card">
+        <div className="flex items-baseline justify-between mb-3">
+          <div className="label-tight text-ink-3">Volumen $ procesado</div>
+          <div className="font-mono text-[10px] text-ink-3 tabular-nums">
+            ${(mesesConMonto.reduce((s, m) => s + m.monto, 0) / 1_000_000).toFixed(0)}M COP
+          </div>
+        </div>
+        <BarsMensuales
+          data={mesesConMonto}
+          valueKey="monto"
+          max={maxMonto}
+          color="accent"
+          format={(v) => `$${(v / 1_000_000).toFixed(1)}M`}
+        />
       </div>
     </div>
   );
 }
 
-function timeAgo(iso: string): string {
-  const ms = Date.now() - new Date(iso).getTime();
-  const m = Math.floor(ms / 60000);
-  if (m < 1) return "ahora";
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `hace ${h}h`;
-  return `hace ${Math.floor(h / 24)}d`;
+function BarsMensuales({
+  data,
+  valueKey,
+  max,
+  color,
+  format = (v: number) => v.toString(),
+}: {
+  data: Array<{ label: string; procesadas: number; monto?: number; key: string }>;
+  valueKey: "procesadas" | "monto";
+  max: number;
+  color: "ok" | "accent" | "ink";
+  format?: (v: number) => string;
+}) {
+  const fillVar = color === "ok" ? "var(--color-ok)" : color === "accent" ? "var(--color-accent)" : "var(--color-ink)";
+  const height = 120;
+  return (
+    <div>
+      <div className="flex items-end gap-3 h-[120px] mb-2">
+        {data.map((m, i) => {
+          const v = (m as any)[valueKey] as number;
+          const h = (v / max) * height;
+          const isLast = i === data.length - 1;
+          return (
+            <div key={m.key} className="flex-1 flex flex-col items-center justify-end gap-1">
+              <div className="font-mono text-[9px] text-ink-3 tabular-nums">{v > 0 ? format(v) : ""}</div>
+              <div
+                className="w-full rounded-sm"
+                style={{
+                  height: `${Math.max(1, h)}px`,
+                  background: fillVar,
+                  opacity: isLast ? 1 : 0.6,
+                }}
+                title={`${m.label}: ${format(v)}`}
+              />
+            </div>
+          );
+        })}
+      </div>
+      <div className="flex gap-3">
+        {data.map((m, i) => (
+          <div
+            key={m.key}
+            className={`flex-1 text-center font-mono text-[9px] tracking-[0.04em] uppercase ${i === data.length - 1 ? "text-ink" : "text-ink-4"}`}
+          >
+            {m.label}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function formatDateTitle(d: Date): string {
@@ -270,17 +498,17 @@ function formatDateTitle(d: Date): string {
   return `${day}.${mon}.${yr}`;
 }
 
-function nextCronAt(hour: number): string {
-  const now = new Date();
-  const next = new Date();
-  next.setHours(hour, 0, 0, 0);
-  if (now.getTime() >= next.getTime()) {
-    // ya pasó hoy → avanzar a mañana
-    next.setDate(next.getDate() + 1);
-  }
-  return next.toLocaleTimeString("es-CO", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: "America/Bogota",
+// Hook que cuenta clientes en proceso de onboarding (no completado)
+function useOnboardingPipeline() {
+  return useQuery({
+    queryKey: ["onboarding-pipeline"],
+    refetchInterval: 5 * 60_000,
+    queryFn: async () => {
+      const { data } = await supabase
+        .from("onboarding_tokens")
+        .select("token, step")
+        .in("step", ["pending", "oauth_done", "fiscal_pending", "resources_done"]);
+      return { enProgreso: (data ?? []) as any[] };
+    },
   });
 }

@@ -72,23 +72,9 @@ function useDiagnosticoData() {
         .gte("started_at", dayStart)
         .order("started_at", { ascending: false });
 
-      const conteos = await Promise.all(
-        ((clientes ?? []) as ClienteRow[]).map(async (c) => {
-          const { count } = await supabase
-            .from("agent_events")
-            .select("*", { count: "exact", head: true })
-            .eq("cliente_id", c.id)
-            .eq("agente_id", "facturacion")
-            .eq("tipo", "factura_procesada")
-            .gte("payload->>fecha", "2026-01-01");
-          return { cliente_id: c.id, facturas_2026: count ?? 0 };
-        }),
-      );
-
       return {
         clientes: (clientes ?? []) as ClienteRow[],
         runs: (runs ?? []) as RunRow[],
-        conteos: new Map(conteos.map((c) => [c.cliente_id, c.facturas_2026])),
       };
     },
   });
@@ -111,7 +97,7 @@ export default function DiagnosticoPage() {
     );
   }
 
-  const { clientes, runs, conteos } = data;
+  const { clientes, runs } = data;
   const clientesOp = clientes.filter((c) => !SYNTHETIC_SLUGS.has(c.slug));
 
   // Stats agregadas por agente
@@ -208,77 +194,36 @@ export default function DiagnosticoPage() {
         </div>
       </section>
 
-      {/* === Tabla de clientes (4 columnas: Procesadas/Saltadas/Repetidas/Errores) === */}
+      {/* === Selector de cliente para auditoría === */}
       <section className="mb-8">
-        <h2 className="label mb-3">Clientes operativos · estado hoy</h2>
-        <div className="card overflow-hidden p-0">
-          <table className="w-full text-[12px]">
-            <thead>
-              <tr className="border-b border-edge bg-paper-sunken">
-                <th className="text-left py-2.5 px-4 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Cliente</th>
-                <th className="text-right py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Facturas 2026</th>
-                <th className="text-right py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Procesadas</th>
-                <th className="text-right py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Repetidas</th>
-                <th className="text-right py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Saltadas</th>
-                <th className="text-right py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Errores</th>
-                <th className="text-center py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Runs</th>
-                <th className="text-left py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Último</th>
-                <th className="text-left py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Auditoría</th>
-              </tr>
-            </thead>
-            <tbody>
-              {clientesOp.map((c) => {
-                const cRuns = runsFactByCliente.get(c.id) ?? [];
-                const ultimo = cRuns[0];
-                const facturas = conteos.get(c.id) ?? 0;
-                // Sumar payload de TODOS los runs del cliente hoy (multi-pass = 12 runs)
-                const proc = sumPayload(cRuns, "procesadas");
-                const rep = sumPayload(cRuns, "repetidas");
-                const salt = sumPayload(cRuns, "saltadas");
-                const err = sumPayload(cRuns, "errores");
-                return (
-                  <tr key={c.id} className="border-b border-edge-2 hover:bg-paper-sunken/50">
-                    <td className="py-2.5 px-4">
-                      <Link to={`/cliente/${c.slug}`} className="text-ink hover:text-accent transition-colors font-medium">
-                        {c.nombre}
-                      </Link>
-                    </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">{facturas}</td>
-                    <td className={`py-2.5 px-3 text-right font-mono tabular-nums ${proc > 0 ? "text-ok" : "text-ink-4"}`}>{proc}</td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-ink-3">{rep}</td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-ink-3">{salt}</td>
-                    <td className={`py-2.5 px-3 text-right font-mono tabular-nums ${err > 0 ? "text-accent" : "text-ink-4"}`}>{err}</td>
-                    <td className="py-2.5 px-3 text-center font-mono text-ink-3">{cRuns.length}</td>
-                    <td className="py-2.5 px-3">
-                      {ultimo ? (
-                        <div className="flex items-center gap-2">
-                          <Pill status={ultimo.status} />
-                          <span className="font-mono text-[10px] text-ink-3">
-                            {new Date(ultimo.started_at).toLocaleTimeString("es-CO", {
-                              timeZone: "America/Bogota",
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-ink-4 font-mono text-[10px]">—</span>
-                      )}
-                    </td>
-                    <td className="py-2.5 px-3">
-                      <button
-                        onClick={() => setAuditCliente({ slug: c.slug, nombre: c.nombre })}
-                        className="font-mono text-[10px] text-accent hover:underline tracking-[0.04em]"
-                        title="Compara Gmail vs Drive vs Sheet vs agent_events del año"
-                      >
-                        auditar →
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div className="flex items-baseline justify-between mb-3">
+          <h2 className="label">Auditoría por cliente · compara Gmail vs Drive vs Sheet vs Events</h2>
+          <Link
+            to="/clientes"
+            className="font-mono text-[11px] text-accent hover:underline tracking-[0.04em]"
+          >
+            ver todos los clientes →
+          </Link>
+        </div>
+        <div className="card">
+          <div className="font-mono text-[10px] text-ink-3 tracking-[0.04em] uppercase mb-3">
+            Selecciona un cliente para auditar
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {clientesOp.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => setAuditCliente({ slug: c.slug, nombre: c.nombre })}
+                className={`font-mono text-[11px] tracking-[0.04em] px-2.5 py-1 rounded-md transition-all ${
+                  auditCliente?.slug === c.slug
+                    ? "bg-ink text-paper font-medium"
+                    : "text-ink-3 hover:text-ink hover:bg-paper-sunken"
+                }`}
+              >
+                {c.nombre}
+              </button>
+            ))}
+          </div>
         </div>
       </section>
 
@@ -354,12 +299,6 @@ function aggregateFacturacion(
     llmCalls,
     ultimaHora,
   };
-}
-
-function sumPayload(runs: RunRow[], key: string): number {
-  let sum = 0;
-  for (const r of runs) sum += Number(r.payload?.[key] ?? 0);
-  return sum;
 }
 
 // ============================================================================

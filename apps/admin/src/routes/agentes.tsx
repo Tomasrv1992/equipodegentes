@@ -113,52 +113,53 @@ export default function AgentesList() {
 
         return (
           <section key={eq.id} className="mb-10">
-            {/* Card del agente principal */}
+            {/* Card del agente principal — mismo layout visual que /diagnostico */}
             <Link
               to={`/agente/${principal.id}`}
               className="card card-hover no-underline text-ink block mb-3"
             >
-              <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-accent font-medium mb-1.5">
+              <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-accent font-medium mb-2">
                 {eq.categoria}
               </div>
-              <div className="flex items-baseline gap-2 mb-2">
-                <span className="w-2 h-2 rounded-full bg-accent translate-y-[-2px]" />
-                <h2 className="font-display text-2xl font-semibold tracking-tighter text-ink m-0">
-                  {eq.agenteNombre}
-                </h2>
-                {!principal.activo && (
-                  <span className="pill pill-off ml-auto">Inactivo</span>
-                )}
+              <div className="flex items-start justify-between mb-4">
+                <div className="flex items-start gap-3">
+                  <div className="text-2xl">📥</div>
+                  <div>
+                    <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase mb-1">
+                      07:00 · agente principal
+                    </div>
+                    <h2 className="font-display text-xl font-semibold tracking-tighter text-ink m-0">
+                      {eq.agenteNombre}
+                    </h2>
+                    <p className="text-xs text-ink-3 mt-1.5 leading-relaxed max-w-[760px]">
+                      {eq.descripcion}
+                    </p>
+                  </div>
+                </div>
+                {!principal.activo && <span className="pill pill-off">Inactivo</span>}
               </div>
-              <p className="text-xs text-ink-3 mb-4 leading-relaxed max-w-[760px]">
-                {eq.descripcion}
-              </p>
 
               <div className="grid grid-cols-4 gap-3 pt-3 border-t border-edge-2">
-                <Stat
+                <BigStat
                   label={mesActualLabel}
                   value={proc}
-                  unit="facturas"
-                  sublabel="mes en curso"
+                  sub="facturas · mes en curso"
                 />
-                <Stat
+                <BigStat
                   label="Histórico total"
                   value={allTime}
-                  unit="facturas"
-                  sublabel="desde inicio"
+                  sub="facturas · desde inicio"
                 />
-                <Stat
+                <BigStat
                   label="Horas ahorradas"
-                  value={formatHoras(horasMes).replace(/[hm]/, "")}
-                  unit={formatHoras(horasMes).endsWith("h") ? "h" : "min"}
-                  sublabel="mes en curso"
+                  value={formatHoras(horasMes)}
+                  sub="mes en curso"
                 />
-                <Stat
+                <BigStat
                   label="Clientes activos"
                   value={clientesQ}
-                  unit={errores7d > 0 ? `${errores7d} err 7d` : "ok"}
+                  sub={errores7d > 0 ? `${errores7d} err 7d · revisar` : "con agente activado"}
                   alert={errores7d > 0}
-                  sublabel="con agente activado"
                 />
               </div>
             </Link>
@@ -264,6 +265,32 @@ function pillClass(status: string): string {
   if (status === "fail") return "pill-fail";
   if (status === "running") return "pill-running";
   return "pill-off";
+}
+
+function BigStat({
+  label,
+  value,
+  sub,
+  alert,
+}: {
+  label: string;
+  value: number | string;
+  sub?: string;
+  alert?: boolean;
+}) {
+  return (
+    <div>
+      <div className="label-tight text-ink-3 mb-1">{label}</div>
+      <div
+        className={`font-display text-2xl font-medium tracking-[-0.02em] tabular-nums leading-none mb-1 ${alert ? "text-accent" : "text-ink"}`}
+      >
+        {value}
+      </div>
+      {sub && (
+        <div className="font-mono text-[9px] text-ink-4 tracking-[0.04em] uppercase">{sub}</div>
+      )}
+    </div>
+  );
 }
 
 function Stat({

@@ -25,6 +25,10 @@
   function = "diagnostico-reporte"
   path = "/api/diagnostico-reporte"
 
+[[edge_functions]]
+  function = "operacion-reporte-mes"
+  path = "/api/operacion-reporte-mes"
+
 # OAuth flow del cliente (Fase 3)
 [[edge_functions]]
   function = "auth-google-start"

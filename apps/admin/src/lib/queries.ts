@@ -19,10 +19,11 @@ export function useClientes() {
   return useQuery({
     queryKey: ["clientes"],
     queryFn: async (): Promise<Cliente[]> => {
+      // Trae TODOS los clientes (activos + inactivos). El filtrado por estado
+      // se hace en el frontend (filtros del panel /clientes).
       const { data, error } = await supabase
         .from("clientes")
         .select("*")
-        .eq("activo", true)
         .order("nombre");
       if (error) throw error;
       return data as Cliente[];

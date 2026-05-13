@@ -70,8 +70,11 @@ export interface LimpiadorReport {
   errores: Array<{ cliente_slug: string; error: string }>;
 }
 
-/** Costo aproximado por llamada al LLM (Claude Haiku). */
-const LLM_COST_PER_CALL_USD = 0.001;
+/**
+ * Costo aproximado por llamada al LLM (Claude Haiku 4.5).
+ * $1/1M input + $5/1M output. Llamada típica ~2000+200 tokens = ~$0.003 USD.
+ */
+const LLM_COST_PER_CALL_USD = 0.003;
 
 export async function runLimpiador(): Promise<LimpiadorReport> {
   const supa = getServerClient();

@@ -91,22 +91,36 @@ export default async (request: Request, _context: Context) => {
   const limpiador = runs.find((r) => r.agente_id === "limpiador");
   const supervisor = runs.find((r) => r.agente_id === "supervisor");
 
+  // Costo Anthropic real: $0.003 por llamada Haiku 4.5
+  const COST_PER_CALL = 0.003;
+  const llamadasLimp = Number(limpiador?.payload?.total_huerfanos_analizados ?? 0);
+  const costoTotalUsd = (llmCallsFact + llamadasLimp) * COST_PER_CALL;
+
+  // Top problemas por cliente (limitar a 5 para no sobrecargar prompt)
+  const clientesProblema = Object.entries(porCliente)
+    .filter(([, v]) => v.errores > 0 || v.status === "fail" || v.status === "warn")
+    .sort(([, a], [, b]) => b.errores - a.errores)
+    .slice(0, 5)
+    .map(([slug, v]) => ({ slug, nombre: v.nombre, errores: v.errores, status: v.status, procesadas: v.procesadas }));
+
   const ctx = {
     fecha: now.toLocaleDateString("es-CO", { timeZone: "America/Bogota", dateStyle: "long" }),
     clientes_total: clientesOp.length,
-    facturacion_por_cliente: porCliente,
-    monitor: monitor?.payload ?? null,
+    clientes_corrieron: Object.keys(porCliente).length,
+    facturas_procesadas_hoy: Object.values(porCliente).reduce((s, v) => s + v.procesadas, 0),
+    facturas_repetidas_hoy: Object.values(porCliente).reduce((s, v) => s + v.repetidas, 0),
+    saltadas_hoy: Object.values(porCliente).reduce((s, v) => s + v.saltadas, 0),
+    errores_hoy: Object.values(porCliente).reduce((s, v) => s + v.errores, 0),
+    clientes_con_problemas: clientesProblema,
     reparador: {
       reparadas: reparador?.payload?.filas_reparadas?.length ?? 0,
       huerfanos: reparador?.payload?.pdfs_huerfanos?.length ?? 0,
       sin_pdf: reparador?.payload?.filas_sin_pdf?.length ?? 0,
-      errores: reparador?.payload?.errores?.length ?? 0,
     },
     limpiador: {
       duplicados: limpiador?.payload?.duplicados_movidos ?? 0,
       recuperadas: limpiador?.payload?.facturas_recuperadas ?? 0,
       no_identificables: limpiador?.payload?.no_identificables ?? 0,
-      costo_llm: Number(limpiador?.payload?.costo_llm_usd ?? 0),
     },
     supervisor: {
       ok: supervisor?.payload?.clientes_ok ?? 0,
@@ -114,8 +128,8 @@ export default async (request: Request, _context: Context) => {
       fail: supervisor?.payload?.clientes_fail ?? 0,
       retriggers: supervisor?.payload?.retriggers_disparados ?? 0,
     },
-    costo_anthropic_total_usd: llmCostFact + Number(limpiador?.payload?.costo_llm_usd ?? 0),
-    llamadas_llm_total: llmCallsFact,
+    costo_anthropic_total_usd: Math.round(costoTotalUsd * 1000) / 1000,
+    llamadas_llm_total: llmCallsFact + llamadasLimp,
   };
 
   // 5. Llamar Claude

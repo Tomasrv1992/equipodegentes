@@ -10,10 +10,10 @@
  */
 
 import { Link } from "react-router-dom";
-import { useAgentes, useLatestRuns, useClientAgents } from "../lib/queries";
+import { useAgentes, useLatestRuns, useClientAgents, useAllFacturas } from "../lib/queries";
 import {
-  totalProcesadas,
-  runsThisMonth,
+  totalFacturas,
+  facturasThisMonth,
   runsLastDays,
   totalErrores,
   tiempoAhorradoHoras,
@@ -53,15 +53,19 @@ export default function AgentesList() {
   const { data: agentes, isLoading: la } = useAgentes();
   const { data: runs, isLoading: lr } = useLatestRuns();
   const { data: activaciones, isLoading: lac } = useClientAgents();
+  const { data: facturas, isLoading: lf } = useAllFacturas();
 
-  if (la || lr || lac) {
+  if (la || lr || lac || lf) {
     return (
       <div className="font-mono text-[11px] text-ink-3 tracking-[0.05em] uppercase">
         Cargando…
       </div>
     );
   }
-  if (!agentes || !runs || !activaciones) return null;
+  if (!agentes || !runs || !activaciones || !facturas) return null;
+
+  const ahora = new Date();
+  const mesActualLabel = ahora.toLocaleDateString("es-CO", { month: "long", year: "numeric" });
 
   // IDs de agentes que están agrupados dentro de equipos (los excluimos de "standalone")
   const idsAgrupados = new Set<string>();
@@ -94,8 +98,11 @@ export default function AgentesList() {
         const principal = agentes.find((a) => a.id === eq.agentePrincipal);
         if (!principal) return null;
         const runsAg = runs.filter((r) => r.agente_id === principal.id);
-        const proc = totalProcesadas(runsThisMonth(runsAg));
-        const allTime = totalProcesadas(runsAg);
+        // Facturas únicas por fecha REAL (agent_events) — fuente de verdad.
+        // No usar agent_runs porque multi-pass + retriggers inflan los contadores.
+        const facturasAg = facturas.filter((ev) => ev.agente_id === principal.id);
+        const proc = totalFacturas(facturasThisMonth(facturasAg));
+        const allTime = totalFacturas(facturasAg);
         const horasMes = tiempoAhorradoHoras(proc);
         const errores7d = totalErrores(runsLastDays(runsAg, 7));
         const clientesQ = new Set(
@@ -128,18 +135,30 @@ export default function AgentesList() {
               </p>
 
               <div className="grid grid-cols-4 gap-3 pt-3 border-t border-edge-2">
-                <Stat label="Mes" value={proc} unit="facts" />
-                <Stat label="All-time" value={allTime} unit="facts" />
                 <Stat
-                  label="Ahorrado mes"
-                  value={formatHoras(horasMes).replace(/[hm]/, "")}
-                  unit={formatHoras(horasMes).endsWith("h") ? "h" : "min"}
+                  label={mesActualLabel}
+                  value={proc}
+                  unit="facturas"
+                  sublabel="mes en curso"
                 />
                 <Stat
-                  label="Clientes"
+                  label="Histórico total"
+                  value={allTime}
+                  unit="facturas"
+                  sublabel="desde inicio"
+                />
+                <Stat
+                  label="Horas ahorradas"
+                  value={formatHoras(horasMes).replace(/[hm]/, "")}
+                  unit={formatHoras(horasMes).endsWith("h") ? "h" : "min"}
+                  sublabel="mes en curso"
+                />
+                <Stat
+                  label="Clientes activos"
                   value={clientesQ}
                   unit={errores7d > 0 ? `${errores7d} err 7d` : "ok"}
                   alert={errores7d > 0}
+                  sublabel="con agente activado"
                 />
               </div>
             </Link>
@@ -207,8 +226,9 @@ export default function AgentesList() {
           <div className="grid grid-cols-2 gap-3">
             {standalone.map((a) => {
               const runsAg = runs.filter((r) => r.agente_id === a.id);
-              const proc = totalProcesadas(runsThisMonth(runsAg));
-              const allTime = totalProcesadas(runsAg);
+              const facturasAg = facturas.filter((ev) => ev.agente_id === a.id);
+              const proc = totalFacturas(facturasThisMonth(facturasAg));
+              const allTime = totalFacturas(facturasAg);
               const errores7d = totalErrores(runsLastDays(runsAg, 7));
               return (
                 <Link key={a.id} to={`/agente/${a.id}`} className="card card-hover no-underline text-ink">
@@ -219,8 +239,8 @@ export default function AgentesList() {
                     <p className="text-xs text-ink-3 mb-3 leading-relaxed">{a.descripcion}</p>
                   )}
                   <div className="grid grid-cols-3 gap-3 pt-3 border-t border-edge-2">
-                    <Stat label="Mes" value={proc} unit="facts" />
-                    <Stat label="All-time" value={allTime} unit="facts" />
+                    <Stat label={mesActualLabel} value={proc} unit="facturas" sublabel="mes en curso" />
+                    <Stat label="Histórico total" value={allTime} unit="facturas" sublabel="desde inicio" />
                     <Stat
                       label="Errores 7d"
                       value={errores7d}
@@ -251,11 +271,13 @@ function Stat({
   value,
   unit,
   alert,
+  sublabel,
 }: {
   label: string;
   value: number | string;
   unit?: string;
   alert?: boolean;
+  sublabel?: string;
 }) {
   return (
     <div>
@@ -274,6 +296,11 @@ function Stat({
           <span className="font-mono text-[9px] text-ink-3 tracking-[0.04em]">{unit}</span>
         )}
       </div>
+      {sublabel && (
+        <div className="font-mono text-[8px] text-ink-4 tracking-[0.04em] uppercase mt-0.5">
+          {sublabel}
+        </div>
+      )}
     </div>
   );
 }

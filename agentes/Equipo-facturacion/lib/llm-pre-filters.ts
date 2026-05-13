@@ -226,8 +226,13 @@ export function preFilterDocument(args: {
 
 // === D. Costo estimado ======================================================
 
-/** Costo aproximado por llamada a Claude Haiku 3.5. Conservador (alto). */
-export const LLM_COST_PER_CALL_USD = 0.001;
+/**
+ * Costo aproximado por llamada a Claude Haiku 4.5.
+ * Pricing oficial Haiku 4.5: $1/1M input + $5/1M output.
+ * Llamada típica ~2000 input + 200 output = $0.002 + $0.001 = $0.003 USD.
+ * Mejor sobreestimar que subestimar para evitar sorpresas en factura mensual.
+ */
+export const LLM_COST_PER_CALL_USD = 0.003;
 
 export function estimateLlmCost(calls: number): number {
   return Math.round(calls * LLM_COST_PER_CALL_USD * 10000) / 10000;

@@ -427,7 +427,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // Adjuntar stats LLM al result (importante: aunque sea 0 si nunca llamó)
   result.llmStats = {
     calls: llmTracker.calls,
-    estimatedCostUsd: Math.round(llmTracker.calls * 0.001 * 10000) / 10000,
+    estimatedCostUsd: Math.round(llmTracker.calls * 0.003 * 10000) / 10000,
     preFilteredOut: llmTracker.preFilteredOut,
   };
 

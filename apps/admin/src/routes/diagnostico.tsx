@@ -53,13 +53,6 @@ function bogotaTodayUtcStart(): string {
   return new Date(d.getTime() + 5 * 60 * 60 * 1000).toISOString();
 }
 
-function bogotaDateNDaysAgo(n: number): string {
-  const ms = Date.now() - n * 24 * 60 * 60 * 1000 - 5 * 60 * 60 * 1000;
-  const d = new Date(ms);
-  d.setUTCHours(0, 0, 0, 0);
-  return new Date(d.getTime() + 5 * 60 * 60 * 1000).toISOString();
-}
-
 function useDiagnosticoData() {
   return useQuery({
     queryKey: ["diagnostico-hoy"],
@@ -101,28 +94,6 @@ function useDiagnosticoData() {
   });
 }
 
-function useHistorico30Dias() {
-  return useQuery({
-    queryKey: ["diagnostico-historico-30d"],
-    refetchInterval: 5 * 60_000,
-    queryFn: async () => {
-      const since = bogotaDateNDaysAgo(30);
-      const { data: runs } = await supabase
-        .from("agent_runs")
-        .select("agente_id, status, started_at, payload")
-        .gte("started_at", since)
-        .order("started_at", { ascending: true });
-      return (runs ?? []) as Array<Pick<RunRow, "agente_id" | "status" | "started_at" | "payload">>;
-    },
-  });
-}
-
-// Día Bogotá (YYYY-MM-DD) desde ISO UTC
-function bogotaDayKey(iso: string): string {
-  const ms = new Date(iso).getTime() - 5 * 60 * 60 * 1000;
-  const d = new Date(ms);
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-}
 
 // ============================================================================
 // Página principal
@@ -130,7 +101,6 @@ function bogotaDayKey(iso: string): string {
 
 export default function DiagnosticoPage() {
   const { data, isLoading } = useDiagnosticoData();
-  const historico = useHistorico30Dias();
   const [auditCliente, setAuditCliente] = useState<{ slug: string; nombre: string } | null>(null);
 
   if (isLoading || !data) {
@@ -164,10 +134,11 @@ export default function DiagnosticoPage() {
   const aggSup = supervisorRun?.payload ?? {};
 
   // Costo Anthropic total del día (facturación + limpiador)
+  // Recalculamos desde llm_calls × $0.003 para runs viejos que tienen factor antiguo.
   const costoFact = aggFact.llmCostUsd;
-  const costoLimp = Number(aggLimp.costo_llm_usd ?? 0);
-  const llmCallsFact = aggFact.llmCalls;
   const llmCallsLimp = Number(aggLimp.llamadas_llm ?? aggLimp.total_huerfanos_analizados ?? 0);
+  const costoLimp = llmCallsLimp * LLM_COST_PER_CALL_USD;
+  const llmCallsFact = aggFact.llmCalls;
   const costoTotal = costoFact + costoLimp;
   const llmCallsTotal = llmCallsFact + llmCallsLimp;
 
@@ -326,12 +297,6 @@ export default function DiagnosticoPage() {
         supervisorPayload={aggSup}
         clienteById={clienteById}
       />
-
-      {/* === Dashboard gráfico === */}
-      <section className="mb-8">
-        <h2 className="label mb-3">Histórico · últimos 30 días</h2>
-        <HistoricoCharts runs={historico.data ?? []} loading={historico.isLoading} />
-      </section>
     </div>
   );
 }
@@ -339,6 +304,9 @@ export default function DiagnosticoPage() {
 // ============================================================================
 // Agregación
 // ============================================================================
+
+// Pricing real Claude Haiku 4.5 — debe coincidir con LLM_COST_PER_CALL_USD del backend
+const LLM_COST_PER_CALL_USD = 0.003;
 
 function aggregateFacturacion(
   runs: RunRow[],
@@ -357,7 +325,6 @@ function aggregateFacturacion(
     saltadas = 0,
     repetidas = 0,
     errores = 0,
-    llmCost = 0,
     llmCalls = 0;
   const clientesConRun = new Set<string>();
   let ultimaHora: string | undefined;
@@ -369,20 +336,21 @@ function aggregateFacturacion(
     saltadas += Number(p.saltadas ?? 0);
     repetidas += Number(p.repetidas ?? 0);
     errores += Number(p.errores ?? 0);
-    llmCost += Number(p.llm_cost_usd ?? 0);
     llmCalls += Number(p.llm_calls ?? 0);
     if (!ultimaHora || r.started_at > (ultimaHora || "")) ultimaHora = r.started_at;
   }
   // Filtrar clientes_con_run a solo operativos
   const opIds = new Set(clientesOp.map((c) => c.id));
   const clientesValidos = Array.from(clientesConRun).filter((id) => opIds.has(id));
+  // Calcular costo desde llm_calls (NO desde payload.llm_cost_usd) porque runs
+  // viejos están con factor obsoleto $0.001. El factor real Haiku 4.5 es $0.003.
   return {
     procesadas,
     saltadas,
     repetidas,
     errores,
     clientesConRun: clientesValidos.length,
-    llmCostUsd: llmCost,
+    llmCostUsd: llmCalls * LLM_COST_PER_CALL_USD,
     llmCalls,
     ultimaHora,
   };
@@ -883,7 +851,21 @@ function ReporteEjecutivoSection() {
         headers: { "content-type": "application/json", ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}) },
         body: JSON.stringify({ fecha: new Date().toISOString() }),
       });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok) {
+        // Leer body del error para mostrar mensaje útil
+        let detalle = "";
+        try {
+          const errJson = await resp.json();
+          detalle = errJson.error ?? JSON.stringify(errJson).slice(0, 250);
+        } catch {
+          try {
+            detalle = (await resp.text()).slice(0, 250);
+          } catch {
+            detalle = "(sin detalle)";
+          }
+        }
+        throw new Error(`HTTP ${resp.status} — ${detalle}`);
+      }
       const json = await resp.json();
       return json.reporte as string;
     },
@@ -918,128 +900,6 @@ function ReporteEjecutivoSection() {
         </div>
       )}
     </section>
-  );
-}
-
-// ============================================================================
-// Charts SVG nativos
-// ============================================================================
-
-function HistoricoCharts({
-  runs,
-  loading,
-}: {
-  runs: Array<Pick<RunRow, "agente_id" | "status" | "started_at" | "payload">>;
-  loading: boolean;
-}) {
-  if (loading) {
-    return (
-      <div className="card font-mono text-[11px] text-ink-3">Cargando histórico…</div>
-    );
-  }
-
-  // Agrupar por día
-  const porDia = new Map<string, { procesadas: number; errores: number; costo: number }>();
-  for (const r of runs) {
-    if (r.agente_id !== "facturacion") continue;
-    const day = bogotaDayKey(r.started_at);
-    const entry = porDia.get(day) ?? { procesadas: 0, errores: 0, costo: 0 };
-    const p = r.payload ?? {};
-    entry.procesadas += Number(p.procesadas ?? 0);
-    entry.errores += Number(p.errores ?? 0);
-    entry.costo += Number(p.llm_cost_usd ?? 0);
-    porDia.set(day, entry);
-  }
-
-  // Generar todos los días (incluso vacíos) de los últimos 30
-  const days: Array<{ day: string; procesadas: number; errores: number; costo: number }> = [];
-  for (let i = 29; i >= 0; i--) {
-    const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000 - 5 * 60 * 60 * 1000);
-    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-    const v = porDia.get(key) ?? { procesadas: 0, errores: 0, costo: 0 };
-    days.push({ day: key, ...v });
-  }
-
-  const totalProc30d = days.reduce((s, d) => s + d.procesadas, 0);
-  const totalCosto30d = days.reduce((s, d) => s + d.costo, 0);
-
-  return (
-    <div className="grid grid-cols-2 gap-3">
-      <div className="card">
-        <div className="flex items-baseline justify-between mb-3">
-          <div className="label-tight text-ink-3">Facturas procesadas/día</div>
-          <div className="font-mono text-[10px] text-ink-3 tabular-nums">{totalProc30d} en 30 días</div>
-        </div>
-        <BarChart
-          data={days.map((d) => ({ label: d.day.slice(5), value: d.procesadas, isError: d.errores > 0 }))}
-          height={140}
-          color="ok"
-        />
-      </div>
-      <div className="card">
-        <div className="flex items-baseline justify-between mb-3">
-          <div className="label-tight text-ink-3">Costo Anthropic/día</div>
-          <div className="font-mono text-[10px] text-ink-3 tabular-nums">${totalCosto30d.toFixed(2)} en 30 días</div>
-        </div>
-        <BarChart
-          data={days.map((d) => ({ label: d.day.slice(5), value: d.costo, isError: false }))}
-          height={140}
-          color="accent"
-          format={(v) => `$${v.toFixed(2)}`}
-        />
-      </div>
-    </div>
-  );
-}
-
-function BarChart({
-  data,
-  height,
-  color,
-  format = (v: number) => v.toString(),
-}: {
-  data: Array<{ label: string; value: number; isError?: boolean }>;
-  height: number;
-  color: "ok" | "accent" | "ink";
-  format?: (v: number) => string;
-}) {
-  const max = Math.max(1, ...data.map((d) => d.value));
-  const barW = 100 / data.length;
-  const fillVar = color === "ok" ? "var(--color-ok)" : color === "accent" ? "var(--color-accent)" : "var(--color-ink)";
-
-  return (
-    <div>
-      <svg viewBox={`0 0 100 ${height}`} preserveAspectRatio="none" className="w-full" style={{ height: `${height}px` }}>
-        {data.map((d, i) => {
-          const h = (d.value / max) * (height - 16);
-          const x = i * barW + barW * 0.15;
-          const y = height - 16 - h;
-          const w = barW * 0.7;
-          const isLast = i === data.length - 1;
-          return (
-            <g key={d.label}>
-              <rect
-                x={x}
-                y={y}
-                width={w}
-                height={Math.max(1, h)}
-                fill={d.isError ? "var(--color-accent)" : fillVar}
-                opacity={isLast ? 1 : 0.85}
-              >
-                <title>
-                  {d.label}: {format(d.value)}
-                </title>
-              </rect>
-            </g>
-          );
-        })}
-      </svg>
-      <div className="flex justify-between font-mono text-[9px] text-ink-4 mt-1.5 tracking-[0.04em]">
-        <span>{data[0].label}</span>
-        <span>{data[Math.floor(data.length / 2)].label}</span>
-        <span>{data[data.length - 1].label}</span>
-      </div>
-    </div>
   );
 }
 

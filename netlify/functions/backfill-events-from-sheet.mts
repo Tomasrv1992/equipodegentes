@@ -239,10 +239,33 @@ export default async (req: Request) => {
   );
 };
 
+/**
+ * Parsea montos en formato latino colombiano:
+ *   "$1.234.567"   → 1234567  (punto = separador de miles)
+ *   "$1.234,56"    → 1234.56  (coma = decimal)
+ *   "300.000"      → 300000
+ *   1234           → 1234     (ya es número)
+ *
+ * El parseFloat nativo interpreta el `.` como decimal (formato anglo),
+ * por eso necesitamos detectar el formato antes.
+ */
 function parseNum(v: unknown): number {
   if (typeof v === "number") return v;
   if (v == null || v === "") return 0;
-  const s = String(v).replace(/[^\d.-]/g, "");
+  // Quitar símbolo $ y espacios; dejar dígitos, puntos, comas, signo menos
+  let s = String(v).trim().replace(/[$\s]/g, "");
+  if (s.includes(",")) {
+    // Formato latino con decimales: "1.234.567,89"
+    //   - quitar puntos (separador de miles)
+    //   - coma → punto (decimal)
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    // Sin coma: asumir formato entero con `.` como separador de miles.
+    // "300.000" → "300000". Para contabilidad colombiana, raro tener decimales sin coma.
+    s = s.replace(/\./g, "");
+  }
+  // Eliminar cualquier otro caracter no numérico (excepto signo y punto decimal)
+  s = s.replace(/[^\d.-]/g, "");
   const n = parseFloat(s);
   return isNaN(n) ? 0 : n;
 }

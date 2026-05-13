@@ -91,13 +91,16 @@ export default async (req: Request) => {
     const tabRange = `'${tab.replace(/'/g, "''")}'`;
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: cred.sheet_id,
-      range: `${tabRange}!A2:L1000`, // skip header (row 1)
+      range: `${tabRange}!A2:O1000`, // 15 cols nueva estructura (skip header)
     });
     const rows = res.data.values || [];
     for (const row of rows) {
-      // Cols: A=N°(0), B=Fecha(1), C=Proveedor(2), D=NIT(3), E=N°Factura(4),
-      // F=Subtotal(5), G=IVA(6), H=Total(7), I=Concepto(8), J=Link PDF(9),
-      // K=Categoría(10), L=Cuenta PYG(11)
+      // Cols nueva estructura (15):
+      //   A=#(0), B=Fecha(1), C=Proveedor(2), D=NIT(3), E=#Documento(4),
+      //   F=Subtotal(5), G=IVA(6),
+      //   H=ReteFuente(7), I=ReteIVA(8), J=ReteICA(9),
+      //   K=Total a Pagar(10),
+      //   L=Concepto(11), M=Categoría(12), N=Cuenta PYG(13), O=Link PDF(14)
       const fechaRaw = String(row[1] || "").trim();
       const numero = String(row[4] || "").trim();
       const nit = String(row[3] || "").replace(/\D+/g, "");
@@ -106,6 +109,10 @@ export default async (req: Request) => {
       const fecha = parseFecha(fechaRaw);
       if (!fecha) continue;
 
+      const reteFuente = parseNum(row[7]);
+      const reteIva = parseNum(row[8]);
+      const reteIca = parseNum(row[9]);
+
       allFacturas.push({
         fecha,
         proveedor: String(row[2] || "").trim(),
@@ -113,11 +120,15 @@ export default async (req: Request) => {
         numero,
         subtotal: parseNum(row[5]),
         iva: parseNum(row[6]),
-        total: parseNum(row[7]),
-        concepto: String(row[8] || "").trim() || undefined,
-        driveLink: String(row[9] || "").trim() || undefined,
-        categoria: String(row[10] || "").trim() || undefined,
-        cuentaPyg: String(row[11] || "").trim() || undefined,
+        reteFuente,
+        reteIva,
+        reteIca,
+        totalRetenciones: reteFuente + reteIva + reteIca,
+        total: parseNum(row[10]),
+        concepto: String(row[11] || "").trim() || undefined,
+        categoria: String(row[12] || "").trim() || undefined,
+        cuentaPyg: String(row[13] || "").trim() || undefined,
+        driveLink: String(row[14] || "").trim() || undefined,
       });
     }
   }

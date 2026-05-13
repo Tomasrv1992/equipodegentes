@@ -122,22 +122,40 @@ export function useFacturasByAgente(agenteId: string, limit = 1000) {
 }
 
 /**
- * Trae todos los agent_events globales (todos los clientes, todos los agentes).
- * Para KPIs globales de la home Operatto.
+ * Trae todos los agent_events globales paginando por bloques de 1000.
+ *
+ * Supabase tiene cap de 1000 rows por query (PostgREST default). Sin paginar,
+ * el panel veía solo los 1000 events más recientes — por eso `/agentes` decía
+ * "Histórico total: 1000" cuando la suma real por cliente daba 1070+.
+ *
+ * Tras backfill masivo (events suben de ~1k a ~5k+), esta función ya no trunca.
  */
-export function useAllFacturas(limit = 2000) {
+export function useAllFacturas() {
   return useQuery({
-    queryKey: ["facturas-all", limit],
+    queryKey: ["facturas-all"],
     queryFn: async (): Promise<AgentEvent[]> => {
-      const { data, error } = await supabase
-        .from("agent_events")
-        .select("*")
-        .eq("tipo", "factura_procesada")
-        .order("created_at", { ascending: false })
-        .limit(limit);
-      if (error) throw error;
-      return data as AgentEvent[];
+      const PAGE_SIZE = 1000;
+      const all: AgentEvent[] = [];
+      let from = 0;
+      // Hard ceiling: 50_000 events. Si supera, hay algo raro y abortamos.
+      const HARD_CEILING = 50_000;
+      while (from < HARD_CEILING) {
+        const { data, error } = await supabase
+          .from("agent_events")
+          .select("*")
+          .eq("tipo", "factura_procesada")
+          .order("created_at", { ascending: false })
+          .range(from, from + PAGE_SIZE - 1);
+        if (error) throw error;
+        const batch = (data ?? []) as AgentEvent[];
+        all.push(...batch);
+        if (batch.length < PAGE_SIZE) break; // última página
+        from += PAGE_SIZE;
+      }
+      return all;
     },
+    // Cache 1 min — query pesada con muchos events
+    staleTime: 60_000,
   });
 }
 

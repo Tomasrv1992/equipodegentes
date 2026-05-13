@@ -224,6 +224,22 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
       }
       await Promise.all(workers);
 
+      // 8. EXIGENTE: mover no_identificables a REVISAR_MANUAL/ para que no
+      // queden flotando en el folder del mes (al día siguiente los volvería
+      // a contar como huérfanos). Una vez allí, son responsabilidad humana
+      // de Tomás revisar y decidir.
+      const noIdentificablesDeCliente = report.acciones.filter(
+        (a) => a.cliente_slug === c.slug && a.tipo === "no_identificable",
+      );
+      if (noIdentificablesDeCliente.length > 0) {
+        try {
+          await moverARevisarManual(drive, cred.drive_folder_id, noIdentificablesDeCliente);
+          console.log(`[limpiador] cliente=${c.slug} → ${noIdentificablesDeCliente.length} no-id movidos a REVISAR_MANUAL/`);
+        } catch (err: any) {
+          console.error(`[limpiador] error moviendo a REVISAR_MANUAL: ${err.message}`);
+        }
+      }
+
       report.clientes_procesados++;
     } catch (err: any) {
       console.error(`[limpiador] error cliente=${c.slug}: ${err.message}`);
@@ -615,4 +631,55 @@ function bogotaYear(): number {
 function bogotaMonth(): number {
   const ms = new Date().getTime() - 5 * 60 * 60 * 1000;
   return new Date(ms).getUTCMonth() + 1;
+}
+
+/**
+ * Mueve archivos no identificables a una subcarpeta REVISAR_MANUAL/ dentro
+ * del folder del cliente. Si la carpeta no existe, la crea.
+ * Razón: al día siguiente, el reparador no los va a contar como huérfanos
+ * (la carpeta REVISAR_MANUAL queda fuera del scope del mes).
+ */
+async function moverARevisarManual(
+  drive: any,
+  clienteRootFolderId: string,
+  acciones: AccionLimpiador[],
+): Promise<void> {
+  // 1. Buscar/crear carpeta REVISAR_MANUAL en root del cliente
+  const resp = await drive.files.list({
+    q: `name='REVISAR_MANUAL' and mimeType='application/vnd.google-apps.folder' and '${clienteRootFolderId}' in parents and trashed=false`,
+    fields: "files(id)",
+  });
+  let manualFolderId = resp.data.files?.[0]?.id;
+  if (!manualFolderId) {
+    const created = await drive.files.create({
+      requestBody: {
+        name: "REVISAR_MANUAL",
+        mimeType: "application/vnd.google-apps.folder",
+        parents: [clienteRootFolderId],
+      },
+      fields: "id",
+    });
+    manualFolderId = created.data.id!;
+    console.log(`[limpiador] carpeta REVISAR_MANUAL creada → ${manualFolderId}`);
+  }
+
+  // 2. Mover cada archivo
+  for (const accion of acciones) {
+    try {
+      // Obtener parents actuales para hacer el move (remove from + add to)
+      const meta = await drive.files.get({
+        fileId: accion.drive_file_id,
+        fields: "parents",
+      });
+      const currentParents = (meta.data.parents ?? []).join(",");
+      await drive.files.update({
+        fileId: accion.drive_file_id,
+        addParents: manualFolderId,
+        removeParents: currentParents,
+        fields: "id, parents",
+      });
+    } catch (err: any) {
+      console.warn(`[limpiador] no pude mover ${accion.drive_file_name}: ${err.message}`);
+    }
+  }
 }

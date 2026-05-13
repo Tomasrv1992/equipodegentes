@@ -368,14 +368,22 @@ export async function runReparador(): Promise<ReparadorReport> {
             for (const f of filasSinPdfConIndex) {
               if (report.auto_repairs.length >= MAX_AUTO_REPAIRS_POR_RUN) break;
               try {
-                // Buscar archivo cuyo nombre contenga el N° factura
-                const numEscaped = f.num.replace(/'/g, "\\'");
-                const searchResp = await drive.files.list({
-                  q: `name contains '${numEscaped}' and trashed=false and mimeType!='application/vnd.google-apps.folder'`,
-                  fields: "files(id, name)",
-                  pageSize: 5,
-                });
-                const found = searchResp.data.files ?? [];
+                // Buscar archivo cuyo nombre contenga el N° factura.
+                // EXIGENTE: probar 3 variantes del número porque el filename
+                // del PDF puede tener padding ('00123') o prefijo ('FE-123')
+                // mientras la fila tiene '123' nudo.
+                const variantes = generarVariantesNumero(f.num);
+                let found: any[] = [];
+                for (const variante of variantes) {
+                  const numEscaped = variante.replace(/'/g, "\\'");
+                  const searchResp = await drive.files.list({
+                    q: `name contains '${numEscaped}' and trashed=false and mimeType!='application/vnd.google-apps.folder'`,
+                    fields: "files(id, name)",
+                    pageSize: 5,
+                  });
+                  found = searchResp.data.files ?? [];
+                  if (found.length > 0) break;
+                }
                 if (found.length === 0) continue; // no encontrado, deja como huérfano
 
                 // Tomar el primer match
@@ -785,4 +793,26 @@ async function matchHuerfanoConLlm(
   }
 
   return null;
+}
+
+/**
+ * Genera variantes del N° de factura para mejorar matching en filenames.
+ * Filenames suelen tener padding ('00123') o prefijo ('FE-123'). La fila
+ * en Sheet puede tener el número "limpio" ('123'). Probamos múltiples.
+ */
+function generarVariantesNumero(num: string): string[] {
+  const variantes = new Set<string>();
+  variantes.add(num);
+  const soloDigitos = num.replace(/\D/g, "");
+  if (soloDigitos && soloDigitos !== num) variantes.add(soloDigitos);
+  // Sin ceros a la izquierda
+  const sinPadding = soloDigitos.replace(/^0+/, "");
+  if (sinPadding && sinPadding !== soloDigitos) variantes.add(sinPadding);
+  // Con padding de 4, 5, 6 dígitos
+  if (sinPadding && sinPadding.length < 6) {
+    variantes.add(sinPadding.padStart(4, "0"));
+    variantes.add(sinPadding.padStart(5, "0"));
+    variantes.add(sinPadding.padStart(6, "0"));
+  }
+  return Array.from(variantes).filter((v) => v.length >= 3); // filtra ruido < 3 chars
 }

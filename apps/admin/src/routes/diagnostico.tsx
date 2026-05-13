@@ -131,6 +131,7 @@ function bogotaDayKey(iso: string): string {
 export default function DiagnosticoPage() {
   const { data, isLoading } = useDiagnosticoData();
   const historico = useHistorico30Dias();
+  const [auditCliente, setAuditCliente] = useState<{ slug: string; nombre: string } | null>(null);
 
   if (isLoading || !data) {
     return (
@@ -182,6 +183,9 @@ export default function DiagnosticoPage() {
     arr.push(r);
     runsFactByCliente.set(r.cliente_id, arr);
   }
+
+  // Cliente seleccionado para auditoría (state arriba)
+  // (declarado dentro del componente para usar useState)
 
   return (
     <div>
@@ -248,6 +252,7 @@ export default function DiagnosticoPage() {
                 <th className="text-right py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Errores</th>
                 <th className="text-center py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Runs</th>
                 <th className="text-left py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Último</th>
+                <th className="text-left py-2.5 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Auditoría</th>
               </tr>
             </thead>
             <tbody>
@@ -289,6 +294,15 @@ export default function DiagnosticoPage() {
                         <span className="text-ink-4 font-mono text-[10px]">—</span>
                       )}
                     </td>
+                    <td className="py-2.5 px-3">
+                      <button
+                        onClick={() => setAuditCliente({ slug: c.slug, nombre: c.nombre })}
+                        className="font-mono text-[10px] text-accent hover:underline tracking-[0.04em]"
+                        title="Compara Gmail vs Drive vs Sheet vs agent_events del año"
+                      >
+                        auditar →
+                      </button>
+                    </td>
                   </tr>
                 );
               })}
@@ -296,6 +310,14 @@ export default function DiagnosticoPage() {
           </table>
         </div>
       </section>
+
+      {/* === Panel de auditoría (cuando hay cliente seleccionado) === */}
+      {auditCliente && (
+        <AuditoriaPanel
+          cliente={auditCliente}
+          onClose={() => setAuditCliente(null)}
+        />
+      )}
 
       {/* === Drilldowns por click === */}
       <DrilldownSection
@@ -1017,6 +1039,166 @@ function BarChart({
         <span>{data[Math.floor(data.length / 2)].label}</span>
         <span>{data[data.length - 1].label}</span>
       </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Auditoría: compara Gmail vs Drive vs Sheet vs agent_events por mes
+// ============================================================================
+
+interface AuditoriaMes {
+  mes: string;
+  gmail: number;
+  drive: number;
+  sheet: number;
+  events: number;
+  coincide: boolean;
+  diff: string | null;
+}
+
+interface AuditoriaResult {
+  customerId: string;
+  year: number;
+  google_email: string;
+  months: AuditoriaMes[];
+  totals: { gmail: number; drive: number; sheet: number; events: number; coincide: boolean };
+  summary: { meses_con_data: number; meses_con_discrepancia: number; todo_cuadra: boolean };
+}
+
+function AuditoriaPanel({
+  cliente,
+  onClose,
+}: {
+  cliente: { slug: string; nombre: string };
+  onClose: () => void;
+}) {
+  const audit = useQuery({
+    queryKey: ["auditoria", cliente.slug],
+    queryFn: async (): Promise<AuditoriaResult> => {
+      const { data: sess } = await supabase.auth.getSession();
+      const accessToken = sess.session?.access_token;
+      const resp = await fetch("/api/admin/health-check", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({
+          customerId: cliente.slug,
+          year: new Date().getFullYear(),
+        }),
+      });
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 150)}`);
+      }
+      return resp.json();
+    },
+    staleTime: 60_000,
+  });
+
+  return (
+    <section className="mb-8 card">
+      <div className="flex items-baseline justify-between mb-3">
+        <div>
+          <h2 className="font-display text-base font-semibold tracking-tighter">
+            Auditoría · {cliente.nombre}
+          </h2>
+          <p className="font-mono text-[10px] text-ink-3 tracking-[0.04em] uppercase mt-0.5">
+            Compara Gmail (etiqueta Facturas/YYYY-MM) vs Drive (PDFs en folder) vs Sheet (filas) vs agent_events
+          </p>
+        </div>
+        <button
+          onClick={onClose}
+          className="font-mono text-[11px] text-ink-3 hover:text-ink tracking-[0.04em]"
+        >
+          cerrar ×
+        </button>
+      </div>
+
+      {audit.isLoading && (
+        <div className="font-mono text-[11px] text-ink-3 uppercase tracking-[0.04em] py-4">
+          Consultando Gmail + Drive + Sheet + Supabase… (puede tardar 10-15s)
+        </div>
+      )}
+
+      {audit.isError && (
+        <div className="font-mono text-[11px] text-accent">
+          Error: {(audit.error as Error).message}
+        </div>
+      )}
+
+      {audit.data && <AuditoriaResultadoTabla data={audit.data} />}
+    </section>
+  );
+}
+
+function AuditoriaResultadoTabla({ data }: { data: AuditoriaResult }) {
+  return (
+    <div>
+      {/* Banner resumen */}
+      <div
+        className={`mb-3 pt-3 border-t border-edge-2 flex items-baseline gap-4 font-mono text-[11px] ${
+          data.summary.todo_cuadra ? "text-ok" : "text-accent"
+        }`}
+      >
+        <span className="font-medium uppercase tracking-[0.04em]">
+          {data.summary.todo_cuadra
+            ? "✓ Todo cuadra"
+            : `⚠ ${data.summary.meses_con_discrepancia} mes(es) con discrepancia`}
+        </span>
+        <span className="text-ink-3">
+          Año {data.year} · cuenta Google {data.google_email}
+        </span>
+      </div>
+
+      <table className="w-full text-[12px]">
+        <thead>
+          <tr className="border-b border-edge bg-paper-sunken">
+            <th className="text-left py-2 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Mes</th>
+            <th className="text-right py-2 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Gmail (label)</th>
+            <th className="text-right py-2 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Drive (PDFs)</th>
+            <th className="text-right py-2 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Sheet (filas)</th>
+            <th className="text-right py-2 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Events (DB)</th>
+            <th className="text-left py-2 px-3 font-mono text-[10px] text-ink-3 uppercase tracking-[0.06em]">Estado</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.months.map((m) => (
+            <tr key={m.mes} className={`border-b border-edge-2 ${m.coincide ? "" : "bg-accent/5"}`}>
+              <td className="py-2 px-3 font-mono text-[11px] font-medium">{m.mes}</td>
+              <td className="py-2 px-3 text-right font-mono tabular-nums">{m.gmail}</td>
+              <td className="py-2 px-3 text-right font-mono tabular-nums">{m.drive}</td>
+              <td className="py-2 px-3 text-right font-mono tabular-nums">{m.sheet}</td>
+              <td className="py-2 px-3 text-right font-mono tabular-nums">{m.events}</td>
+              <td className="py-2 px-3">
+                {m.coincide ? (
+                  <span className="font-mono text-[10px] text-ok tracking-[0.04em] uppercase">✓ ok</span>
+                ) : (
+                  <span className="font-mono text-[10px] text-accent" title={m.diff ?? ""}>
+                    {m.diff ?? "discrepancia"}
+                  </span>
+                )}
+              </td>
+            </tr>
+          ))}
+          <tr className="border-b-2 border-edge bg-paper-sunken font-semibold">
+            <td className="py-2.5 px-3 font-mono text-[11px] uppercase tracking-[0.04em]">Total {data.year}</td>
+            <td className="py-2.5 px-3 text-right font-mono tabular-nums">{data.totals.gmail}</td>
+            <td className="py-2.5 px-3 text-right font-mono tabular-nums">{data.totals.drive}</td>
+            <td className="py-2.5 px-3 text-right font-mono tabular-nums">{data.totals.sheet}</td>
+            <td className="py-2.5 px-3 text-right font-mono tabular-nums">{data.totals.events}</td>
+            <td className="py-2.5 px-3">
+              {data.totals.coincide ? (
+                <span className="font-mono text-[10px] text-ok tracking-[0.04em] uppercase">✓ ok</span>
+              ) : (
+                <span className="font-mono text-[10px] text-accent uppercase tracking-[0.04em]">discrepancia</span>
+              )}
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   );
 }

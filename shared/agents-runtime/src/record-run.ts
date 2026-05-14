@@ -1,7 +1,7 @@
 import { getServerClient } from "./supabase-server";
 
 export type RunStatus = "running" | "ok" | "fail" | "warn";
-export type TriggeredBy = "cron" | "manual" | "rerun";
+export type TriggeredBy = "cron" | "manual" | "rerun" | "preflight";
 
 export interface RecordRunStartInput {
   clienteSlug: string;

@@ -14,6 +14,20 @@ export {
   llmRateLimiterStats,
 } from "./llm-rate-limiter";
 
+// Pre-flight validation antes de correr el pipeline — chequea oauth, drive,
+// sheet, gmail con 4 llamadas baratas; si falla, abortar el run sin tocar
+// nada y reportar al admin con hint accionable.
+export {
+  runPreflight,
+  preflightToPayload,
+} from "./preflight";
+export type {
+  PreflightConfig,
+  PreflightResult,
+  PreflightOk,
+  PreflightFail,
+} from "./preflight";
+
 // Multi-tenant credentials (Fase 3)
 export {
   saveOAuthTokens,

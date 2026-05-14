@@ -22,6 +22,11 @@ import {
   clienteIdBySlug,
   type FacturaEventPayload,
 } from "../../shared/agents-runtime/src/agent-events";
+import {
+  runPreflight,
+  preflightToPayload,
+  type PreflightResult,
+} from "../../shared/agents-runtime/src/preflight";
 
 interface RequestBody {
   /** Forward-compat para SaaS multi-tenant (Proyecto B). */
@@ -69,6 +74,13 @@ interface RequestBody {
    * aunque silent=true (silent suprime el email diario, no el de progreso).
    */
   notifyMonthComplete?: boolean;
+  /**
+   * Si true, SKIPEA el pre-flight check. Lo usa el orquestador del fan-out
+   * para los dispatches individuales por mes — el preflight ya corrió antes
+   * del fan-out una sola vez, los 5-12 dispatches paralelos no necesitan
+   * repetirlo (gastaría 4 llamadas API extra * N meses).
+   */
+  skipPreflight?: boolean;
 }
 
 export default async (req: Request) => {
@@ -131,6 +143,9 @@ export default async (req: Request) => {
             skipSheetSetup: mes !== firstMes,
             // Email corto "listo {mes}" al terminar cada mes — feedback incremental.
             notifyMonthComplete: true,
+            // Preflight ya corrió en el orquestador — los dispatches del fan-out
+            // no necesitan repetirlo (gasta llamadas API, mismo cred).
+            skipPreflight: true,
           }),
         }).catch((e) => console.warn(`[multi-pass] dispatch mes ${mes} failed: ${e.message}`)),
       );
@@ -155,6 +170,104 @@ export default async (req: Request) => {
     credBefore = await loadCredentialsForBackground(body.customerId);
   }
   const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
+
+  // 3.25. PRE-FLIGHT VALIDATION (multi-tenant, no skipPreflight).
+  //
+  //   Si tenemos credBefore válido y body.skipPreflight!=true, chequear las 4
+  //   dependencias críticas (oauth, drive folder, sheet, gmail) con ~4
+  //   llamadas API baratas ANTES de empezar a procesar. Si alguna falla:
+  //     - Registramos un agent_run con status=fail y payload.preflight
+  //     - Mandamos email al cliente con hint accionable
+  //     - Retornamos sin tocar Sheet/Drive (idempotente, no deja basura)
+  //
+  //   Por qué importa: hoy si el cliente revocó OAuth, borró su Drive folder,
+  //   o trasheó el Sheet, nos enteramos a mitad del pipeline — perdiendo
+  //   tiempo de Netlify, dejando estados parciales, y sin contexto claro
+  //   en el error.
+  let preflightResult: PreflightResult | null = null;
+  if (credBefore && !body.skipPreflight) {
+    try {
+      preflightResult = await runPreflight({
+        clientId: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_ID"),
+        clientSecret: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_SECRET"),
+        refreshToken: credBefore.google_refresh_token!,
+        driveFolderId: credBefore.drive_folder_id!,
+        sheetId: credBefore.sheet_id!,
+      });
+    } catch (err: any) {
+      // Si preflight mismo crasheó (ej: env var ausente), fail-safe: log
+      // y continuar — preferimos un run con error a un cliente sin run.
+      console.error(`[preflight] crash: ${err.message}`);
+    }
+
+    if (preflightResult && !preflightResult.ok) {
+      console.error(JSON.stringify({
+        level: "preflight_fail",
+        customerId: body.customerId,
+        check: preflightResult.check,
+        message: preflightResult.message,
+        hint: preflightResult.hint,
+      }));
+
+      // Registrar agent_run preflight_failed para visibilidad en panel
+      try {
+        const runIdPf = await recordRunStart({
+          clienteSlug: body.customerId ?? "owner",
+          agenteId: "facturacion",
+          triggeredBy: "preflight",
+        });
+        if (runIdPf) {
+          await recordRunEnd({
+            runId: runIdPf,
+            status: "fail",
+            durationMs: preflightResult.durationMs,
+            error: new Error(`preflight ${preflightResult.check}: ${preflightResult.message}`),
+            summary: `Preflight failed: ${preflightResult.check}`,
+            payload: preflightToPayload(preflightResult),
+          });
+        }
+      } catch (e: any) {
+        console.error(`[preflight] failed to record agent_run: ${e.message}`);
+      }
+
+      // Notificar al admin (Tomás) con hint accionable.
+      try {
+        await notifyPreflightFailed(body.customerId!, preflightResult);
+      } catch (e: any) {
+        console.error(`[preflight] notify failed: ${e.message}`);
+      }
+
+      // Para errores de OAuth, marcar credenciales como expired/revoked
+      // para que el panel admin lo refleje y los próximos crons skipeen.
+      if (preflightResult.check === "oauth") {
+        try {
+          const supa = getServerClient();
+          const { data: cliente } = await supa
+            .from("clientes")
+            .select("id")
+            .eq("slug", body.customerId)
+            .single();
+          if (cliente) {
+            await markOAuthStatus((cliente as any).id, "facturacion", "expired");
+          }
+        } catch (e: any) {
+          console.error(`[preflight] markOAuthStatus failed: ${e.message}`);
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          preflight_failed: preflightResult.check,
+          message: preflightResult.message,
+          hint: preflightResult.hint,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    } else if (preflightResult?.ok) {
+      console.log(`[preflight] OK cliente=${body.customerId} (${preflightResult.durationMs}ms)`);
+    }
+  }
 
   // 3.5. AUTO MULTI-PASS para clientes en first_run o force=true.
   //      Disparamos 12 invocaciones paralelas (1 por mes) para evitar timeout
@@ -234,6 +347,8 @@ export default async (req: Request) => {
               skipSheetSetup: mes !== firstMes,
               // Email corto "listo {mes}" al terminar cada mes — feedback incremental.
               notifyMonthComplete: true,
+              // Preflight ya corrió en el orquestador — los dispatches no repiten.
+              skipPreflight: true,
             }),
           }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
         );
@@ -758,6 +873,57 @@ async function notifyMonthDone(
   } else {
     console.log(`[month-done] email enviado a ${target.to} — ${mesName} (${result.procesadas.length} facturas)`);
   }
+}
+
+/**
+ * Email al admin (Tomás) cuando preflight detecta un problema con las
+ * credenciales del cliente. Mejor que enterarse a mitad del pipeline:
+ * tenemos hint accionable + permite Tomás actuar antes del próximo cron.
+ */
+async function notifyPreflightFailed(
+  customerId: string,
+  pf: Extract<PreflightResult, { ok: false }>,
+): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return;
+  // Solo Tomás (admin) — no spam al cliente con errores de OAuth técnicos.
+  const adminEmail = process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com";
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
+
+  const subject = `🚨 Preflight ${pf.check} falló — ${customerId}`;
+  const html = `
+<div style="font-family:system-ui,-apple-system,sans-serif;max-width:560px;color:#222;padding:24px">
+  <h2 style="color:#c00;margin:0 0 12px;font-size:20px">🚨 Preflight failed</h2>
+  <table style="font-size:14px;border-collapse:collapse">
+    <tr>
+      <td style="padding:4px 8px 4px 0;color:#666;font-weight:600">Cliente:</td>
+      <td style="padding:4px 0"><code>${escapeHtml(customerId)}</code></td>
+    </tr>
+    <tr>
+      <td style="padding:4px 8px 4px 0;color:#666;font-weight:600">Check fallado:</td>
+      <td style="padding:4px 0"><code style="background:#fee;padding:2px 6px;border-radius:3px;color:#c00">${pf.check}</code></td>
+    </tr>
+    <tr>
+      <td style="padding:4px 8px 4px 0;color:#666;font-weight:600">Mensaje:</td>
+      <td style="padding:4px 0;font-family:ui-monospace,monospace;font-size:12px">${escapeHtml(pf.message)}</td>
+    </tr>
+  </table>
+  <div style="background:#fef9e7;border-left:4px solid #f0b020;padding:14px 16px;margin:16px 0;border-radius:0 6px 6px 0">
+    <div style="font-weight:600;color:#806600;margin-bottom:4px">Acción sugerida</div>
+    <div style="color:#444;font-size:14px;line-height:1.5">${escapeHtml(pf.hint)}</div>
+  </div>
+  <p style="margin:24px 0 0;font-size:12px;color:#999">
+    El pipeline NO procesó nada — Sheet y Drive del cliente quedan intactos.
+    Cuando arregles las credenciales, el próximo cron diario (o un re-disparo
+    manual) volverá a chequear.
+  </p>
+</div>`;
+
+  await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ from, to: [adminEmail], subject, html }),
+  });
 }
 
 async function notifyError(err: Error, customerId?: string): Promise<void> {

@@ -195,6 +195,35 @@ export function useAllFacturas() {
   });
 }
 
+/**
+ * Última validación 5 fuentes del reparador (Bloque B).
+ *
+ * Returns un Map<cliente_slug, ValidacionClienteCliente> con la última
+ * validación de cada cliente. Usada para calcular health-score.
+ */
+export function useLatestReparadorValidations() {
+  return useQuery({
+    queryKey: ["reparador-validations"],
+    refetchInterval: 5 * 60_000,
+    queryFn: async (): Promise<Map<string, any>> => {
+      // Buscar el último run del reparador con validaciones
+      const { data } = await supabase
+        .from("agent_runs")
+        .select("payload")
+        .eq("agente_id", "reparador")
+        .order("started_at", { ascending: false })
+        .limit(1);
+      const map = new Map<string, any>();
+      const payload = (data?.[0]?.payload as any) ?? {};
+      const validaciones = payload.validaciones ?? [];
+      for (const v of validaciones) {
+        if (v.cliente_slug) map.set(v.cliente_slug, v);
+      }
+      return map;
+    },
+  });
+}
+
 export function useRunsByClienteAgente(clienteId: string, agenteId: string, limit = 10) {
   return useQuery({
     queryKey: ["runs", clienteId, agenteId, limit],

@@ -14,12 +14,14 @@ import {
   useAllFacturas,
   useLatestRuns,
   useClientAgents,
+  useLatestReparadorValidations,
 } from "../lib/queries";
 import {
   facturasThisMonth,
   totalErrores,
   runsLastDays,
 } from "../lib/metrics";
+import { calcularHealthScore, type HealthScoreResult } from "../lib/health-score";
 import type { Cliente, AgentEvent } from "../types";
 import EmptyState from "../components/EmptyState";
 
@@ -35,6 +37,7 @@ export default function ClientesPage() {
   const { data: facturas, isLoading: lf } = useAllFacturas();
   const { data: runs, isLoading: lr } = useLatestRuns();
   const { data: activaciones, isLoading: la } = useClientAgents();
+  const { data: validaciones } = useLatestReparadorValidations();
   const [filtro, setFiltro] = useState<FiltroEstado>("todos");
 
   if (lc || lf || lr || la) {
@@ -49,7 +52,9 @@ export default function ClientesPage() {
   const SYNTHETIC = new Set(["monitor", "reparador", "limpiador", "supervisor", "owner"]);
   const clientesOp = clientes.filter((c) => !SYNTHETIC.has(c.slug));
 
-  const filas = clientesOp.map((c) => calcularFila(c, facturas, runs, activaciones));
+  const filas = clientesOp.map((c) =>
+    calcularFila(c, facturas, runs, activaciones, validaciones ?? null),
+  );
 
   // Filtros
   const filtradas = filas.filter((f) => {
@@ -119,6 +124,7 @@ export default function ClientesPage() {
               <tr className="border-b border-edge bg-paper-sunken">
                 <Th>Cliente</Th>
                 <Th>Estado</Th>
+                <Th right>Health</Th>
                 <Th right>{mesActualLabel}</Th>
                 <Th right>vs mes ant.</Th>
                 <Th>Tendencia 30d</Th>
@@ -154,6 +160,7 @@ interface Fila {
   ultimaFecha: string | null;
   diasSinFactura: number;
   errores7d: number;
+  healthScore: HealthScoreResult;
 }
 
 function calcularFila(
@@ -161,6 +168,7 @@ function calcularFila(
   facturas: AgentEvent[],
   runs: any[],
   activaciones: any[],
+  validaciones: Map<string, any> | null,
 ): Fila {
   const now = new Date();
   const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -209,6 +217,18 @@ function calcularFila(
   else if (factMes > 0 && factMesPrev > 0 && factMes < factMesPrev * 0.5) estado = "warn";
   else estado = "ok";
 
+  // Health-score (0-100) — usa última validación del reparador si existe
+  const validacion = validaciones?.get(c.slug) ?? null;
+  const healthScore = calcularHealthScore({
+    validacion,
+    errores7d,
+    diasSinFactura,
+    factMes,
+    factMesPrev,
+    tieneActivacion,
+    clienteActivo: c.activo,
+  });
+
   return {
     cliente: c,
     estado,
@@ -220,6 +240,7 @@ function calcularFila(
     ultimaFecha,
     diasSinFactura,
     errores7d,
+    healthScore,
   };
 }
 
@@ -250,6 +271,9 @@ function ClienteRow({ fila }: { fila: Fila }) {
       </td>
       <td className="py-2.5 px-3">
         <EstadoBadge estado={fila.estado} />
+      </td>
+      <td className="py-2.5 px-3 text-right">
+        <HealthBadge health={fila.healthScore} />
       </td>
       <td className="py-2.5 px-3 text-right font-mono tabular-nums font-medium">
         {fila.factMes}
@@ -301,6 +325,41 @@ function EstadoBadge({ estado }: { estado: Fila["estado"] }) {
   };
   const c = cfg[estado];
   return <span className={`pill ${c.cls}`}>{c.label}</span>;
+}
+
+function HealthBadge({ health }: { health: HealthScoreResult }) {
+  const colorClass =
+    health.color === "ok"
+      ? "text-ok"
+      : health.color === "warn"
+        ? "text-accent"
+        : health.color === "fail"
+          ? "text-fail"
+          : "text-ink-4";
+  const bgClass =
+    health.color === "ok"
+      ? "bg-ok/10"
+      : health.color === "warn"
+        ? "bg-accent/10"
+        : health.color === "fail"
+          ? "bg-fail/10"
+          : "bg-paper-sunken";
+
+  if (health.banda === "inactivo") {
+    return <span className="font-mono text-[10px] text-ink-4">—</span>;
+  }
+
+  return (
+    <div
+      className={`inline-flex items-baseline gap-1 px-2 py-0.5 rounded ${bgClass}`}
+      title={health.razon}
+    >
+      <span className={`font-display text-[14px] font-semibold tabular-nums ${colorClass}`}>
+        {health.score}
+      </span>
+      <span className="font-mono text-[9px] text-ink-3">/100</span>
+    </div>
+  );
 }
 
 function SparklineInline({ values }: { values: number[] }) {

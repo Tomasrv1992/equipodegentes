@@ -51,3 +51,18 @@ export interface AgentEvent {
   payload: Record<string, unknown>;
   created_at: string;
 }
+
+/**
+ * Validación 5 fuentes generada por el Reparador (Bloque B).
+ * Vive en agent_runs.payload.validaciones[] del último run del reparador.
+ */
+export interface ValidacionClienteCliente {
+  cliente_slug: string;
+  mes: string; // "YYYY-MM"
+  gmail: number;
+  drive: number;
+  sheet: number;
+  events: number;
+  todo_cuadra: boolean;
+  discrepancias: string[];
+}

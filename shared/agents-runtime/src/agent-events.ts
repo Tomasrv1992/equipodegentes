@@ -69,13 +69,47 @@ export async function emitFacturaEvents(input: EmitFacturaEventsInput): Promise<
 
   const supa = getServerClient();
 
-  const rows = input.facturas.map((f) => ({
-    run_id: input.runId,
-    cliente_id: input.clienteId,
-    agente_id: input.agenteId,
-    tipo: "factura_procesada",
-    payload: f as unknown as Record<string, unknown>,
-  }));
+  // AUDIT 2026-05-13: SANITIZACIÓN DE TIPOS antes de insertar.
+  // Garantiza que el admin panel reciba SIEMPRE tipos correctos:
+  //   - total/subtotal/iva: number
+  //   - fecha: YYYY-MM-DD string
+  //   - proveedor/nit/numero: strings no vacíos
+  // Si alguno falla validación, se loguea y se SKIP el insert (no rompe el batch).
+  const rows: any[] = [];
+  for (const f of input.facturas) {
+    const fechaStr = String(f.fecha ?? "").trim();
+    const fechaOk = /^\d{4}-\d{2}-\d{2}$/.test(fechaStr);
+    const numeroStr = String(f.numero ?? "").trim();
+    const total = typeof f.total === "number" ? f.total : Number(f.total ?? 0);
+    if (!fechaOk || !numeroStr || isNaN(total)) {
+      console.warn(
+        `[events] skip insert por datos inválidos: fecha="${fechaStr}" numero="${numeroStr}" total=${f.total}`,
+      );
+      continue;
+    }
+    // Normalizar payload: forzar tipos correctos
+    const cleanPayload = {
+      ...f,
+      fecha: fechaStr,
+      proveedor: String(f.proveedor ?? "").trim(),
+      nit: String(f.nit ?? "").replace(/\D+/g, ""),
+      numero: numeroStr,
+      subtotal: Number(f.subtotal ?? 0) || 0,
+      iva: Number(f.iva ?? 0) || 0,
+      total,
+      reteFuente: Number(f.reteFuente ?? 0) || 0,
+      reteIva: Number(f.reteIva ?? 0) || 0,
+      reteIca: Number(f.reteIca ?? 0) || 0,
+      totalRetenciones: Number(f.totalRetenciones ?? 0) || 0,
+    };
+    rows.push({
+      run_id: input.runId,
+      cliente_id: input.clienteId,
+      agente_id: input.agenteId,
+      tipo: "factura_procesada",
+      payload: cleanPayload as unknown as Record<string, unknown>,
+    });
+  }
 
   // Insert por filas individuales con ON CONFLICT DO NOTHING (idempotente).
   // El insert bulk fallaba TODO el batch si una sola fila chocaba con el UNIQUE

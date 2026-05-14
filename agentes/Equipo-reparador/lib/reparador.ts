@@ -563,7 +563,19 @@ export async function runReparador(): Promise<ReparadorReport> {
               }
 
               // === Etapa 4.B: LLM fallback (descargar PDF + identificar) ==
-              if (!matchedNum && process.env.ANTHROPIC_API_KEY) {
+              //
+              // DEPRECATED por default. Razón: el limpiador hace el MISMO trabajo
+              // (descarga PDF, extrae texto, llama LLM) 15 min después con más
+              // contexto (crea event si no matchea, mueve duplicados, etc).
+              // Mantener ambos significa gastar Anthropic 2× por cada huérfano.
+              //
+              // Para reactivar (caso muy específico de prod), set:
+              //   REPARADOR_LLM_HUERFANOS=true  en netlify env vars
+              if (
+                !matchedNum &&
+                process.env.ANTHROPIC_API_KEY &&
+                process.env.REPARADOR_LLM_HUERFANOS === "true"
+              ) {
                 try {
                   const llmMatchedNum = await matchHuerfanoConLlm(
                     drive,

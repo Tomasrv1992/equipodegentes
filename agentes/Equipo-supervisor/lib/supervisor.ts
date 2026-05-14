@@ -153,34 +153,70 @@ export async function runSupervisor(): Promise<SupervisorReport> {
         "../../../shared/agents-runtime/src/audit-log"
       );
 
-      const retriggersHoyCliente = await contarRetriggersHoy(c.slug);
-      const puedeRetrigger = retriggersHoyCliente < MAX_RETRIGGERS_POR_DIA;
+      // ANTI-LOOP POR AGENTE-DESTINO (no global).
+      //
+      // Antes contábamos retriggers globales del cliente — un cliente con 3
+      // problemas distintos (duplicados + gap events + gap drive) saturaba el
+      // contador en UNA pasada y quedaba bloqueado el resto del día sin que
+      // ninguno de los retriggers se haya completado todavía.
+      //
+      // Ahora separamos por agente destino: cada cliente puede recibir hasta
+      // MAX_RETRIGGERS_POR_DIA retriggers de CADA agente (limpiador, reparador,
+      // facturacion) por separado. Loop protection sigue activo por agente —
+      // si limpiador no resuelve duplicados después de 3 intentos, ese sí
+      // escala. Pero no se bloquea por problemas no-relacionados.
+      const [retriggersLimpiador, retriggersReparador, retriggersProcesador] =
+        await Promise.all([
+          contarRetriggersHoy(c.slug, "limpiador"),
+          contarRetriggersHoy(c.slug, "reparador"),
+          contarRetriggersHoy(c.slug, "facturacion"),
+        ]);
+      const puedeLimpiador = retriggersLimpiador < MAX_RETRIGGERS_POR_DIA;
+      const puedeReparador = retriggersReparador < MAX_RETRIGGERS_POR_DIA;
+      const puedeProcesador = retriggersProcesador < MAX_RETRIGGERS_POR_DIA;
+      const algunoSaturado =
+        (tieneDuplicados && !puedeLimpiador) ||
+        (gapSheetEvents && !puedeReparador) ||
+        (gapDriveSheet && !puedeProcesador);
 
-      if (!puedeRetrigger && (tieneDuplicados || fuentesNoCuadran)) {
-        // CAPA 3: escalar a intervención humana
+      if (algunoSaturado) {
+        // Escalar SOLO los agentes saturados (no abortar todos los retriggers).
         chequeo.estado = "fail";
+        const saturados: string[] = [];
+        if (tieneDuplicados && !puedeLimpiador) saturados.push(`limpiador=${retriggersLimpiador}`);
+        if (gapSheetEvents && !puedeReparador) saturados.push(`reparador=${retriggersReparador}`);
+        if (gapDriveSheet && !puedeProcesador) saturados.push(`facturacion=${retriggersProcesador}`);
         chequeo.acciones_tomadas.push(
-          `🚨 LÍMITE de retriggers alcanzado (${retriggersHoyCliente}/${MAX_RETRIGGERS_POR_DIA}) — REQUIERE INTERVENCIÓN HUMANA`,
+          `🚨 LÍMITE retriggers alcanzado: ${saturados.join(", ")} (cap=${MAX_RETRIGGERS_POR_DIA}) — REQUIERE INTERVENCIÓN HUMANA`,
         );
-        chequeo.detalle += ` 🚨 Anti-loop activado: ya fue retrigger ${retriggersHoyCliente} veces hoy`;
+        chequeo.detalle += ` 🚨 Anti-loop: ${saturados.join(", ")}`;
         await auditLog({
           agente: "supervisor",
           accion: "supervisor.escalar_intervencion_humana",
           clienteSlug: c.slug,
           clienteId: c.id,
-          motivo: `Cliente alcanzó ${retriggersHoyCliente} retriggers HOY — no se retrigger más`,
+          motivo: `Agentes saturados hoy: ${saturados.join(", ")}`,
           detalles: {
-            retriggers_hoy: retriggersHoyCliente,
+            saturados,
             limite: MAX_RETRIGGERS_POR_DIA,
             gap_sheet_events: chequeo.events_count - chequeo.sheet_count,
             gap_drive_sheet: chequeo.drive_count - chequeo.sheet_count,
             duplicados: chequeo.duplicados_drive.length,
+            retriggers_por_agente: {
+              limpiador: retriggersLimpiador,
+              reparador: retriggersReparador,
+              facturacion: retriggersProcesador,
+            },
           },
         });
         report.requiere_atencion_critica = true;
-      } else {
+      }
+
+      // Retriggers individuales (cada uno respeta SU contador de anti-loop).
+      // Si un agente está saturado, su retrigger se skipea pero los otros sí corren.
+      {
         // Retriggers normales con audit
-        if (tieneDuplicados && baseUrl && internalSecret) {
+        if (tieneDuplicados && puedeLimpiador && baseUrl && internalSecret) {
           try {
             await disparar(`${baseUrl}/.netlify/functions/limpiador-background`, internalSecret);
             chequeo.acciones_tomadas.push(`Retrigger LIMPIADOR (${chequeo.duplicados_drive.length} grupos dup)`);
@@ -197,7 +233,7 @@ export async function runSupervisor(): Promise<SupervisorReport> {
             console.warn(`[supervisor] retrigger limpiador falló: ${err.message}`);
           }
         }
-        if (gapSheetEvents && baseUrl && internalSecret) {
+        if (gapSheetEvents && puedeReparador && baseUrl && internalSecret) {
           try {
             await disparar(`${baseUrl}/.netlify/functions/reparador-background`, internalSecret);
             chequeo.acciones_tomadas.push(
@@ -220,7 +256,7 @@ export async function runSupervisor(): Promise<SupervisorReport> {
         // Significa que llegaron correos al Gmail pero el procesador no los procesó
         // (probable: cron timeout, error temporal, etc). force=true re-procesa.
         const gapGmailSheet = chequeo.drive_count < chequeo.sheet_count;
-        if ((gapDriveSheet || gapGmailSheet) && baseUrl && internalSecret) {
+        if ((gapDriveSheet || gapGmailSheet) && puedeProcesador && baseUrl && internalSecret) {
           try {
             const procUrl = `${baseUrl}/.netlify/functions/facturacion-background`;
             await fetch(procUrl, {

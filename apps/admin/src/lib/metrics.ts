@@ -143,28 +143,36 @@ export function totalFacturas(events: AgentEvent[]): number {
   return events.length;
 }
 
-/** Filtra events por fecha REAL (payload.fecha) en el mes en curso. */
+/**
+ * Filtra events por fecha REAL (payload.fecha) en el mes de la referencia.
+ *
+ * AUDIT 2026-05-13: usa string-match en YYYY-MM (no Date parsing) para evitar
+ * bugs de zona horaria. La fecha viene del XML/LLM como string YYYY-MM-DD,
+ * comparar como string es más confiable que parsear a Date local.
+ */
 export function facturasThisMonth(events: AgentEvent[], reference: Date = new Date()): AgentEvent[] {
-  const refY = reference.getFullYear();
-  const refM = reference.getMonth();
+  // Construir clave YYYY-MM de la referencia usando getters locales (browser de Tomás está en Bogotá)
+  const refKey = `${reference.getFullYear()}-${String(reference.getMonth() + 1).padStart(2, "0")}`;
   return events.filter((ev) => {
     const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
-    if (!fecha) return false;
-    const d = new Date(fecha + "T00:00:00");
-    return d.getFullYear() === refY && d.getMonth() === refM;
+    if (!fecha || typeof fecha !== "string" || fecha.length < 7) return false;
+    return fecha.slice(0, 7) === refKey;
   });
 }
 
-/** Filtra events con fecha REAL en los últimos N días. */
+/**
+ * Filtra events con fecha REAL en los últimos N días.
+ *
+ * AUDIT 2026-05-13: comparar como string YYYY-MM-DD (más confiable que Date).
+ */
 export function facturasLastDays(events: AgentEvent[], days: number, reference: Date = new Date()): AgentEvent[] {
   const cutoff = new Date(reference);
   cutoff.setDate(cutoff.getDate() - days);
-  cutoff.setHours(0, 0, 0, 0);
+  const cutoffKey = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, "0")}-${String(cutoff.getDate()).padStart(2, "0")}`;
   return events.filter((ev) => {
     const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
-    if (!fecha) return false;
-    const d = new Date(fecha + "T00:00:00");
-    return d.getTime() >= cutoff.getTime();
+    if (!fecha || typeof fecha !== "string" || fecha.length < 10) return false;
+    return fecha.slice(0, 10) >= cutoffKey;
   });
 }
 
@@ -182,12 +190,17 @@ export function facturasToday(events: AgentEvent[], reference: Date = new Date()
 /**
  * Suma de montos totales de facturas procesadas.
  * Devuelve en COP (asumiendo que payload.total ya está en COP enteros).
+ *
+ * AUDIT 2026-05-13: acepta string y number (algunos backfills viejos
+ * guardaron total como string). Number() devuelve NaN si no parseable.
  */
 export function totalMonto(events: AgentEvent[]): number {
   let total = 0;
   for (const ev of events) {
-    const t = (ev.payload as FacturaEventPayload | null)?.total;
-    if (typeof t === "number") total += t;
+    const raw = (ev.payload as FacturaEventPayload | null)?.total;
+    if (raw == null) continue;
+    const t = typeof raw === "number" ? raw : Number(raw);
+    if (!isNaN(t) && isFinite(t)) total += t;
   }
   return total;
 }
@@ -267,7 +280,10 @@ export function topProveedores(events: AgentEvent[], topN = 3): ProveedorAgg[] {
     if (!proveedor) continue;
     const existing = map.get(proveedor) ?? { proveedor, count: 0, total: 0 };
     existing.count++;
-    existing.total += p?.total ?? 0;
+    // AUDIT 2026-05-13: parse defensivo del monto (string o number)
+    const rawTotal = p?.total;
+    const t = rawTotal == null ? 0 : (typeof rawTotal === "number" ? rawTotal : Number(rawTotal));
+    if (!isNaN(t) && isFinite(t)) existing.total += t;
     map.set(proveedor, existing);
   }
   return Array.from(map.values())

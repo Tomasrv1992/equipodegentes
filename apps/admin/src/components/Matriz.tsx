@@ -541,11 +541,14 @@ function contarSinActividad(
 
 function HistoricoMensual({ facturas }: { facturas: AgentEvent[] }) {
   const meses = aggFacturasByMonth(facturas, 6);
+  // AUDIT 2026-05-13: parse defensivo del monto (acepta string + number)
   const totalMonto = (events: AgentEvent[]): number => {
     let total = 0;
     for (const ev of events) {
-      const t = (ev.payload as FacturaPayload | null)?.total;
-      if (typeof t === "number") total += t;
+      const raw = (ev.payload as FacturaPayload | null)?.total;
+      if (raw == null) continue;
+      const t = typeof raw === "number" ? raw : Number(raw);
+      if (!isNaN(t) && isFinite(t)) total += t;
     }
     return total;
   };

@@ -1520,15 +1520,107 @@ function extractRetenciones(invoice: any): {
 
 // ===== Drive =====
 
+/**
+ * Find-or-create de carpeta mensual con AUTO-CONSOLIDACIÓN de duplicados.
+ *
+ * Bug histórico: el multi-pass dispara 12 invocaciones paralelas. Cada una
+ * llamaba esta función, hacía list → veía 0, hacía create → creaba carpeta.
+ * Resultado: 12 carpetas con mismo nombre creadas simultáneamente (Freshco
+ * tuvo 5+ duplicadas por mes).
+ *
+ * Fix: si list encuentra MÁS DE UNA carpeta con el mismo nombre, consolida:
+ *   - Mantiene la más vieja (canónica, ordenada por createdTime)
+ *   - Mueve archivos de las extras a la canónica (addParents + removeParents)
+ *   - Borra las extras
+ *
+ * También re-verifica DESPUÉS de crear (race condition post-create) y aplica
+ * la misma lógica de consolidación.
+ */
 async function getOrCreateMonthFolder(drive: any, parentFolderId: string, year: number, month: number) {
   const name = `${year}-${String(month).padStart(2, "0")}`;
   const q = `name='${name}' and '${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-  const list = await drive.files.list({ q, fields: "files(id, name)", spaces: "drive" });
-  if (list.data.files?.length) return list.data.files[0].id;
+
+  // Helper local: si hay más de 1 carpeta, consolida y devuelve canónica.
+  const consolidarSiDuplicado = async (files: any[]): Promise<string> => {
+    if (files.length === 1) return files[0].id;
+    if (files.length === 0) throw new Error(`consolidar: 0 files (no debería llegar acá)`);
+
+    // Ordenar por createdTime (más vieja primero = canónica)
+    files.sort((a, b) => String(a.createdTime ?? "").localeCompare(String(b.createdTime ?? "")));
+    const canonica = files[0].id;
+    const extras = files.slice(1);
+    console.warn(
+      `[getOrCreateMonthFolder] DEDUP: ${files.length} carpetas '${name}' encontradas. Canónica=${canonica}. Consolidando ${extras.length} extras…`,
+    );
+
+    for (const extra of extras) {
+      try {
+        // Listar archivos dentro de la extra
+        let pageToken: string | undefined;
+        do {
+          const filesInExtra = await drive.files.list({
+            q: `'${extra.id}' in parents and trashed=false`,
+            fields: "files(id), nextPageToken",
+            pageSize: 1000,
+            pageToken,
+          });
+          // Mover cada archivo a canónica
+          for (const file of filesInExtra.data.files ?? []) {
+            try {
+              await drive.files.update({
+                fileId: file.id!,
+                addParents: canonica,
+                removeParents: extra.id,
+                fields: "id",
+              });
+            } catch (e: any) {
+              console.warn(`[consolidar] no pude mover ${file.id}: ${e.message}`);
+            }
+          }
+          pageToken = filesInExtra.data.nextPageToken ?? undefined;
+        } while (pageToken);
+
+        // Borrar la carpeta extra ahora vacía
+        await drive.files.delete({ fileId: extra.id });
+      } catch (e: any) {
+        console.warn(`[consolidar] error con extra ${extra.id}: ${e.message}`);
+      }
+    }
+    return canonica;
+  };
+
+  // 1. Primer intento: listar
+  const list = await drive.files.list({
+    q,
+    fields: "files(id, name, createdTime)",
+    spaces: "drive",
+  });
+  const filesInicial = list.data.files ?? [];
+
+  if (filesInicial.length >= 1) {
+    return consolidarSiDuplicado(filesInicial);
+  }
+
+  // 2. No existe: crear
   const created = await drive.files.create({
     requestBody: { name, mimeType: "application/vnd.google-apps.folder", parents: [parentFolderId] },
-    fields: "id",
+    fields: "id, createdTime",
   });
+
+  // 3. RE-VERIFICAR (race condition post-create): otro proceso paralelo
+  //    pudo haber creado otra carpeta al mismo tiempo.
+  const recheck = await drive.files.list({
+    q,
+    fields: "files(id, createdTime)",
+    spaces: "drive",
+  });
+  const filesPostCreate = recheck.data.files ?? [];
+  if (filesPostCreate.length > 1) {
+    console.warn(
+      `[getOrCreateMonthFolder] RACE detectada post-create: ${filesPostCreate.length} carpetas '${name}'`,
+    );
+    return consolidarSiDuplicado(filesPostCreate);
+  }
   return created.data.id;
 }
 

@@ -478,6 +478,25 @@ export default async (req: Request) => {
           llm_calls: result.llmStats?.calls ?? 0,
           llm_cost_usd: result.llmStats?.estimatedCostUsd ?? 0,
           llm_pre_filtered: result.llmStats?.preFilteredOut ?? 0,
+          // Sample primeros 10 errores con detalle para diagnóstico SQL.
+          // Antes solo se guardaba el count `errores: N` — para investigar
+          // qué falló había que escarbar en Netlify logs (caros y lentos).
+          // Ahora basta `select payload->'sample_errors' from agent_runs`.
+          sample_errors: result.errores.slice(0, 10).map((e) => ({
+            messageId: e.messageId,
+            error: e.error,
+            asunto: e.asunto,
+          })),
+          // Mismo concepto para saltadas — útil para entender qué se filtró.
+          sample_skipped: result.saltadas.slice(0, 5).map((s) => ({
+            messageId: s.messageId,
+            motivo: s.motivo,
+            asunto: s.asunto,
+          })),
+          // Breakdown de motivos de error/saltada para detectar patrones.
+          // Ej: si 80 errores son "pdf-encrypted", sabemos que es ruido bancario.
+          error_pattern_breakdown: countByErrorPattern(result.errores),
+          skipped_pattern_breakdown: countByMotivo(result.saltadas),
         },
       });
     } catch (e: any) {
@@ -810,6 +829,55 @@ const MES_NAMES = [
   "enero", "febrero", "marzo", "abril", "mayo", "junio",
   "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 ] as const;
+
+/**
+ * Agrupa errores por patrón reconocible para detectar ruido vs problemas reales.
+ *
+ * Patrones que hoy alimentan el contador "errores" y NO son fallas reales:
+ *   - pdf-encrypted     → extractos bancarios con password (Bancolombia, Itaú, tarjetas)
+ *   - pdf-no-text       → PDFs escaneados solo imagen, sin texto extraíble
+ *   - llm-no-invoice    → LLM determinó que el doc no es factura
+ *   - timeout           → red inestable, el daily cron retry-ea
+ *
+ * Devuelve { "pdf-encrypted": 80, "real-llm-fail": 12, "other": 8 } así Tomás
+ * puede entender de un vistazo si el "31% error rate" es ruido bancario o
+ * problema real del pipeline.
+ */
+function countByErrorPattern(errores: Array<{ error: string }>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const e of errores) {
+    const msg = (e.error ?? "").toLowerCase();
+    let pat = "other";
+    if (msg.includes("no password") || msg.includes("password given") || msg.includes("encrypted")) {
+      pat = "pdf-encrypted";
+    } else if (msg.includes("no text") || msg.includes("sin texto")) {
+      pat = "pdf-no-text";
+    } else if (msg.includes("not.*invoice") || msg.includes("no es factura")) {
+      pat = "llm-no-invoice";
+    } else if (msg.includes("timeout") || msg.includes("econnreset") || msg.includes("etimedout")) {
+      pat = "network-timeout";
+    } else if (msg.includes("quota") || msg.includes("rate") || msg.includes("429")) {
+      pat = "api-quota";
+    } else if (msg.includes("invalid_grant") || msg.includes("oauth")) {
+      pat = "oauth-expired";
+    } else if (msg.includes("xml") || msg.includes("parse")) {
+      pat = "xml-parse";
+    } else if (msg.includes("zip")) {
+      pat = "zip-corrupted";
+    }
+    out[pat] = (out[pat] ?? 0) + 1;
+  }
+  return out;
+}
+
+function countByMotivo(saltadas: Array<{ motivo: string }>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const s of saltadas) {
+    const m = s.motivo ?? "unknown";
+    out[m] = (out[m] ?? 0) + 1;
+  }
+  return out;
+}
 
 /**
  * Email corto "Listo {mes}: N facturas — $X procesado" al terminar cada

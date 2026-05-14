@@ -414,7 +414,27 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
           result.saltadas.push({ messageId: e.id!, motivo: r.reason, asunto: r.subject });
         }
       } catch (err: any) {
-        result.errores.push({ messageId: e.id!, error: err.message });
+        // CLASIFICACIÓN DE ERROR: muchos "errores" no son fallas del pipeline,
+        // son docs que no debían procesarse (extractos bancarios encriptados,
+        // newsletters con adjuntos, PDFs escaneados sin texto). Antes todos
+        // contaban como "error", inflando el contador y disparando WARN/FAIL
+        // status del run. Ahora los reclasificamos como `saltadas` para que
+        // el panel admin refleje la realidad.
+        const msg = String(err?.message ?? "").toLowerCase();
+        const esRuido =
+          msg.includes("no password") ||
+          msg.includes("password given") ||
+          msg.includes("encrypted") ||
+          msg.includes("sin texto") ||
+          msg.includes("no extraible");
+        if (esRuido) {
+          let motivo = "doc-no-procesable";
+          if (msg.includes("password") || msg.includes("encrypted")) motivo = "pdf-encrypted";
+          else if (msg.includes("sin texto")) motivo = "pdf-no-text";
+          result.saltadas.push({ messageId: e.id!, motivo, asunto: undefined });
+        } else {
+          result.errores.push({ messageId: e.id!, error: err.message });
+        }
       }
     }
   }

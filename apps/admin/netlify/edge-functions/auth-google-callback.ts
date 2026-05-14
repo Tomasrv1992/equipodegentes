@@ -175,41 +175,32 @@ export default async (request: Request, context: Context) => {
     folderName = `Facturas ${clienteNombre} - Operatto`;
     sheetName = `Control Facturas ${clienteNombre}`;
 
-    // 5a. Crear carpeta en Drive root
-    const folderResp = await fetch("https://www.googleapis.com/drive/v3/files", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokens.access_token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        name: folderName,
-        mimeType: "application/vnd.google-apps.folder",
-        parents: ["root"],
-      }),
-    });
-    if (!folderResp.ok) {
-      throw new Error(`drive folder create: ${await folderResp.text()}`);
-    }
-    folderId = ((await folderResp.json()) as { id: string }).id;
+    // IDEMPOTENCIA: si client_credentials ya tiene folder/sheet asignados
+    // (de un intento previo de onboarding), reusarlos en vez de crear duplicados.
+    // Esto cubre: doble-click del cliente en "conectar Google", refresh durante
+    // OAuth, reintento del callback por error transitorio, etc.
+    const credResp = await fetch(
+      `${supabaseUrl}/rest/v1/client_credentials?cliente_id=eq.${onboarding.cliente_id}&agente_id=eq.${onboarding.agente_id}&select=drive_folder_id,sheet_id`,
+      { headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` } },
+    );
+    const credRows = (await credResp.json()) as Array<{
+      drive_folder_id: string | null;
+      sheet_id: string | null;
+    }>;
+    const existingFolderId = credRows[0]?.drive_folder_id ?? null;
+    const existingSheetId = credRows[0]?.sheet_id ?? null;
 
-    // 5b. Crear Sheet dentro de la carpeta
-    const sheetResp = await fetch("https://www.googleapis.com/drive/v3/files", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokens.access_token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        name: sheetName,
-        mimeType: "application/vnd.google-apps.spreadsheet",
-        parents: [folderId],
-      }),
-    });
-    if (!sheetResp.ok) {
-      throw new Error(`sheet create: ${await sheetResp.text()}`);
-    }
-    sheetId = ((await sheetResp.json()) as { id: string }).id;
+    folderId = await resolveOrCreateFolder(
+      tokens.access_token,
+      existingFolderId,
+      folderName,
+    );
+    sheetId = await resolveOrCreateSheet(
+      tokens.access_token,
+      folderId,
+      existingSheetId,
+      sheetName,
+    );
   } catch (e: any) {
     console.error("auto-create resources failed:", e.message);
     // Si falla la auto-creación, redirigir al paso 2 manual (fallback)
@@ -308,3 +299,215 @@ export default async (request: Request, context: Context) => {
   const redirectFlag = nextStep === "completed" ? "completed=1" : "fiscal=1";
   return Response.redirect(`${adminUrl}/onboarding/${state}?oauth=ok&${redirectFlag}`, 302);
 };
+
+// === Helpers: idempotencia de Folder y Sheet ===
+//
+// Por qué existen: Google Drive permite múltiples archivos con el mismo nombre.
+// Si este callback corre 2+ veces (doble-click, refresh, reintento), sin estos
+// helpers crearía folders y sheets duplicados. Hemos visto este bug con
+// carpetas de mes (5 carpetas "2026-01" en Freshco) y también es teóricamente
+// posible con el Sheet de control inicial.
+//
+// Estrategia:
+//   1. Si tenemos un ID guardado en client_credentials → validar que el archivo
+//      todavía exista (no esté en trash) y reusarlo.
+//   2. Si no, buscar archivos con ese nombre en el parent. Si hay alguno →
+//      usar el más antiguo (canónico) y borrar el resto (consolidación).
+//   3. Si no existe ninguno → crear nuevo.
+
+async function resolveOrCreateFolder(
+  accessToken: string,
+  existingId: string | null,
+  folderName: string,
+): Promise<string> {
+  // 1. Validar el ID guardado si lo hay
+  if (existingId) {
+    const existsResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${existingId}?fields=id,trashed`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (existsResp.ok) {
+      const file = (await existsResp.json()) as { id: string; trashed: boolean };
+      if (!file.trashed) {
+        console.log(`[onboarding] reusing existing folder ${existingId}`);
+        return existingId;
+      }
+    }
+    console.warn(`[onboarding] saved folder ${existingId} not found or trashed — buscando por nombre`);
+  }
+
+  // 2. Buscar por nombre en root del cliente
+  const q = encodeURIComponent(
+    `name='${folderName.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false`,
+  );
+  const listResp = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,createdTime)&orderBy=createdTime`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (listResp.ok) {
+    const data = (await listResp.json()) as {
+      files: Array<{ id: string; createdTime: string }>;
+    };
+    const files = data.files ?? [];
+    if (files.length >= 1) {
+      const canonico = files[0].id;
+      console.log(`[onboarding] found ${files.length} folder(s) named "${folderName}", reusing oldest ${canonico}`);
+      // Si hay duplicados, consolidar: mover archivos al canónico y borrar duplicados.
+      for (let i = 1; i < files.length; i++) {
+        await consolidateFolderInto(accessToken, files[i].id, canonico).catch((err) =>
+          console.warn(`[onboarding] consolidate folder ${files[i].id} failed: ${err.message}`),
+        );
+      }
+      return canonico;
+    }
+  }
+
+  // 3. Crear nuevo
+  const createResp = await fetch("https://www.googleapis.com/drive/v3/files", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      name: folderName,
+      mimeType: "application/vnd.google-apps.folder",
+      parents: ["root"],
+    }),
+  });
+  if (!createResp.ok) {
+    throw new Error(`drive folder create: ${await createResp.text()}`);
+  }
+  const folder = (await createResp.json()) as { id: string };
+  console.log(`[onboarding] created new folder ${folder.id} named "${folderName}"`);
+  return folder.id;
+}
+
+async function resolveOrCreateSheet(
+  accessToken: string,
+  parentFolderId: string,
+  existingId: string | null,
+  sheetName: string,
+): Promise<string> {
+  // 1. Validar el ID guardado si lo hay
+  if (existingId) {
+    const existsResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${existingId}?fields=id,trashed,parents`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (existsResp.ok) {
+      const file = (await existsResp.json()) as {
+        id: string;
+        trashed: boolean;
+        parents?: string[];
+      };
+      if (!file.trashed) {
+        console.log(`[onboarding] reusing existing sheet ${existingId}`);
+        // Bonus: si el sheet existe pero NO está en el folder canónico,
+        // moverlo. Cubre el caso donde el folder se recreó pero el sheet no.
+        if (!file.parents?.includes(parentFolderId) && file.parents?.length) {
+          try {
+            await fetch(
+              `https://www.googleapis.com/drive/v3/files/${existingId}?addParents=${parentFolderId}&removeParents=${file.parents.join(",")}`,
+              { method: "PATCH", headers: { Authorization: `Bearer ${accessToken}` } },
+            );
+            console.log(`[onboarding] moved sheet ${existingId} into folder ${parentFolderId}`);
+          } catch (err: any) {
+            console.warn(`[onboarding] move sheet failed: ${err.message}`);
+          }
+        }
+        return existingId;
+      }
+    }
+    console.warn(`[onboarding] saved sheet ${existingId} not found or trashed — buscando por nombre`);
+  }
+
+  // 2. Buscar por nombre dentro del folder padre
+  const q = encodeURIComponent(
+    `name='${sheetName.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.spreadsheet' and '${parentFolderId}' in parents and trashed=false`,
+  );
+  const listResp = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,createdTime)&orderBy=createdTime`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (listResp.ok) {
+    const data = (await listResp.json()) as {
+      files: Array<{ id: string; createdTime: string }>;
+    };
+    const files = data.files ?? [];
+    if (files.length >= 1) {
+      const canonico = files[0].id;
+      console.log(`[onboarding] found ${files.length} sheet(s) named "${sheetName}", reusing oldest ${canonico}`);
+      // Borrar duplicados (no podemos consolidar pestañas entre spreadsheets fácilmente;
+      // si hay un duplicado vacío de un reintento previo, simplemente lo trasheamos).
+      for (let i = 1; i < files.length; i++) {
+        await trashFile(accessToken, files[i].id).catch((err) =>
+          console.warn(`[onboarding] trash duplicate sheet ${files[i].id} failed: ${err.message}`),
+        );
+      }
+      return canonico;
+    }
+  }
+
+  // 3. Crear nuevo
+  const createResp = await fetch("https://www.googleapis.com/drive/v3/files", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      name: sheetName,
+      mimeType: "application/vnd.google-apps.spreadsheet",
+      parents: [parentFolderId],
+    }),
+  });
+  if (!createResp.ok) {
+    throw new Error(`sheet create: ${await createResp.text()}`);
+  }
+  const sheet = (await createResp.json()) as { id: string };
+  console.log(`[onboarding] created new sheet ${sheet.id} named "${sheetName}"`);
+  return sheet.id;
+}
+
+/**
+ * Mueve todos los archivos de un folder duplicado al folder canónico, y luego
+ * trashea el duplicado. Idempotente: si el duplicado ya está vacío, solo lo trashea.
+ */
+async function consolidateFolderInto(
+  accessToken: string,
+  duplicatedId: string,
+  canonicoId: string,
+): Promise<void> {
+  // Listar archivos del duplicado
+  const q = encodeURIComponent(`'${duplicatedId}' in parents and trashed=false`);
+  const listResp = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,parents)`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (listResp.ok) {
+    const data = (await listResp.json()) as {
+      files: Array<{ id: string; parents?: string[] }>;
+    };
+    for (const f of data.files ?? []) {
+      // Mover al canónico
+      await fetch(
+        `https://www.googleapis.com/drive/v3/files/${f.id}?addParents=${canonicoId}&removeParents=${duplicatedId}`,
+        { method: "PATCH", headers: { Authorization: `Bearer ${accessToken}` } },
+      ).catch(() => {});
+    }
+  }
+  // Trashear el duplicado
+  await trashFile(accessToken, duplicatedId);
+}
+
+async function trashFile(accessToken: string, fileId: string): Promise<void> {
+  await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ trashed: true }),
+  });
+}

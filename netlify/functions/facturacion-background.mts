@@ -89,14 +89,21 @@ export default async (req: Request) => {
       return new Response("missing URL env", { status: 500 });
     }
     const target = `${baseUrl}/.netlify/functions/facturacion-background`;
-    console.log(`[multi-pass] cliente=${body.customerId} → disparando 12 invocaciones con stagger 1.5s`);
+
+    // Solo procesar meses con facturas posibles (mes actual hacia atrás)
+    // y en orden descendente — mes actual primero para entregar valor inmediato.
+    const currentMonth = new Date().getMonth() + 1;
+    const meses: number[] = [];
+    for (let m = currentMonth; m >= 1; m--) meses.push(m);
+    const firstMes = meses[0];
+
+    console.log(
+      `[multi-pass] cliente=${body.customerId} → disparando ${meses.length} meses ` +
+      `[${meses.join(",")}] (desc, stagger 3.5s)`,
+    );
     const dispatches: Array<Promise<any>> = [];
-    for (let mes = 1; mes <= 12; mes++) {
-      // Stagger 3.5s entre dispatches para evitar Google Sheets quota
-      // "Read requests" exceeded (300/min). 12 × 3.5s = 42s total — los
-      // dispatches arrancan distribuidos en el tiempo, reduciendo el pico
-      // inicial de ~120 reads/min a ~30 reads/min.
-      if (mes > 1) await new Promise((r) => setTimeout(r, 3500));
+    for (const mes of meses) {
+      if (mes !== firstMes) await new Promise((r) => setTimeout(r, 3500));
       dispatches.push(
         fetch(target, {
           method: "POST",
@@ -110,15 +117,20 @@ export default async (req: Request) => {
             force: body.force ?? false,
             silent: body.silent ?? true,
             monthFilter: mes,
-            // Solo el primer mes ejecuta setup; los otros 11 skipean.
-            skipSheetSetup: mes !== 1,
+            // Solo el primer dispatch (mes actual) ejecuta setup; los otros skipean.
+            skipSheetSetup: mes !== firstMes,
           }),
         }).catch((e) => console.warn(`[multi-pass] dispatch mes ${mes} failed: ${e.message}`)),
       );
     }
     await Promise.all(dispatches);
     return new Response(
-      JSON.stringify({ ok: true, multiPass: true, monthsDispatched: 12 }),
+      JSON.stringify({
+        ok: true,
+        multiPass: true,
+        monthsDispatched: meses.length,
+        months: meses,
+      }),
       { headers: { "content-type": "application/json" } },
     );
   }
@@ -146,17 +158,53 @@ export default async (req: Request) => {
     const baseUrl = process.env.URL;
     if (baseUrl) {
       const target = `${baseUrl}/.netlify/functions/facturacion-background`;
-      console.log(`[auto-fan-out] cliente=${body.customerId} (${wasFirstRun ? "first_run" : "force"}) → disparando 12 invocaciones con stagger 1.5s`);
+
+      // OPTIMIZACIÓN 1: Solo procesar meses con facturas posibles.
+      // Estamos en mayo → procesar enero..mayo. No tiene sentido disparar
+      // junio..diciembre porque no hay facturas todavía. Reduce dispatches
+      // de 12 fijos a `currentMonth` (típicamente 5-7).
+      const currentMonth = new Date().getMonth() + 1;
+
+      // OPTIMIZACIÓN 2: Orden descendente — mes actual primero.
+      // El cliente quiere ver mayo (mes actual) en su dashboard ANTES que
+      // enero. Procesar de currentMonth → 1 entrega valor inmediato y
+      // mejora la percepción de velocidad.
+      const meses: number[] = [];
+      for (let m = currentMonth; m >= 1; m--) meses.push(m);
+
+      // OPTIMIZACIÓN 3: Marcar first_run_done ANTES del dispatch (no después).
+      // Hoy se marca al final de Promise.all, pero los dispatches devuelven
+      // 202 inmediato — el procesamiento real ocurre en background después.
+      // Si el cron diario corre mientras los meses procesan, NO debe
+      // re-disparar fan-out. Marcamos antes para que el flag refleje
+      // "ya empecé" no "ya terminé".
+      if (wasFirstRun && credBefore) {
+        try {
+          const supa = getServerClient();
+          await supa.rpc("client_credentials_mark_first_run_done", {
+            p_cliente_id: credBefore.cliente_id,
+            p_agente_id: "facturacion",
+          });
+          console.log(`[auto-fan-out] first_run_done marcado ANTES del dispatch (cliente=${body.customerId})`);
+        } catch (err: any) {
+          console.warn(`[auto-fan-out] failed mark first_run_done: ${err.message}`);
+        }
+      }
+
+      console.log(
+        `[auto-fan-out] cliente=${body.customerId} (${wasFirstRun ? "first_run" : "force"}) ` +
+        `→ disparando ${meses.length} meses [${meses.join(",")}] ` +
+        `(currentMonth=${currentMonth}, desc, stagger 3.5s)`,
+      );
+
+      // El PRIMER mes en disparar (el actual) hace setup completo del Sheet;
+      // los siguientes lo skipean para evitar quota exceeded.
+      const firstMes = meses[0];
       const dispatches: Array<Promise<any>> = [];
-      // Stagger 1.5s entre dispatches para evitar choque concurrente en
-      // Sheet API (quota Read requests + race en ensureSheetSetup).
-      // 12 dispatches × 1.5s = 18s de stagger total. Aceptable.
-      for (let mes = 1; mes <= 12; mes++) {
+      for (const mes of meses) {
         // Stagger 3.5s entre dispatches para evitar Google Sheets quota
-      // "Read requests" exceeded (300/min). 12 × 3.5s = 42s total — los
-      // dispatches arrancan distribuidos en el tiempo, reduciendo el pico
-      // inicial de ~120 reads/min a ~30 reads/min.
-      if (mes > 1) await new Promise((r) => setTimeout(r, 3500));
+        // "Read requests" exceeded (300/min).
+        if (mes !== firstMes) await new Promise((r) => setTimeout(r, 3500));
         dispatches.push(
           fetch(target, {
             method: "POST",
@@ -170,28 +218,20 @@ export default async (req: Request) => {
               force: body.force ?? false,
               silent: true,
               monthFilter: mes,
-              // Solo el primer mes ejecuta ensureSheetSetup. Los otros 11 skip
-              // para evitar quota exceeded y race conditions en Sheet API.
-              skipSheetSetup: mes !== 1,
+              // Solo el primer dispatch (mes actual) hace setup completo.
+              skipSheetSetup: mes !== firstMes,
             }),
           }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
         );
       }
       await Promise.all(dispatches);
-      // Marcar first_run_done para que próxima vez NO vuelva a hacer fan-out
-      if (wasFirstRun && credBefore) {
-        try {
-          const supa = getServerClient();
-          await supa.rpc("client_credentials_mark_first_run_done", {
-            p_cliente_id: credBefore.cliente_id,
-            p_agente_id: "facturacion",
-          });
-        } catch (err: any) {
-          console.warn(`[auto-fan-out] failed mark first_run_done: ${err.message}`);
-        }
-      }
       return new Response(
-        JSON.stringify({ ok: true, autoFanOut: true, monthsDispatched: 12 }),
+        JSON.stringify({
+          ok: true,
+          autoFanOut: true,
+          monthsDispatched: meses.length,
+          months: meses,
+        }),
         { headers: { "content-type": "application/json" } },
       );
     }

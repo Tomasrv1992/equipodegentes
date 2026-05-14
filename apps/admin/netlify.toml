@@ -26,6 +26,10 @@
   path = "/api/admin/onboarding-rerun-month"
 
 [[edge_functions]]
+  function = "admin-client-preflight"
+  path = "/api/admin/client-preflight"
+
+[[edge_functions]]
   function = "diagnostico-reporte"
   path = "/api/diagnostico-reporte"
 

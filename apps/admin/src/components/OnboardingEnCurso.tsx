@@ -269,6 +269,10 @@ function OnboardingCard({
         />
       )}
 
+      {/* Preflight check on-demand: validar credenciales sin esperar al próximo cron */}
+      <PreflightPanel clienteSlug={cliente.slug} />
+
+
       {/* Footer: links */}
       <div className="flex gap-3 mt-3 pt-3 border-t border-edge-2">
         {sheetId && (
@@ -395,6 +399,99 @@ function ReDispararPanel({
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+interface PreflightCheck {
+  check: "oauth" | "drive_folder" | "sheet" | "gmail";
+  ok: boolean;
+  message: string;
+  hint?: string;
+  durationMs: number;
+}
+
+function PreflightPanel({ clienteSlug }: { clienteSlug: string }) {
+  const [results, setResults] = useState<PreflightCheck[] | null>(null);
+
+  const mut = useMutation({
+    mutationFn: async () => {
+      const { data: sess } = await supabase.auth.getSession();
+      const accessToken = sess.session?.access_token;
+      const resp = await fetch("/api/admin/client-preflight", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({ clienteSlug }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      return (await resp.json()) as {
+        ok: boolean;
+        results: PreflightCheck[];
+        total_ms: number;
+      };
+    },
+    onSuccess: (data) => setResults(data.results),
+  });
+
+  const labelCheck = (c: PreflightCheck["check"]): string =>
+    ({
+      oauth: "OAuth",
+      drive_folder: "Drive folder",
+      sheet: "Sheet",
+      gmail: "Gmail",
+    })[c];
+
+  return (
+    <div className="bg-paper-sunken rounded-md p-2.5 mb-2">
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase">
+          Health check
+        </div>
+        <button
+          onClick={() => mut.mutate()}
+          disabled={mut.isPending}
+          className="font-mono text-[10px] tracking-[0.04em] px-2 py-0.5 rounded bg-ink text-paper hover:bg-ink-2 disabled:opacity-50"
+        >
+          {mut.isPending ? "Chequeando…" : "Validar"}
+        </button>
+      </div>
+      {results && (
+        <div className="grid grid-cols-2 gap-1.5 mt-2">
+          {results.map((r) => (
+            <div
+              key={r.check}
+              className={`px-2 py-1 rounded text-[10px] font-mono ${
+                r.ok
+                  ? "bg-ok-soft text-ok"
+                  : "bg-fail-soft text-fail"
+              }`}
+              title={r.ok ? r.message : (r.hint ?? r.message)}
+            >
+              <div className="flex items-center justify-between">
+                <span>
+                  {r.ok ? "✓" : "✕"} {labelCheck(r.check)}
+                </span>
+                <span className="tabular-nums opacity-60">
+                  {r.durationMs}ms
+                </span>
+              </div>
+              {!r.ok && r.hint && (
+                <div className="text-[9px] opacity-90 mt-0.5 leading-tight">
+                  {r.hint}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {mut.isError && (
+        <div className="font-mono text-[10px] text-fail mt-1.5">
+          Error: {(mut.error as Error).message}
+        </div>
+      )}
     </div>
   );
 }

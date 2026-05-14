@@ -102,12 +102,16 @@ function useClienteBySlug(slug: string) {
           .from("client_agents")
           .select("*")
           .eq("cliente_id", (cliente as Cliente).id),
+        // AUDIT 2026-05-13: limit subido de 200 a 500.
+        // Razón: multi-pass = 12 runs/día + retriggers ≈ 13/día.
+        // Con 200, los métricas "errores 30d" se truncan a ~15 días.
+        // Con 500 cubrimos ~38 días con margen.
         supabase
           .from("agent_runs")
           .select("*")
           .eq("cliente_id", (cliente as Cliente).id)
           .order("started_at", { ascending: false })
-          .limit(200),
+          .limit(500),
         supabase
           .from("client_credentials")
           .select("agente_id, google_oauth_status, google_email, drive_folder_id, drive_folder_name, sheet_id, sheet_name, notify_email, onboarded_at, retention_rules, municipio_ica, nit_cliente")

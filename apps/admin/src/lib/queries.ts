@@ -50,11 +50,14 @@ export function useLatestRuns() {
   return useQuery({
     queryKey: ["latest-runs"],
     queryFn: async (): Promise<AgentRun[]> => {
+      // AUDIT 2026-05-13: limit subido de 200 a 1000.
+      // Con 10 clientes × 13 runs/día (multi-pass + 4 admin) ≈ 130 runs/día.
+      // 200 cubre solo ~1.5 días. Con 1000 cubrimos 7+ días para /operacion + /agentes.
       const { data, error } = await supabase
         .from("agent_runs")
         .select("*")
         .order("started_at", { ascending: false })
-        .limit(200);
+        .limit(1000);
       if (error) throw error;
       return data as AgentRun[];
     },
@@ -82,21 +85,38 @@ export function useRun(id: string) {
  * Estos events son la fuente de verdad para conteos por fecha real
  * (no por fecha del run).
  */
-export function useFacturasByCliente(clienteId: string, limit = 1000) {
+/**
+ * Trae TODOS los events del cliente paginando en bloques de 1000.
+ * AUDIT 2026-05-13: si un cliente supera 1000 events (Freshco con 1098,
+ * Dentilandia con 610), la versión anterior con limit(1000) truncaba.
+ * Ahora pagina hasta 50_000 (hard ceiling).
+ */
+export function useFacturasByCliente(clienteId: string) {
   return useQuery({
-    queryKey: ["facturas-cliente", clienteId, limit],
+    queryKey: ["facturas-cliente", clienteId],
     enabled: !!clienteId,
     queryFn: async (): Promise<AgentEvent[]> => {
-      const { data, error } = await supabase
-        .from("agent_events")
-        .select("*")
-        .eq("cliente_id", clienteId)
-        .eq("tipo", "factura_procesada")
-        .order("created_at", { ascending: false })
-        .limit(limit);
-      if (error) throw error;
-      return data as AgentEvent[];
+      const PAGE_SIZE = 1000;
+      const HARD_CEILING = 50_000;
+      const all: AgentEvent[] = [];
+      let from = 0;
+      while (from < HARD_CEILING) {
+        const { data, error } = await supabase
+          .from("agent_events")
+          .select("*")
+          .eq("cliente_id", clienteId)
+          .eq("tipo", "factura_procesada")
+          .order("created_at", { ascending: false })
+          .range(from, from + PAGE_SIZE - 1);
+        if (error) throw error;
+        const batch = (data ?? []) as AgentEvent[];
+        all.push(...batch);
+        if (batch.length < PAGE_SIZE) break;
+        from += PAGE_SIZE;
+      }
+      return all;
     },
+    staleTime: 60_000,
   });
 }
 
@@ -104,21 +124,36 @@ export function useFacturasByCliente(clienteId: string, limit = 1000) {
  * Trae todos los agent_events tipo 'factura_procesada' del agente cross-cliente.
  * Útil para vista global del agente.
  */
-export function useFacturasByAgente(agenteId: string, limit = 1000) {
+/**
+ * Trae TODOS los events del agente paginando.
+ * AUDIT 2026-05-13: paginación para no truncar con +1k events.
+ */
+export function useFacturasByAgente(agenteId: string) {
   return useQuery({
-    queryKey: ["facturas-agente", agenteId, limit],
+    queryKey: ["facturas-agente", agenteId],
     enabled: !!agenteId,
     queryFn: async (): Promise<AgentEvent[]> => {
-      const { data, error } = await supabase
-        .from("agent_events")
-        .select("*")
-        .eq("agente_id", agenteId)
-        .eq("tipo", "factura_procesada")
-        .order("created_at", { ascending: false })
-        .limit(limit);
-      if (error) throw error;
-      return data as AgentEvent[];
+      const PAGE_SIZE = 1000;
+      const HARD_CEILING = 50_000;
+      const all: AgentEvent[] = [];
+      let from = 0;
+      while (from < HARD_CEILING) {
+        const { data, error } = await supabase
+          .from("agent_events")
+          .select("*")
+          .eq("agente_id", agenteId)
+          .eq("tipo", "factura_procesada")
+          .order("created_at", { ascending: false })
+          .range(from, from + PAGE_SIZE - 1);
+        if (error) throw error;
+        const batch = (data ?? []) as AgentEvent[];
+        all.push(...batch);
+        if (batch.length < PAGE_SIZE) break;
+        from += PAGE_SIZE;
+      }
+      return all;
     },
+    staleTime: 60_000,
   });
 }
 

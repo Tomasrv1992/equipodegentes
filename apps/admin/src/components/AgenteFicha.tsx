@@ -24,12 +24,13 @@ function useAgenteData(id: string) {
     queryFn: async (): Promise<{ agente: Agente; runs: AgentRun[] }> => {
       const [{ data: agente, error: e1 }, { data: runs, error: e2 }] = await Promise.all([
         supabase.from("agentes").select("*").eq("id", id).single(),
+        // AUDIT 2026-05-13: limit 200 → 500. Cubrir 30+ días con muchos clientes
         supabase
           .from("agent_runs")
           .select("*")
           .eq("agente_id", id)
           .order("started_at", { ascending: false })
-          .limit(200),
+          .limit(500),
       ]);
       if (e1 || !agente) throw new Error(e1?.message ?? "agente no encontrado");
       if (e2) throw e2;

@@ -39,8 +39,14 @@ export default async (req: Request) => {
       retriggers: report.retriggers_disparados,
     }));
 
-    // Email SOLO si hay atención crítica (no spam diario)
-    if (report.requiere_atencion_critica) {
+    // Email crítico: DESACTIVADO por default — la info vive en el panel /diagnostico.
+    // Para reactivar (debug o monitoreo profundo), setear AGENTS_DAILY_EMAILS_ENABLED=true en Netlify.
+    if (process.env.AGENTS_DAILY_EMAILS_ENABLED !== "true") {
+      console.log(
+        `[supervisor] email crítico desactivado (AGENTS_DAILY_EMAILS_ENABLED!=true) — ver /diagnostico. ` +
+          `clientes_fail=${report.clientes_fail}, requiere_atencion_critica=${report.requiere_atencion_critica}`,
+      );
+    } else if (report.requiere_atencion_critica) {
       const fromAddr = process.env.NOTIFY_EMAIL_FROM;
       const adminEmail =
         process.env.MONITOR_ADMIN_EMAIL ??

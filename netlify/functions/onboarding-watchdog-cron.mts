@@ -96,26 +96,45 @@ export default async (_req: Request) => {
     skipped: number[];
   }> = [];
 
+  let totalAutoCompleted = 0;
   for (const cred of creds as Array<{ cliente_id: string }>) {
     const cli = slugById.get(cred.cliente_id);
     if (!cli) continue;
     totalChecked++;
 
-    // 3a. Meses con al menos 1 factura procesada
-    const { data: events } = await supa
-      .from("agent_events")
-      .select("payload")
-      .eq("cliente_id", cred.cliente_id)
-      .eq("agente_id", "facturacion")
-      .eq("tipo", "factura_procesada")
-      .gte("payload->>fecha", `${year}-01-01`)
-      .lt("payload->>fecha", `${year + 1}-01-01`);
+    // 3a. Meses con al menos 1 factura procesada (paginado — clientes
+    //     grandes superan 1000 events).
+    const PAGE_SIZE = 1000;
+    const HARD_CEILING = 50_000;
     const mesesConFacturas = new Set<number>();
-    for (const ev of (events ?? []) as Array<{ payload: any }>) {
-      const fecha = ev.payload?.fecha as string | undefined;
-      if (!fecha || !fecha.startsWith(`${year}-`)) continue;
-      const mes = parseInt(fecha.slice(5, 7), 10);
-      if (Number.isFinite(mes)) mesesConFacturas.add(mes);
+    let totalFacturasYear = 0;
+    {
+      let from = 0;
+      while (from < HARD_CEILING) {
+        const { data, error } = await supa
+          .from("agent_events")
+          .select("payload")
+          .eq("cliente_id", cred.cliente_id)
+          .eq("agente_id", "facturacion")
+          .eq("tipo", "factura_procesada")
+          .gte("payload->>fecha", `${year}-01-01`)
+          .lt("payload->>fecha", `${year + 1}-01-01`)
+          .range(from, from + PAGE_SIZE - 1);
+        if (error) {
+          console.warn(`[watchdog] events query failed ${cli.slug}: ${error.message}`);
+          break;
+        }
+        const batch = (data ?? []) as Array<{ payload: any }>;
+        for (const ev of batch) {
+          const fecha = ev.payload?.fecha as string | undefined;
+          if (!fecha || !fecha.startsWith(`${year}-`)) continue;
+          const mes = parseInt(fecha.slice(5, 7), 10);
+          if (Number.isFinite(mes)) mesesConFacturas.add(mes);
+        }
+        totalFacturasYear += batch.length;
+        if (batch.length < PAGE_SIZE) break;
+        from += PAGE_SIZE;
+      }
     }
 
     // 3b. Runs recientes (últimos 60 min) para evitar re-disparar
@@ -149,6 +168,52 @@ export default async (_req: Request) => {
       if (mesesConFacturas.has(m)) continue;
       if (mesesConRunReciente.has(m)) continue;
       mesesPendientes.push(m);
+    }
+
+    // 3d. AUTO-MARK first_run_done si el cliente ya tiene cobertura razonable.
+    //
+    //   Caso real: Freshco quedó con first_run_done=false porque el código
+    //   viejo solo marcaba el flag si result.errores.length === 0 en cada
+    //   mes del fan-out. Cualquier error en cualquier mes dejaba al cliente
+    //   "atascado" en estado onboarding aunque ya tuviera 1700+ facturas
+    //   procesadas. El panel admin lo seguía marcando como "Onboarding en
+    //   progreso · LIVE" indefinidamente.
+    //
+    //   Heurística para considerarlo "ya completó":
+    //     - >= 80% de los meses esperados tienen al menos 1 factura, O
+    //     - tiene más de 200 facturas registradas en el año
+    //   AND
+    //     - onboarded_at hace más de 6h (le dimos tiempo al fan-out)
+    //
+    //   Si cumple, marcar first_run_done=true. Próximos cron diarios
+    //   procesan en modo regular (window=30d) en vez de re-disparar fan-out.
+    const onboardedMs = (cred as any).onboarded_at
+      ? new Date((cred as any).onboarded_at as string).getTime()
+      : null;
+    const horasDesdeOnboard = onboardedMs
+      ? (triggeredAt.getTime() - onboardedMs) / 3_600_000
+      : Infinity;
+    const coberturaMeses = mesesConFacturas.size / Math.max(1, currentMonth);
+    const yaTieneCoberturaCompleta =
+      horasDesdeOnboard > 6 &&
+      (coberturaMeses >= 0.8 || totalFacturasYear >= 200);
+
+    if (yaTieneCoberturaCompleta) {
+      try {
+        await supa.rpc("client_credentials_mark_first_run_done", {
+          p_cliente_id: cred.cliente_id,
+          p_agente_id: "facturacion",
+        });
+        console.log(
+          `[watchdog] auto-complete ${cli.slug} — first_run_done=true ` +
+          `(${mesesConFacturas.size}/${currentMonth} meses, ${totalFacturasYear} facturas, ${horasDesdeOnboard.toFixed(1)}h desde onboard)`,
+        );
+        totalAutoCompleted++;
+        reporte.push({ cliente: cli.slug, redispatched: [], skipped: [] });
+        continue; // no necesita re-dispatch; ya está completo
+      } catch (err: any) {
+        console.warn(`[watchdog] auto-complete ${cli.slug} failed: ${err.message}`);
+      }
     }
 
     // Limitar dispatches por cliente para no saturar.
@@ -200,6 +265,7 @@ export default async (_req: Request) => {
     JSON.stringify({
       triggered_at: triggeredAt.toISOString(),
       checked: totalChecked,
+      auto_completed: totalAutoCompleted,
       redispatched: totalRedispatched,
       report: reporte,
     }),
@@ -209,6 +275,7 @@ export default async (_req: Request) => {
     JSON.stringify({
       ok: true,
       checked: totalChecked,
+      auto_completed: totalAutoCompleted,
       redispatched: totalRedispatched,
       report: reporte,
     }),

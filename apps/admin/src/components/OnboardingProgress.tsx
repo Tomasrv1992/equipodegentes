@@ -71,22 +71,39 @@ export default function OnboardingProgress({ clienteId }: { clienteId: string })
   });
 
   // 3. Conteo de events por mes
+  //
+  // PAGINACIÓN OBLIGATORIA: Supabase corta a 1000 rows/query por default
+  // (PostgREST). Si un cliente tiene >1000 facturas en el año (Freshco con
+  // 1710, Dentilandia con 610), sin paginar el componente subestima cada
+  // mes — la barra "Multi-pass" mostraba MAR=0 ABR=0 mientras el histórico
+  // mostraba 253/214 reales. Mismo bug que arreglamos en useFacturasByCliente.
   const eventsByMonth = useQuery({
     queryKey: ["onboarding-events-month", clienteId],
     refetchInterval: 15_000,
     queryFn: async () => {
-      const { data } = await supabase
-        .from("agent_events")
-        .select("payload")
-        .eq("cliente_id", clienteId)
-        .eq("agente_id", "facturacion")
-        .eq("tipo", "factura_procesada");
+      const PAGE_SIZE = 1000;
+      const HARD_CEILING = 50_000;
       const byMonth = new Array(12).fill(0);
-      for (const ev of data ?? []) {
-        const fecha = (ev.payload as any)?.fecha;
-        if (!fecha) continue;
-        const m = parseInt(String(fecha).slice(5, 7), 10);
-        if (m >= 1 && m <= 12) byMonth[m - 1]++;
+      let from = 0;
+      while (from < HARD_CEILING) {
+        const { data, error } = await supabase
+          .from("agent_events")
+          .select("payload")
+          .eq("cliente_id", clienteId)
+          .eq("agente_id", "facturacion")
+          .eq("tipo", "factura_procesada")
+          .order("created_at", { ascending: false })
+          .range(from, from + PAGE_SIZE - 1);
+        if (error) throw error;
+        const batch = (data ?? []) as Array<{ payload: any }>;
+        for (const ev of batch) {
+          const fecha = ev.payload?.fecha;
+          if (!fecha) continue;
+          const m = parseInt(String(fecha).slice(5, 7), 10);
+          if (m >= 1 && m <= 12) byMonth[m - 1]++;
+        }
+        if (batch.length < PAGE_SIZE) break;
+        from += PAGE_SIZE;
       }
       return byMonth;
     },

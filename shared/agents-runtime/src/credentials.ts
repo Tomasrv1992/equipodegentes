@@ -64,6 +64,15 @@ export interface ClientCredentialsRow {
    * descartarlas — sino se cuelan como gastos.
    */
   nit_cliente: string | null;
+  /**
+   * Modo del primer run elegido por el cliente en el wizard:
+   *   'rapido'   → solo últimos 30 días, 1 invocación (~3 min)
+   *   'completo' → año entero con multi-pass fan-out (~15-25 min)
+   * Después del primer run vuelve al cron diario normal (window=30d) en
+   * ambos casos. Optional porque depende de migration 0015 — si no está
+   * aplicada, el RPC no lo devuelve y queda undefined (se asume 'completo').
+   */
+  first_run_mode?: "rapido" | "completo";
 }
 
 export interface SaveOAuthTokensInput {

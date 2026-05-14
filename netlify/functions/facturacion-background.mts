@@ -59,6 +59,16 @@ interface RequestBody {
    * para que solo el primer mes haga setup y los otros 11 lo skip.
    */
   skipSheetSetup?: boolean;
+  /**
+   * Si true, al terminar el run (cuando hay monthFilter set) manda un email
+   * corto "Listo {mes}: N facturas procesadas". Lo usa el dispatcher de
+   * fan-out para dar feedback incremental al cliente — no espera al final
+   * de los 5-12 meses para saber que algo se procesó.
+   * Solo se manda si procesadas > 0 (no spam por meses vacíos).
+   * Independiente de `silent`: si notifyMonthComplete=true, este email sale
+   * aunque silent=true (silent suprime el email diario, no el de progreso).
+   */
+  notifyMonthComplete?: boolean;
 }
 
 export default async (req: Request) => {
@@ -119,6 +129,8 @@ export default async (req: Request) => {
             monthFilter: mes,
             // Solo el primer dispatch (mes actual) ejecuta setup; los otros skipean.
             skipSheetSetup: mes !== firstMes,
+            // Email corto "listo {mes}" al terminar cada mes — feedback incremental.
+            notifyMonthComplete: true,
           }),
         }).catch((e) => console.warn(`[multi-pass] dispatch mes ${mes} failed: ${e.message}`)),
       );
@@ -220,6 +232,8 @@ export default async (req: Request) => {
               monthFilter: mes,
               // Solo el primer dispatch (mes actual) hace setup completo.
               skipSheetSetup: mes !== firstMes,
+              // Email corto "listo {mes}" al terminar cada mes — feedback incremental.
+              notifyMonthComplete: true,
             }),
           }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
         );
@@ -408,6 +422,16 @@ export default async (req: Request) => {
       }
     } catch (e: any) {
       console.error("post-run hooks failed (no-fatal):", e.message);
+    }
+  }
+
+  // Email per-mes del fan-out: feedback incremental durante el backfill.
+  // Independiente de `silent`. Solo manda si procesó > 0 facturas (no spam).
+  if (body.notifyMonthComplete && body.customerId && body.monthFilter && result.procesadas.length > 0) {
+    try {
+      await notifyMonthDone(body.customerId, body.monthFilter, result);
+    } catch (err: any) {
+      console.error("notifyMonthDone failed:", err.message);
     }
   }
 
@@ -664,6 +688,75 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
     console.error("Resend error:", res.status, txt);
   } else {
     console.log(`Email enviado a ${target.to} (cliente: ${customerId ?? "owner"}) — total ${total} items`);
+  }
+}
+
+const MES_NAMES = [
+  "enero", "febrero", "marzo", "abril", "mayo", "junio",
+  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+] as const;
+
+/**
+ * Email corto "Listo {mes}: N facturas — $X procesado" al terminar cada
+ * mes del fan-out. Feedback incremental durante el backfill para que el
+ * cliente vea progreso real, no espere 15+ min al welcome final.
+ */
+async function notifyMonthDone(
+  customerId: string,
+  monthNumber: number,
+  result: PipelineResult,
+): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return;
+
+  const target = await resolveNotifyTarget(customerId);
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
+
+  const mesName = MES_NAMES[monthNumber - 1] ?? `mes ${monthNumber}`;
+  const totalMonto = result.procesadas.reduce((s, p) => s + (Number(p.total) || 0), 0);
+  const moneyCO = "$" + Math.round(totalMonto).toLocaleString("es-CO");
+
+  const subject = `✅ Listo ${mesName}: ${result.procesadas.length} factura${result.procesadas.length === 1 ? "" : "s"} (${moneyCO})`;
+
+  const html = `
+<div style="font-family:system-ui,-apple-system,sans-serif;max-width:520px;margin:0 auto;color:#222;padding:24px">
+  <div style="background:#f0f9ff;padding:20px;border-radius:8px;border-left:4px solid #1a3a5c;margin-bottom:16px">
+    <div style="font-size:14px;color:#666;margin-bottom:4px">Backfill en curso</div>
+    <h2 style="margin:0 0 12px;font-size:20px;color:#1a3a5c">
+      Listo ${mesName.charAt(0).toUpperCase()}${mesName.slice(1)}
+    </h2>
+    <div style="display:flex;gap:16px;margin-top:12px">
+      <div>
+        <div style="font-size:24px;font-weight:600;color:#1a3a5c;line-height:1">${result.procesadas.length}</div>
+        <div style="font-size:12px;color:#666">factura${result.procesadas.length === 1 ? "" : "s"}</div>
+      </div>
+      <div>
+        <div style="font-size:24px;font-weight:600;color:#1a3a5c;line-height:1">${moneyCO}</div>
+        <div style="font-size:12px;color:#666">monto registrado</div>
+      </div>
+    </div>
+  </div>
+  <p style="margin:0 0 12px;font-size:14px;color:#444;line-height:1.5">
+    Procesamos las facturas de ${mesName} y ya están en tu Sheet con sus PDFs en Drive.
+    Seguimos con los otros meses — te avisamos cuando termine cada uno.
+  </p>
+  <p style="margin:16px 0 0;font-size:13px;color:#666">
+    <a href="${target.sheetLink}" style="color:#1a3a5c;font-weight:600">📊 Abrir Sheet</a>
+    &nbsp;·&nbsp;
+    <a href="${target.driveLink}" style="color:#1a3a5c;font-weight:600">📁 Abrir Drive</a>
+  </p>
+  <p style="margin:24px 0 0;font-size:12px;color:#999;text-align:center">— Operatto</p>
+</div>`;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ from, to: [target.to], subject, html }),
+  });
+  if (!res.ok) {
+    console.error("notifyMonthDone resend error:", res.status, await res.text());
+  } else {
+    console.log(`[month-done] email enviado a ${target.to} — ${mesName} (${result.procesadas.length} facturas)`);
   }
 }
 

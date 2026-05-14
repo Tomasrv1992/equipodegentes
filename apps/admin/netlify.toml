@@ -55,6 +55,10 @@
   function = "onboarding-save-fiscal-data"
   path = "/api/onboarding/save-fiscal-data"
 
+[[edge_functions]]
+  function = "onboarding-estimate"
+  path = "/api/onboarding/estimate"
+
 # SPA fallback — DEBE ir al final
 [[redirects]]
   from = "/*"

@@ -714,7 +714,55 @@ function StepFiscalData({
 }
 
 // ===== Step 4: Done =====
+interface EstimateResponse {
+  total: number;
+  estimatedMinutes: number;
+  monthsToProcess: number;
+  porMes: Array<{ mes: number; mesName: string; count: number }>;
+}
+
 function StepDone({ cliente }: { cliente: OnboardingInfo }) {
+  const { token } = useParams<{ token: string }>();
+  const [estimate, setEstimate] = useState<EstimateResponse | null>(null);
+  const [estimating, setEstimating] = useState(true);
+
+  useEffect(() => {
+    if (!token) {
+      setEstimating(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch("/api/onboarding/estimate", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        if (!resp.ok) {
+          if (!cancelled) setEstimating(false);
+          return;
+        }
+        const data = (await resp.json()) as EstimateResponse;
+        if (!cancelled) {
+          setEstimate(data);
+          setEstimating(false);
+        }
+      } catch {
+        if (!cancelled) setEstimating(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  // Mes con más facturas — útil para setear expectativa del cuello de botella
+  const peakMonth =
+    estimate && estimate.porMes.length > 0
+      ? estimate.porMes.reduce((a, b) => (b.count > a.count ? b : a))
+      : null;
+
   return (
     <section className="card mt-10 text-center">
       <div className="relative w-12 h-12 mx-auto mb-4">
@@ -726,11 +774,50 @@ function StepDone({ cliente }: { cliente: OnboardingInfo }) {
       <h2 className="font-display text-3xl font-semibold tracking-tighter mb-2">
         ¡Listo! Ya estamos procesando.
       </h2>
-      <p className="font-sans text-base text-ink-3 leading-relaxed mb-3 max-w-md mx-auto">
-        El agente de <strong>{cliente.agente_nombre}</strong> arrancó ahora mismo.
-        Va a procesar todas tus facturas DIAN del año en curso (puede tardar
-        5–15 minutos según volumen).
-      </p>
+
+      {/* Estimación previa: setear expectativas reales del cliente */}
+      {estimating && (
+        <p className="font-mono text-[11px] text-ink-3 tracking-[0.04em] mb-3">
+          Contando facturas en tu Gmail…
+        </p>
+      )}
+      {estimate && estimate.total > 0 && (
+        <div className="bg-accent-soft border border-accent/30 rounded-lg p-4 my-4 max-w-md mx-auto text-left">
+          <div className="font-mono text-[10px] text-accent tracking-[0.06em] uppercase mb-1">
+            Encontramos en tu Gmail
+          </div>
+          <div className="font-display text-2xl font-semibold tracking-tighter text-ink mb-1">
+            ~{estimate.total} facturas{" "}
+            <span className="font-sans text-sm text-ink-3 font-normal">
+              · {estimate.monthsToProcess} mes
+              {estimate.monthsToProcess === 1 ? "" : "es"}
+            </span>
+          </div>
+          <p className="font-sans text-sm text-ink-2 leading-relaxed">
+            Procesamiento estimado: <strong>~{estimate.estimatedMinutes} min</strong>
+            {peakMonth && peakMonth.count > 0 && (
+              <>
+                {" "}
+                · Mes más cargado: {peakMonth.mesName} ({peakMonth.count})
+              </>
+            )}
+          </p>
+        </div>
+      )}
+      {estimate && estimate.total === 0 && (
+        <p className="font-sans text-sm text-ink-3 leading-relaxed mb-3 max-w-md mx-auto">
+          No encontramos facturas DIAN nuevas en tu Gmail aún — apenas lleguen,
+          las procesamos automáticamente.
+        </p>
+      )}
+      {!estimating && !estimate && (
+        <p className="font-sans text-base text-ink-3 leading-relaxed mb-3 max-w-md mx-auto">
+          El agente de <strong>{cliente.agente_nombre}</strong> arrancó ahora
+          mismo. Va a procesar todas tus facturas DIAN del año en curso (puede
+          tardar 5–15 minutos según volumen).
+        </p>
+      )}
+
       <div className="font-mono text-[10px] text-ink-3 tracking-[0.06em] uppercase mt-4 mb-2">
         Lo que está pasando ahora
       </div>
@@ -741,8 +828,8 @@ function StepDone({ cliente }: { cliente: OnboardingInfo }) {
         <li>· Armando un Dashboard con métricas vivas</li>
       </ul>
       <p className="font-mono text-[11px] text-ink-3 tracking-[0.04em]">
-        Vas a recibir un email cuando termine. Después corre solo, todos los
-        días a las 7am Bogotá.
+        Vas a recibir un email cuando termine cada mes. Después corre solo,
+        todos los días a las 7am Bogotá.
       </p>
     </section>
   );

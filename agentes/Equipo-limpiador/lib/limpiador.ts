@@ -348,6 +348,14 @@ export async function runLimpiador(): Promise<LimpiadorReport> {
   return report;
 }
 
+/**
+ * Timeout máximo por huérfano (descarga PDF + pdf-parse + LLM + Sheet append).
+ * Si un PDF tarda más, lo abortamos y dejamos como no_identificable. Evita
+ * que un PDF gigantesco o un LLM colgado bloquee toda la cola y consuma
+ * el timeout de Netlify (15min).
+ */
+const HUERFANO_TIMEOUT_MS = 60_000;
+
 /** Worker que pulla huérfanos de una queue compartida y los procesa. */
 async function processWorker(
   queue: Array<{ id: string; name: string }>,
@@ -367,9 +375,35 @@ async function processWorker(
     const h = queue.shift();
     if (!h) break;
     try {
-      await procesarHuerfano(h, c, cred, drive, sheets, supa, events, nitCliente, tabName, mesActual, year, report);
+      // Race con timeout — si procesarHuerfano se cuelga (LLM lento, PDF mega),
+      // abortamos y registramos como no-identificable. NO bloquea otros workers.
+      await Promise.race([
+        procesarHuerfano(h, c, cred, drive, sheets, supa, events, nitCliente, tabName, mesActual, year, report),
+        new Promise<void>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(`huerfano timeout >${HUERFANO_TIMEOUT_MS / 1000}s`),
+              ),
+            HUERFANO_TIMEOUT_MS,
+          ),
+        ),
+      ]);
     } catch (err: any) {
-      console.warn(`[limpiador] huerfano ${h.name} falló: ${err.message}`);
+      const isTimeout = /huerfano timeout/i.test(err.message);
+      console.warn(
+        `[limpiador] huerfano ${h.name} ${isTimeout ? "TIMEOUT" : "falló"}: ${err.message}`,
+      );
+      if (isTimeout) {
+        report.no_identificables++;
+        report.acciones.push({
+          cliente_slug: c.slug,
+          drive_file_id: h.id,
+          drive_file_name: h.name,
+          tipo: "no_identificable",
+          detalle: `Timeout >${HUERFANO_TIMEOUT_MS / 1000}s — PDF muy grande o LLM colgado. Movido a REVISAR_MANUAL.`,
+        });
+      }
     }
   }
 }
@@ -645,20 +679,63 @@ async function procesarHuerfano(
     const targetTab = MES_TABS[targetMes - 1] ?? tabName;
     const totalAPagar = subtotalExt + ivaExt; // sin retenciones por defecto en recuperados
 
-    // Obtener consecutivo nuevo
+    // Cargar filas existentes para (a) calcular consecutivo y (b) dedup.
+    // Cols A=consecutivo, D=NIT, E=numero — lo necesitamos para evitar
+    // duplicar rows si el limpiador re-corrió y la factura ya está.
     let maxConsec = 0;
+    let yaExisteEnSheet = false;
     try {
       const resp = await sheets.spreadsheets.values.get({
         spreadsheetId: cred.sheet_id,
-        range: `'${targetTab}'!A2:A1000`,
+        range: `'${targetTab}'!A2:E1000`,
       });
-      const rows = resp.data.values ?? [];
+      const rows = (resp.data.values ?? []) as string[][];
       maxConsec = rows
-        .map((r: any[]) => parseInt(r[0] ?? "0", 10) || 0)
-        .reduce((a: number, b: number) => Math.max(a, b), 0);
+        .map((r) => parseInt(r[0] ?? "0", 10) || 0)
+        .reduce((a, b) => Math.max(a, b), 0);
+
+      // Dedup: ¿hay ya una fila con mismo numero + (NIT o proveedor)?
+      // Esto cubre el caso "limpiador corrió ayer y creó la fila, hoy el PDF
+      // sigue marcado huérfano por alguna razón → no duplicar".
+      if (numExt) {
+        const numNorm = numExt.trim();
+        const nitNorm = nitExt.trim();
+        for (const r of rows) {
+          const rowNum = String(r[4] ?? "").trim();
+          if (!rowNum || rowNum !== numNorm) continue;
+          const rowNit = String(r[3] ?? "").replace(/\D+/g, "");
+          // Match estricto: numero igual + (NIT igual OR no hay NIT en ninguno).
+          if (
+            !nitNorm ||
+            !rowNit ||
+            rowNit === nitNorm
+          ) {
+            yaExisteEnSheet = true;
+            break;
+          }
+        }
+      }
     } catch {
       /* ignorar */
     }
+
+    if (yaExisteEnSheet) {
+      console.log(
+        `[limpiador] cliente=${c.slug} #${numExt} ya está en ${targetTab} — skip append (dedup)`,
+      );
+      report.facturas_recuperadas++;
+      report.acciones.push({
+        cliente_slug: c.slug,
+        drive_file_id: h.id,
+        drive_file_name: fname,
+        tipo: "factura_recuperada",
+        detalle: `Recuperada (ya estaba en Sheet, solo se ligó event): ${extracted.proveedor} #${numExt}.`,
+        num_factura: numExt,
+        total: totalExt,
+      });
+      return;
+    }
+
     const nuevoConsec = maxConsec + 1;
 
     await sheets.spreadsheets.values.append({

@@ -7,6 +7,13 @@ export type { RecordRunStartInput, RecordRunEndInput } from "./record-run";
 export { emitFacturaEvents, clienteIdBySlug } from "./agent-events";
 export type { FacturaEventPayload, EmitFacturaEventsInput } from "./agent-events";
 
+// LLM rate limiting (Anthropic token bucket) — usar antes de cada
+// anthropic.messages.create() para evitar 429s en cascada.
+export {
+  acquireLlmToken,
+  llmRateLimiterStats,
+} from "./llm-rate-limiter";
+
 // Multi-tenant credentials (Fase 3)
 export {
   saveOAuthTokens,

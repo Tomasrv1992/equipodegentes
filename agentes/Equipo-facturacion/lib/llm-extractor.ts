@@ -18,6 +18,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { InvoiceData } from "./pipeline";
+import { acquireLlmToken } from "../../../shared/agents-runtime/src/llm-rate-limiter";
 
 export type DocumentSource = "cuenta_cobro" | "recibo_internacional" | "recibo_servicio" | "email_body";
 
@@ -78,6 +79,9 @@ export async function extractInvoiceFromText(
   let resp: any = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
+      // Token bucket: bloquea (await) si superamos el rate limit del minuto.
+      // Evita 429s en cascada durante fan-out con muchos clientes/meses paralelos.
+      await acquireLlmToken();
       resp = await anthropic.messages.create({
         model: "claude-haiku-4-5",
         max_tokens: 600,

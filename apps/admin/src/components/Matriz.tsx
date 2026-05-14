@@ -28,6 +28,7 @@ import {
 } from "../lib/metrics";
 import type { Cliente, AgentEvent } from "../types";
 import EmptyState from "./EmptyState";
+import OnboardingEnCurso from "./OnboardingEnCurso";
 
 interface FacturaPayload {
   fecha?: string;
@@ -159,6 +160,9 @@ export default function Matriz() {
           factura procesada.
         </div>
       </section>
+
+      {/* === CLIENTES EN ONBOARDING (alta prioridad — backfill activo) === */}
+      <OnboardingEnCurso clientes={clientes} runs={runs} facturas={facturas} />
 
       {/* === TOP CLIENTES POR VALOR ENTREGADO === */}
       <section className="mb-9">

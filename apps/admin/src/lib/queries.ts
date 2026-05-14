@@ -224,6 +224,41 @@ export function useLatestReparadorValidations() {
   });
 }
 
+/**
+ * Trae client_credentials de clientes en onboarding (first_run_done=false).
+ *
+ * Devuelve para cada cliente en proceso de backfill:
+ *   - cliente_id, agente_id
+ *   - onboarded_at: cuándo se completó el OAuth (referencia ETA)
+ *   - sheet_id, drive_folder_id: para mostrar links al admin
+ *
+ * Usado por el Matriz/operacion para mostrar "clientes en onboarding"
+ * con progreso real (cruzado con agent_events y agent_runs).
+ */
+export interface OnboardingProgressCred {
+  cliente_id: string;
+  agente_id: string;
+  onboarded_at: string | null;
+  drive_folder_id: string | null;
+  sheet_id: string | null;
+}
+
+export function useFirstRunClients() {
+  return useQuery({
+    queryKey: ["first-run-clients"],
+    // 2-min polling — los stats del onboarding cambian rápido durante el backfill.
+    refetchInterval: 2 * 60_000,
+    queryFn: async (): Promise<OnboardingProgressCred[]> => {
+      const { data, error } = await supabase
+        .from("client_credentials")
+        .select("cliente_id, agente_id, onboarded_at, drive_folder_id, sheet_id")
+        .eq("first_run_done", false);
+      if (error) throw error;
+      return (data ?? []) as OnboardingProgressCred[];
+    },
+  });
+}
+
 export function useRunsByClienteAgente(clienteId: string, agenteId: string, limit = 10) {
   return useQuery({
     queryKey: ["runs", clienteId, agenteId, limit],

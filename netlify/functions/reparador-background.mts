@@ -17,6 +17,17 @@ export default async (req: Request) => {
     return new Response("unauthorized", { status: 401 });
   }
 
+  // Parse body opcional para clienteSlugFilter (re-validación on-demand 1 cliente)
+  let body: { clienteSlug?: string } = {};
+  try {
+    if (req.headers.get("content-length") !== "0") {
+      body = await req.json();
+    }
+  } catch {
+    /* body opcional, default {} */
+  }
+  const clienteSlugFilter = body.clienteSlug?.trim() || undefined;
+
   // Registrar el run en agent_runs (cliente_slug = "reparador" como marker)
   let runId: string | null = null;
   try {
@@ -33,7 +44,10 @@ export default async (req: Request) => {
   let report: Awaited<ReturnType<typeof runReparador>> | null = null;
 
   try {
-    report = await runReparador();
+    if (clienteSlugFilter) {
+      console.log(`[reparador] re-validación on-demand cliente=${clienteSlugFilter}`);
+    }
+    report = await runReparador({ clienteSlugFilter });
     console.log(JSON.stringify({
       level: "info",
       event: "reparador_report",

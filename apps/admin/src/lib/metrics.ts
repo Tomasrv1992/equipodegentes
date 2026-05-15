@@ -1,0 +1,292 @@
+/**
+ * Cálculos de métricas operacionales.
+ *
+ * IMPORTANTE: hay 2 fuentes de verdad:
+ *
+ * 1. **`agent_runs`** (1 fila por corrida). `payload = {procesadas, errores, saltadas}`.
+ *    Para info de runs (status, errores, duration). Las funciones legacy
+ *    (`totalProcesadas(runs)`, `aggByMonth(runs)`) suman los `procesadas` de cada run
+ *    pero AGRUPAN POR FECHA DEL RUN — incorrecto para mostrar conteos por mes real.
+ *
+ * 2. **`agent_events`** tipo `factura_procesada` (1 fila por factura individual).
+ *    `payload = {fecha, proveedor, total, ...}`. La fuente de verdad para conteos
+ *    por mes/proveedor/categoría — agrupa por la fecha REAL de la factura.
+ *
+ * Para KPIs visibles al cliente (panel admin, email mensual, etc.) USAR `agent_events`.
+ * Para info técnica (¿está corriendo?, ¿hubo errores?) usar `agent_runs`.
+ */
+
+import type { AgentRun, AgentEvent } from "../types";
+
+/** Minutos que tarda un humano en procesar manualmente una factura DIAN. */
+export const MINUTES_PER_FACTURA = 10;
+
+export interface RunPayloadFacturacion {
+  procesadas?: number;
+  errores?: number;
+  saltadas?: number;
+}
+
+/** Suma de facturas procesadas en runs OK/WARN. */
+export function totalProcesadas(runs: AgentRun[]): number {
+  let total = 0;
+  for (const r of runs) {
+    if (r.status === "fail" || r.status === "running") continue;
+    const p = (r.payload as RunPayloadFacturacion | null)?.procesadas;
+    if (typeof p === "number") total += p;
+  }
+  return total;
+}
+
+/** Filtra runs ocurridos en el mes actual (zona Bogota). */
+export function runsThisMonth(runs: AgentRun[], reference: Date = new Date()): AgentRun[] {
+  const refY = reference.getFullYear();
+  const refM = reference.getMonth();
+  return runs.filter((r) => {
+    const d = new Date(r.started_at);
+    return d.getFullYear() === refY && d.getMonth() === refM;
+  });
+}
+
+/** Filtra runs en los últimos N días. */
+export function runsLastDays(runs: AgentRun[], days: number, reference: Date = new Date()): AgentRun[] {
+  const cutoff = reference.getTime() - days * 24 * 60 * 60 * 1000;
+  return runs.filter((r) => new Date(r.started_at).getTime() >= cutoff);
+}
+
+/** Devuelve la fecha en formato YYYY-MM-DD según zona Bogotá (no del browser). */
+function bogotaDateKey(d: Date): string {
+  // Intl con timeZone garantiza que un usuario en cualquier zona horaria
+  // vea el mismo "hoy" que un usuario en Bogotá. Crítico para no mostrar
+  // un cliente como "operativo hoy" cuando para él aún es ayer (o viceversa).
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Bogota",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+/** Filtra runs ocurridos hoy (calendario zona Bogotá). */
+export function runsToday(runs: AgentRun[], reference: Date = new Date()): AgentRun[] {
+  const todayKey = bogotaDateKey(reference);
+  return runs.filter((r) => bogotaDateKey(new Date(r.started_at)) === todayKey);
+}
+
+/** Tiempo ahorrado en horas por procesado de N facturas. */
+export function tiempoAhorradoHoras(facturas: number): number {
+  return (facturas * MINUTES_PER_FACTURA) / 60;
+}
+
+/** Format pretty of hours: 5.5 → "5.5 h"; 0.4 → "24 min". */
+export function formatHoras(horas: number): string {
+  if (horas < 1) {
+    const mins = Math.round(horas * 60);
+    return `${mins}m`;
+  }
+  const rounded = Math.round(horas * 10) / 10;
+  return `${rounded}h`;
+}
+
+/** Cantidad de errores en runs (status='fail'). */
+export function totalErrores(runs: AgentRun[]): number {
+  return runs.filter((r) => r.status === "fail").length;
+}
+
+/**
+ * Agrupa runs por mes (clave: "YYYY-MM") con conteo de procesadas y errores.
+ * Devuelve los últimos N meses, en orden cronológico ascendente.
+ */
+export interface MesAgg {
+  key: string;       // "2026-05"
+  label: string;     // "may"
+  procesadas: number;
+  errores: number;
+  runs: number;
+}
+
+export function aggByMonth(runs: AgentRun[], lastNMonths = 6, reference: Date = new Date()): MesAgg[] {
+  const meses: MesAgg[] = [];
+  for (let i = lastNMonths - 1; i >= 0; i--) {
+    const d = new Date(reference.getFullYear(), reference.getMonth() - i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const label = d.toLocaleDateString("es-CO", { month: "short" }).replace(".", "");
+    meses.push({ key, label, procesadas: 0, errores: 0, runs: 0 });
+  }
+
+  for (const r of runs) {
+    const d = new Date(r.started_at);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const target = meses.find((m) => m.key === key);
+    if (!target) continue;
+    target.runs++;
+    if (r.status === "fail") target.errores++;
+    const p = (r.payload as RunPayloadFacturacion | null)?.procesadas;
+    if (typeof p === "number") target.procesadas += p;
+  }
+
+  return meses;
+}
+
+// ===== Helpers basados en agent_events (fuente de verdad por FECHA REAL) =====
+
+interface FacturaEventPayload {
+  fecha?: string;        // YYYY-MM-DD (fecha emisión factura)
+  proveedor?: string;
+  nit?: string;
+  total?: number;
+  categoria?: string;
+}
+
+/** Total de facturas procesadas (cuenta de events). */
+export function totalFacturas(events: AgentEvent[]): number {
+  return events.length;
+}
+
+/**
+ * Filtra events por fecha REAL (payload.fecha) en el mes de la referencia.
+ *
+ * AUDIT 2026-05-13: usa string-match en YYYY-MM (no Date parsing) para evitar
+ * bugs de zona horaria. La fecha viene del XML/LLM como string YYYY-MM-DD,
+ * comparar como string es más confiable que parsear a Date local.
+ */
+export function facturasThisMonth(events: AgentEvent[], reference: Date = new Date()): AgentEvent[] {
+  // Construir clave YYYY-MM de la referencia usando getters locales (browser de Tomás está en Bogotá)
+  const refKey = `${reference.getFullYear()}-${String(reference.getMonth() + 1).padStart(2, "0")}`;
+  return events.filter((ev) => {
+    const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
+    if (!fecha || typeof fecha !== "string" || fecha.length < 7) return false;
+    return fecha.slice(0, 7) === refKey;
+  });
+}
+
+/**
+ * Filtra events con fecha REAL en los últimos N días.
+ *
+ * AUDIT 2026-05-13: comparar como string YYYY-MM-DD (más confiable que Date).
+ */
+export function facturasLastDays(events: AgentEvent[], days: number, reference: Date = new Date()): AgentEvent[] {
+  const cutoff = new Date(reference);
+  cutoff.setDate(cutoff.getDate() - days);
+  const cutoffKey = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, "0")}-${String(cutoff.getDate()).padStart(2, "0")}`;
+  return events.filter((ev) => {
+    const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
+    if (!fecha || typeof fecha !== "string" || fecha.length < 10) return false;
+    return fecha.slice(0, 10) >= cutoffKey;
+  });
+}
+
+/** Filtra events con fecha REAL = hoy (calendario zona Bogotá). */
+export function facturasToday(events: AgentEvent[], reference: Date = new Date()): AgentEvent[] {
+  const todayKey = bogotaDateKey(reference);
+  return events.filter((ev) => {
+    const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
+    if (!fecha) return false;
+    // payload.fecha viene en formato YYYY-MM-DD (no necesita conversión TZ)
+    return fecha === todayKey;
+  });
+}
+
+/**
+ * Suma de montos totales de facturas procesadas.
+ * Devuelve en COP (asumiendo que payload.total ya está en COP enteros).
+ *
+ * AUDIT 2026-05-13: acepta string y number (algunos backfills viejos
+ * guardaron total como string). Number() devuelve NaN si no parseable.
+ */
+export function totalMonto(events: AgentEvent[]): number {
+  let total = 0;
+  for (const ev of events) {
+    const raw = (ev.payload as FacturaEventPayload | null)?.total;
+    if (raw == null) continue;
+    const t = typeof raw === "number" ? raw : Number(raw);
+    if (!isNaN(t) && isFinite(t)) total += t;
+  }
+  return total;
+}
+
+/**
+ * Agrupa facturas (agent_events) por mes según FECHA REAL de la factura.
+ * Devuelve los últimos N meses en orden cronológico ascendente.
+ */
+export function aggFacturasByMonth(
+  events: AgentEvent[],
+  lastNMonths = 6,
+  reference: Date = new Date(),
+): MesAgg[] {
+  const meses: MesAgg[] = [];
+  for (let i = lastNMonths - 1; i >= 0; i--) {
+    const d = new Date(reference.getFullYear(), reference.getMonth() - i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const label = d.toLocaleDateString("es-CO", { month: "short" }).replace(".", "");
+    meses.push({ key, label, procesadas: 0, errores: 0, runs: 0 });
+  }
+
+  for (const ev of events) {
+    const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
+    if (!fecha) continue;
+    const key = fecha.slice(0, 7); // YYYY-MM
+    const target = meses.find((m) => m.key === key);
+    if (!target) continue;
+    target.procesadas++;
+  }
+
+  return meses;
+}
+
+/**
+ * Agrupa facturas por mes para el año en curso, desde Enero hasta el mes actual.
+ * Útil para gráficos "año actual" sin barras vacías de meses futuros ni ruido
+ * de meses del año pasado.
+ */
+export function aggFacturasByCurrentYear(
+  events: AgentEvent[],
+  reference: Date = new Date(),
+): MesAgg[] {
+  const year = reference.getFullYear();
+  const currentMonth = reference.getMonth() + 1; // 1..12
+
+  const meses: MesAgg[] = [];
+  for (let m = 1; m <= currentMonth; m++) {
+    const d = new Date(year, m - 1, 1);
+    const key = `${year}-${String(m).padStart(2, "0")}`;
+    const label = d.toLocaleDateString("es-CO", { month: "short" }).replace(".", "");
+    meses.push({ key, label, procesadas: 0, errores: 0, runs: 0 });
+  }
+
+  for (const ev of events) {
+    const fecha = (ev.payload as FacturaEventPayload | null)?.fecha;
+    if (!fecha) continue;
+    const key = fecha.slice(0, 7);
+    const target = meses.find((m) => m.key === key);
+    if (!target) continue;
+    target.procesadas++;
+  }
+
+  return meses;
+}
+
+/** Top N proveedores por cantidad de facturas. */
+export interface ProveedorAgg {
+  proveedor: string;
+  count: number;
+  total: number;
+}
+export function topProveedores(events: AgentEvent[], topN = 3): ProveedorAgg[] {
+  const map = new Map<string, ProveedorAgg>();
+  for (const ev of events) {
+    const p = ev.payload as FacturaEventPayload | null;
+    const proveedor = p?.proveedor;
+    if (!proveedor) continue;
+    const existing = map.get(proveedor) ?? { proveedor, count: 0, total: 0 };
+    existing.count++;
+    // AUDIT 2026-05-13: parse defensivo del monto (string o number)
+    const rawTotal = p?.total;
+    const t = rawTotal == null ? 0 : (typeof rawTotal === "number" ? rawTotal : Number(rawTotal));
+    if (!isNaN(t) && isFinite(t)) existing.total += t;
+    map.set(proveedor, existing);
+  }
+  return Array.from(map.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, topN);
+}

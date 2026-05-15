@@ -14,13 +14,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 import anthropic
 
 from src.config import PROJECT_ROOT, settings
+from src.integraciones.runs_client import record_run_end, record_run_start
 from src.tools.definitions import TOOLS, ejecutar_tool
 from src.tools.prestamos import get_sheets_client
 
@@ -235,11 +239,39 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    started = time.monotonic()
+    run_id = record_run_start(
+        cliente_slug=os.environ.get("CLIENTE_SLUG", "owner"),
+        agente_id="cartera",
+        triggered_by="cron" if os.environ.get("CRON") else "manual",
+    )
+
     try:
         resultado = correr_agente(args.prestamo, verbose=args.verbose)
     except Exception as e:  # noqa: BLE001
         logger.exception("Fallo ejecutando el agente: %s", e)
+        record_run_end(
+            run_id=run_id,
+            status="fail",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error_message=str(e),
+            error_stack=traceback.format_exc(),
+        )
         return 1
+
+    record_run_end(
+        run_id=run_id,
+        status="ok",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        summary=(
+            f"Decisión: {resultado.get('accion_tomada') or 'indeterminado'} | "
+            f"Iteraciones: {resultado.get('iteraciones', 0)}"
+        ),
+        payload={
+            "decision": resultado.get("accion_tomada"),
+            "iteraciones": resultado.get("iteraciones"),
+        },
+    )
 
     print("\n========== RESULTADO DEL AGENTE ==========")
     print(f"Préstamo:        {args.prestamo}")

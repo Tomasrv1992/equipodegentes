@@ -22,5 +22,13 @@
     "shared/**/*.ts",
     "apps/**/*.ts"
   ],
-  "exclude": ["node_modules", "dist", "build", ".next", ".netlify"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".netlify",
+    "apps/admin/netlify/edge-functions"
+  ]
 }
+

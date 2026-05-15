@@ -11,6 +11,22 @@
 
 import type { Config } from "@netlify/functions";
 import { run, type PipelineConfig, type PipelineResult } from "../../agentes/Equipo-facturacion/lib/pipeline";
+import {
+  recordRunStart,
+  recordRunEnd,
+} from "../../shared/agents-runtime/src/record-run";
+import { markOAuthStatus } from "../../shared/agents-runtime/src/credentials";
+import { getServerClient } from "../../shared/agents-runtime/src/supabase-server";
+import {
+  emitFacturaEvents,
+  clienteIdBySlug,
+  type FacturaEventPayload,
+} from "../../shared/agents-runtime/src/agent-events";
+import {
+  runPreflight,
+  preflightToPayload,
+  type PreflightResult,
+} from "../../shared/agents-runtime/src/preflight";
 
 interface RequestBody {
   /** Forward-compat para SaaS multi-tenant (Proyecto B). */
@@ -19,6 +35,52 @@ interface RequestBody {
   window?: string;
   /** Solo listar, no procesar. */
   dryRun?: boolean;
+  /**
+   * Si true, NO excluye -label:Procesado del query Gmail. Re-lee emails
+   * ya procesados para encontrar Word/PDF que el cron viejo dejó sin LLM.
+   * isDuplicate sigue activo en Sheet — no duplica filas.
+   */
+  force?: boolean;
+  /**
+   * Si true, NO manda email al cliente al terminar el run. Útil para
+   * pruebas de validación interna sin spam al cliente. El procesamiento
+   * (Sheet, Drive, agent_events) sigue normal — solo se skipea el correo.
+   */
+  silent?: boolean;
+  /**
+   * Si está set (1-12), filtra el procesamiento a SOLO ese mes del año.
+   * Usado por multi-pass para clientes grandes.
+   */
+  monthFilter?: number;
+  /**
+   * Si true y customerId presente, en lugar de un único run, dispara 12
+   * invocaciones (una por mes) y termina. Útil para primer run + force=true
+   * en clientes con alto volumen — evita timeout de Netlify 15min.
+   * El dispatcher recibe este request y abre 12 fan-outs paralelos.
+   */
+  multiPass?: boolean;
+  /**
+   * Si true, NO ejecuta ensureSheetSetup. Lo usa el dispatcher multi-pass
+   * para que solo el primer mes haga setup y los otros 11 lo skip.
+   */
+  skipSheetSetup?: boolean;
+  /**
+   * Si true, al terminar el run (cuando hay monthFilter set) manda un email
+   * corto "Listo {mes}: N facturas procesadas". Lo usa el dispatcher de
+   * fan-out para dar feedback incremental al cliente — no espera al final
+   * de los 5-12 meses para saber que algo se procesó.
+   * Solo se manda si procesadas > 0 (no spam por meses vacíos).
+   * Independiente de `silent`: si notifyMonthComplete=true, este email sale
+   * aunque silent=true (silent suprime el email diario, no el de progreso).
+   */
+  notifyMonthComplete?: boolean;
+  /**
+   * Si true, SKIPEA el pre-flight check. Lo usa el orquestador del fan-out
+   * para los dispatches individuales por mes — el preflight ya corrió antes
+   * del fan-out una sola vez, los 5-12 dispatches paralelos no necesitan
+   * repetirlo (gastaría 4 llamadas API extra * N meses).
+   */
+  skipPreflight?: boolean;
 }
 
 export default async (req: Request) => {
@@ -39,30 +101,344 @@ export default async (req: Request) => {
     /* body opcional, default {} */
   }
 
-  // 3. Resolver config según customerId
-  const cfg = await buildConfig(body);
+  // 2.5. MULTI-PASS FAN-OUT: si viene multiPass=true + customerId, en lugar
+  //      de procesar nosotros mismos, disparamos 12 invocaciones (una por mes)
+  //      en paralelo y terminamos. Cada invocación procesa solo su mes,
+  //      cabiendo en el límite de 15min de Netlify. Resuelve clientes grandes.
+  if (body.multiPass && body.customerId) {
+    const baseUrl = process.env.URL;
+    if (!baseUrl) {
+      return new Response("missing URL env", { status: 500 });
+    }
+    const target = `${baseUrl}/.netlify/functions/facturacion-background`;
 
-  // 4. Ejecutar pipeline
+    // Solo procesar meses con facturas posibles (mes actual hacia atrás)
+    // y en orden descendente — mes actual primero para entregar valor inmediato.
+    const currentMonth = new Date().getMonth() + 1;
+    const meses: number[] = [];
+    for (let m = currentMonth; m >= 1; m--) meses.push(m);
+    const firstMes = meses[0];
+
+    console.log(
+      `[multi-pass] cliente=${body.customerId} → disparando ${meses.length} meses ` +
+      `[${meses.join(",")}] (desc, stagger 3.5s)`,
+    );
+    const dispatches: Array<Promise<any>> = [];
+    for (const mes of meses) {
+      if (mes !== firstMes) await new Promise((r) => setTimeout(r, 3500));
+      dispatches.push(
+        fetch(target, {
+          method: "POST",
+          headers: {
+            "x-internal-secret": secret,
+            "x-trigger": "multi-pass",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            customerId: body.customerId,
+            force: body.force ?? false,
+            silent: body.silent ?? true,
+            monthFilter: mes,
+            // Solo el primer dispatch (mes actual) ejecuta setup; los otros skipean.
+            skipSheetSetup: mes !== firstMes,
+            // Email corto "listo {mes}" al terminar cada mes — feedback incremental.
+            notifyMonthComplete: true,
+            // Preflight ya corrió en el orquestador — los dispatches del fan-out
+            // no necesitan repetirlo (gasta llamadas API, mismo cred).
+            skipPreflight: true,
+          }),
+        }).catch((e) => console.warn(`[multi-pass] dispatch mes ${mes} failed: ${e.message}`)),
+      );
+    }
+    await Promise.all(dispatches);
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        multiPass: true,
+        monthsDispatched: meses.length,
+        months: meses,
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  }
+
+  // 3. Cargar credenciales del cliente (multi-tenant) ANTES del run
+  //    Lo necesitamos para detectar `wasFirstRun` y elegir entre email
+  //    de bienvenida (post-onboarding) vs email diario.
+  let credBefore: Awaited<ReturnType<typeof loadCredentialsForBackground>> = null;
+  if (body.customerId) {
+    credBefore = await loadCredentialsForBackground(body.customerId);
+  }
+  const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
+
+  // 3.25. PRE-FLIGHT VALIDATION (multi-tenant, no skipPreflight).
+  //
+  //   Si tenemos credBefore válido y body.skipPreflight!=true, chequear las 4
+  //   dependencias críticas (oauth, drive folder, sheet, gmail) con ~4
+  //   llamadas API baratas ANTES de empezar a procesar. Si alguna falla:
+  //     - Registramos un agent_run con status=fail y payload.preflight
+  //     - Mandamos email al cliente con hint accionable
+  //     - Retornamos sin tocar Sheet/Drive (idempotente, no deja basura)
+  //
+  //   Por qué importa: hoy si el cliente revocó OAuth, borró su Drive folder,
+  //   o trasheó el Sheet, nos enteramos a mitad del pipeline — perdiendo
+  //   tiempo de Netlify, dejando estados parciales, y sin contexto claro
+  //   en el error.
+  let preflightResult: PreflightResult | null = null;
+  if (credBefore && !body.skipPreflight) {
+    try {
+      preflightResult = await runPreflight({
+        clientId: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_ID"),
+        clientSecret: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_SECRET"),
+        refreshToken: credBefore.google_refresh_token!,
+        driveFolderId: credBefore.drive_folder_id!,
+        sheetId: credBefore.sheet_id!,
+      });
+    } catch (err: any) {
+      // Si preflight mismo crasheó (ej: env var ausente), fail-safe: log
+      // y continuar — preferimos un run con error a un cliente sin run.
+      console.error(`[preflight] crash: ${err.message}`);
+    }
+
+    if (preflightResult && !preflightResult.ok) {
+      console.error(JSON.stringify({
+        level: "preflight_fail",
+        customerId: body.customerId,
+        check: preflightResult.check,
+        message: preflightResult.message,
+        hint: preflightResult.hint,
+      }));
+
+      // Registrar agent_run preflight_failed para visibilidad en panel
+      try {
+        const runIdPf = await recordRunStart({
+          clienteSlug: body.customerId ?? "owner",
+          agenteId: "facturacion",
+          triggeredBy: "preflight",
+        });
+        if (runIdPf) {
+          await recordRunEnd({
+            runId: runIdPf,
+            status: "fail",
+            durationMs: preflightResult.durationMs,
+            error: new Error(`preflight ${preflightResult.check}: ${preflightResult.message}`),
+            summary: `Preflight failed: ${preflightResult.check}`,
+            payload: preflightToPayload(preflightResult),
+          });
+        }
+      } catch (e: any) {
+        console.error(`[preflight] failed to record agent_run: ${e.message}`);
+      }
+
+      // Notificar al admin (Tomás) con hint accionable.
+      try {
+        await notifyPreflightFailed(body.customerId!, preflightResult);
+      } catch (e: any) {
+        console.error(`[preflight] notify failed: ${e.message}`);
+      }
+
+      // Para errores de OAuth, marcar credenciales como expired/revoked
+      // para que el panel admin lo refleje y los próximos crons skipeen.
+      if (preflightResult.check === "oauth") {
+        try {
+          const supa = getServerClient();
+          const { data: cliente } = await supa
+            .from("clientes")
+            .select("id")
+            .eq("slug", body.customerId)
+            .single();
+          if (cliente) {
+            await markOAuthStatus((cliente as any).id, "facturacion", "expired");
+          }
+        } catch (e: any) {
+          console.error(`[preflight] markOAuthStatus failed: ${e.message}`);
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          preflight_failed: preflightResult.check,
+          message: preflightResult.message,
+          hint: preflightResult.hint,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    } else if (preflightResult?.ok) {
+      console.log(`[preflight] OK cliente=${body.customerId} (${preflightResult.durationMs}ms)`);
+    }
+  }
+
+  // 3.5. AUTO MULTI-PASS para clientes en first_run o force=true.
+  //      Disparamos 12 invocaciones paralelas (1 por mes) para evitar timeout
+  //      en clientes grandes. Si el body trae monthFilter o multiPass=false
+  //      explícito, NO auto-disparamos (respetamos lo que vino).
+  const shouldAutoFanOut =
+    body.customerId &&
+    body.monthFilter == null &&
+    !body.multiPass &&
+    (wasFirstRun || body.force === true);
+
+  if (shouldAutoFanOut) {
+    const baseUrl = process.env.URL;
+    if (baseUrl) {
+      const target = `${baseUrl}/.netlify/functions/facturacion-background`;
+
+      // OPTIMIZACIÓN 1: Solo procesar meses con facturas posibles.
+      // Estamos en mayo → procesar enero..mayo. No tiene sentido disparar
+      // junio..diciembre porque no hay facturas todavía. Reduce dispatches
+      // de 12 fijos a `currentMonth` (típicamente 5-7).
+      const currentMonth = new Date().getMonth() + 1;
+
+      // OPTIMIZACIÓN 2: Orden descendente — mes actual primero.
+      // El cliente quiere ver mayo (mes actual) en su dashboard ANTES que
+      // enero. Procesar de currentMonth → 1 entrega valor inmediato y
+      // mejora la percepción de velocidad.
+      const meses: number[] = [];
+      for (let m = currentMonth; m >= 1; m--) meses.push(m);
+
+      // OPTIMIZACIÓN 3: Marcar first_run_done ANTES del dispatch (no después).
+      // Hoy se marca al final de Promise.all, pero los dispatches devuelven
+      // 202 inmediato — el procesamiento real ocurre en background después.
+      // Si el cron diario corre mientras los meses procesan, NO debe
+      // re-disparar fan-out. Marcamos antes para que el flag refleje
+      // "ya empecé" no "ya terminé".
+      if (wasFirstRun && credBefore) {
+        try {
+          const supa = getServerClient();
+          await supa.rpc("client_credentials_mark_first_run_done", {
+            p_cliente_id: credBefore.cliente_id,
+            p_agente_id: "facturacion",
+          });
+          console.log(`[auto-fan-out] first_run_done marcado ANTES del dispatch (cliente=${body.customerId})`);
+        } catch (err: any) {
+          console.warn(`[auto-fan-out] failed mark first_run_done: ${err.message}`);
+        }
+      }
+
+      console.log(
+        `[auto-fan-out] cliente=${body.customerId} (${wasFirstRun ? "first_run" : "force"}) ` +
+        `→ disparando ${meses.length} meses [${meses.join(",")}] ` +
+        `(currentMonth=${currentMonth}, desc, stagger 3.5s)`,
+      );
+
+      // El PRIMER mes en disparar (el actual) hace setup completo del Sheet;
+      // los siguientes lo skipean para evitar quota exceeded.
+      const firstMes = meses[0];
+      const dispatches: Array<Promise<any>> = [];
+      for (const mes of meses) {
+        // Stagger 3.5s entre dispatches para evitar Google Sheets quota
+        // "Read requests" exceeded (300/min).
+        if (mes !== firstMes) await new Promise((r) => setTimeout(r, 3500));
+        dispatches.push(
+          fetch(target, {
+            method: "POST",
+            headers: {
+              "x-internal-secret": secret,
+              "x-trigger": "auto-multi-pass",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              customerId: body.customerId,
+              force: body.force ?? false,
+              silent: true,
+              monthFilter: mes,
+              // Solo el primer dispatch (mes actual) hace setup completo.
+              skipSheetSetup: mes !== firstMes,
+              // Email corto "listo {mes}" al terminar cada mes — feedback incremental.
+              notifyMonthComplete: true,
+              // Preflight ya corrió en el orquestador — los dispatches no repiten.
+              skipPreflight: true,
+            }),
+          }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
+        );
+      }
+      await Promise.all(dispatches);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          autoFanOut: true,
+          monthsDispatched: meses.length,
+          months: meses,
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+  }
+
+  // 4. Resolver config según customerId (reutiliza cred si ya cargado)
+  const cfg = await buildConfig(body, credBefore);
+
+  // 5. Ejecutar pipeline + registrar en agent_runs
   const startedAt = Date.now();
-  let result;
+  const clienteSlug = body.customerId ?? "owner";
+
+  let runId: string | null = null;
+  try {
+    runId = await recordRunStart({
+      clienteSlug,
+      agenteId: "facturacion",
+      triggeredBy: req.headers.get("x-trigger") === "rerun" ? "rerun" : "cron",
+    });
+  } catch (err: any) {
+    console.error("recordRunStart failed (no-fatal):", err.message);
+    // No bloqueamos el pipeline si Supabase está caído.
+  }
+
+  let result: PipelineResult;
   try {
     result = await run(cfg);
   } catch (err: any) {
-    // Log estructurado para que sea fácil grepear en Netlify logs
     console.error(JSON.stringify({
       level: "fatal",
-      customerId: body.customerId ?? "owner",
+      customerId: clienteSlug,
       error: err.message,
       stack: err.stack,
       hint: err.message?.includes("invalid_grant")
         ? "Refresh token expiró: corré scripts/setup-oauth.mjs local y actualizá GOOGLE_OAUTH_REFRESH_TOKEN en Netlify env vars"
         : undefined,
     }));
-    // Email de error fatal (no esperar — best effort)
-    try {
-      await notifyError(err, body.customerId);
-    } catch {
-      /* notify falla silencioso */
+
+    if (runId) {
+      try {
+        await recordRunEnd({
+          runId,
+          status: "fail",
+          durationMs: Date.now() - startedAt,
+          error: err,
+          netlifyLogUrl: process.env.URL
+            ? `${process.env.URL}/.netlify/functions/facturacion-background`
+            : undefined,
+        });
+      } catch (e: any) {
+        console.error("recordRunEnd(fail) failed:", e.message);
+      }
+    }
+
+    // Si el error es invalid_grant en modo multi-tenant, marcar credenciales expiradas
+    if (body.customerId && err.message?.includes("invalid_grant")) {
+      try {
+        const supa = getServerClient();
+        const { data: cliente } = await supa
+          .from("clientes")
+          .select("id")
+          .eq("slug", body.customerId)
+          .single();
+        if (cliente) {
+          await markOAuthStatus((cliente as any).id, "facturacion", "expired");
+          console.log(`OAuth marked expired for cliente ${body.customerId}`);
+        }
+      } catch (e: any) {
+        console.error("mark oauth expired failed:", e.message);
+      }
+    }
+
+    if (!body.silent) {
+      try {
+        await notifyError(err, body.customerId);
+      } catch {
+        /* notify falla silencioso */
+      }
     }
     return new Response("internal error", { status: 500 });
   }
@@ -70,24 +446,151 @@ export default async (req: Request) => {
   const durationMs = Date.now() - startedAt;
   console.log(JSON.stringify({
     level: "result",
-    customerId: body.customerId ?? "owner",
+    customerId: clienteSlug,
     durationMs,
     procesadas: result.procesadas.length,
     errores: result.errores.length,
     saltadas: result.saltadas.length,
+    repetidas: result.repetidas.length,
     sample: result.procesadas.slice(0, 3),
   }));
 
-  // Email diario incondicional con resumen
-  try {
-    await notifyResult(result, body.customerId);
-  } catch (err: any) {
-    console.error("notify failed:", err.message);
-    /* no bloquear el flujo si email falla */
+  // Registrar fin OK (o WARN si hubo errores parciales)
+  if (runId) {
+    try {
+      const status: "ok" | "warn" = result.errores.length > 0 ? "warn" : "ok";
+      const summary =
+        `${result.procesadas.length} procesadas` +
+        (result.repetidas.length ? ` · ${result.repetidas.length} repetidas` : "") +
+        (result.saltadas.length ? ` · ${result.saltadas.length} saltadas` : "") +
+        (result.errores.length ? ` · ${result.errores.length} errores` : "");
+      await recordRunEnd({
+        runId,
+        status,
+        durationMs,
+        summary,
+        payload: {
+          procesadas: result.procesadas.length,
+          errores: result.errores.length,
+          saltadas: result.saltadas.length,
+          repetidas: result.repetidas.length,
+          // Tracking de uso LLM para visibilidad de costo por cliente/run
+          llm_calls: result.llmStats?.calls ?? 0,
+          llm_cost_usd: result.llmStats?.estimatedCostUsd ?? 0,
+          llm_pre_filtered: result.llmStats?.preFilteredOut ?? 0,
+          // Sample primeros 10 errores con detalle para diagnóstico SQL.
+          // Antes solo se guardaba el count `errores: N` — para investigar
+          // qué falló había que escarbar en Netlify logs (caros y lentos).
+          // Ahora basta `select payload->'sample_errors' from agent_runs`.
+          sample_errors: result.errores.slice(0, 10).map((e) => ({
+            messageId: e.messageId,
+            error: e.error,
+            asunto: e.asunto,
+          })),
+          // Mismo concepto para saltadas — útil para entender qué se filtró.
+          sample_skipped: result.saltadas.slice(0, 5).map((s) => ({
+            messageId: s.messageId,
+            motivo: s.motivo,
+            asunto: s.asunto,
+          })),
+          // Breakdown de motivos de error/saltada para detectar patrones.
+          // Ej: si 80 errores son "pdf-encrypted", sabemos que es ruido bancario.
+          error_pattern_breakdown: countByErrorPattern(result.errores),
+          skipped_pattern_breakdown: countByMotivo(result.saltadas),
+        },
+      });
+    } catch (e: any) {
+      console.error("recordRunEnd(ok) failed:", e.message);
+    }
   }
 
-  // Background fn: respuesta vacía/202 al caller
-  return new Response(JSON.stringify({ ok: true, durationMs }), {
+  // Marcar first_run_done + emitir agent_events (uno por factura procesada)
+  if (body.customerId) {
+    try {
+      const clienteUuid = await clienteIdBySlug(body.customerId);
+      if (clienteUuid && runId) {
+        // 1. Emit agent_events granulares (1 por factura procesada con su fecha REAL)
+        if (result.procesadas.length > 0) {
+          const facturas: FacturaEventPayload[] = result.procesadas.map((p) => ({
+            fecha: p.fecha,           // YYYY-MM-DD de la factura, NO del run
+            proveedor: p.proveedor,
+            nit: p.nit,
+            numero: p.numero,
+            cufe: p.cufe,
+            subtotal: p.subtotal,
+            iva: p.iva,
+            total: p.total,
+            concepto: p.concepto,
+            categoria: p.categoria,
+            cuentaPyg: p.cuentaPyg,
+            tipo: (p as any).tipo ?? "factura_dian",
+            // Retenciones: si el cliente tiene reglas configuradas, vienen
+            // del engine (XML/oficio/override). Sino, del XML directo.
+            reteFuente: (p as any).reteFuente ?? 0,
+            reteIva: (p as any).reteIva ?? 0,
+            reteIca: (p as any).reteIca ?? 0,
+            totalRetenciones: (p as any).totalRetenciones ?? 0,
+            // Audit trail del engine de retenciones (solo si se aplicó).
+            // Valores: "xml" | "oficio" | "override_nit" | "none"
+            retencionSource: (p as any).retencionSource,
+            driveLink: p.driveLink,
+          }));
+          await emitFacturaEvents({
+            runId,
+            clienteId: clienteUuid,
+            agenteId: "facturacion",
+            facturas,
+          });
+          console.log(`[events] cliente ${body.customerId}: ${facturas.length} facturas → agent_events`);
+        }
+
+        // 2. Marcar first_run_done si terminó sin errores
+        if (result.errores.length === 0) {
+          const supa = getServerClient();
+          await supa.rpc("client_credentials_mark_first_run_done", {
+            p_cliente_id: clienteUuid,
+            p_agente_id: "facturacion",
+          });
+          console.log(`[backfill] cliente ${body.customerId} first_run_done=true`);
+        }
+      }
+    } catch (e: any) {
+      console.error("post-run hooks failed (no-fatal):", e.message);
+    }
+  }
+
+  // Email per-mes del fan-out: feedback incremental durante el backfill.
+  // Independiente de `silent`. Solo manda si procesó > 0 facturas (no spam).
+  if (body.notifyMonthComplete && body.customerId && body.monthFilter && result.procesadas.length > 0) {
+    try {
+      await notifyMonthDone(body.customerId, body.monthFilter, result);
+    } catch (err: any) {
+      console.error("notifyMonthDone failed:", err.message);
+    }
+  }
+
+  // Email: si fue primer run del cliente (post-onboarding) Y terminó OK,
+  // mandamos email de BIENVENIDA con resumen completo del año actual.
+  // Sino, email diario regular con lo procesado en este run.
+  //
+  // Si body.silent === true → SKIPEAR completamente el envío. Útil para
+  // disparar runs de prueba sin spam al cliente.
+  if (body.silent) {
+    console.log(`[silent] skip email — cliente=${body.customerId ?? "owner"}`);
+  } else {
+    try {
+      if (wasFirstRun && body.customerId && result.errores.length === 0) {
+        console.log(`[welcome] cliente ${body.customerId}: primer run OK, enviando email de bienvenida`);
+        await notifyWelcome(body.customerId);
+      } else {
+        await notifyResult(result, body.customerId);
+      }
+    } catch (err: any) {
+      console.error("notify failed:", err.message);
+    }
+  }
+
+  return new Response(JSON.stringify({ ok: true, durationMs, runId }), {
     headers: { "content-type": "application/json" },
   });
 };
@@ -98,28 +601,128 @@ export const config: Config = {
 
 // ===== Config builder =====
 
-async function buildConfig(body: RequestBody): Promise<PipelineConfig> {
-  // Single-tenant (hoy): credenciales del owner desde env vars del site.
-  if (!body.customerId) {
+/**
+ * Carga las credenciales del cliente para el background fn (con validación).
+ * Devuelve null si el customerId no tiene fila o las creds están incompletas.
+ * Usar antes de buildConfig para detectar wasFirstRun.
+ */
+async function getNombreClienteFromSlug(slug: string | undefined): Promise<string | null> {
+  if (!slug) return null;
+  try {
+    const supa = getServerClient();
+    const { data } = await supa
+      .from("clientes")
+      .select("nombre")
+      .eq("slug", slug)
+      .single();
+    return (data as { nombre?: string } | null)?.nombre ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadCredentialsForBackground(customerId: string) {
+  const { loadCredentialsBySlug } = await import("../../shared/agents-runtime/src/credentials-by-slug");
+  const cred = await loadCredentialsBySlug(customerId, "facturacion");
+  if (!cred) return null;
+  return cred;
+}
+
+async function buildConfig(
+  body: RequestBody,
+  preloadedCred: Awaited<ReturnType<typeof loadCredentialsForBackground>> = null,
+): Promise<PipelineConfig> {
+  // === Multi-tenant: customerId es el SLUG del cliente en public.clientes ===
+  // Carga credenciales del cliente desde Supabase (refresh_token desencriptado
+  // con pgcrypto + recursos elegidos durante onboarding).
+  if (body.customerId) {
+    const cred = preloadedCred ?? (await loadCredentialsForBackground(body.customerId));
+    if (!cred) {
+      throw new Error(
+        `Cliente con slug "${body.customerId}" no tiene credenciales en client_credentials`,
+      );
+    }
+    if (cred.google_oauth_status !== "connected") {
+      throw new Error(
+        `Cliente "${body.customerId}" tiene OAuth en estado '${cred.google_oauth_status}'. Reconectar.`,
+      );
+    }
+    if (!cred.google_refresh_token) {
+      throw new Error(`Cliente "${body.customerId}" sin refresh_token`);
+    }
+    if (!cred.drive_folder_id || !cred.sheet_id) {
+      throw new Error(
+        `Cliente "${body.customerId}" no completó selección de Drive folder o Sheet`,
+      );
+    }
+
+    // Backfill rule: si es el primer run del cliente (first_run_done = false)
+    // o si vino force=true (reprocesamiento manual), procesa todo el año
+    // calendario actual (after:YYYY/01/01) en vez del rolling 30d.
+    // El primer run después de onboarding entrega valor inmediato al cliente.
+    // Force re-procesa hacia atrás para capturar lo que el cron viejo no pudo.
+    let resolvedWindow: string;
+    if (body.window) {
+      resolvedWindow = body.window;  // override explícito desde el body
+    } else if (!cred.first_run_done || body.force) {
+      // First run o force=true → backfill desde 1° de enero del año actual
+      const yearStart = new Date(new Date().getFullYear(), 0, 1);
+      const yyyy = yearStart.getFullYear();
+      const mm = String(yearStart.getMonth() + 1).padStart(2, "0");
+      const dd = String(yearStart.getDate()).padStart(2, "0");
+      resolvedWindow = `${yyyy}/${mm}/${dd}`;
+      const reason = !cred.first_run_done ? "first_run_done=false" : "force=true";
+      console.log(`[backfill] cliente ${body.customerId} ${reason} → window=${resolvedWindow}`);
+    } else {
+      resolvedWindow = "30d";
+    }
+
     return {
       google: {
-        clientId: requireEnv("GOOGLE_CLIENT_ID"),
-        clientSecret: requireEnv("GOOGLE_CLIENT_SECRET"),
-        refreshToken: requireEnv("GOOGLE_OAUTH_REFRESH_TOKEN"),
-        driveFolderId: requireEnv("INVOICES_DRIVE_FOLDER_ID"),
-        sheetId: requireEnv("INVOICES_SHEET_ID"),
-        sheetTab: process.env.INVOICES_SHEET_TAB || "Gastos 2026",
+        // Usamos el OAuth Web Client de Operatto (compartido entre todos los clientes).
+        // Cada cliente tiene su propio refresh_token autorizado contra ese client.
+        clientId: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_ID"),
+        clientSecret: requireEnv("GOOGLE_OAUTH_WEB_CLIENT_SECRET"),
+        refreshToken: cred.google_refresh_token,
+        driveFolderId: cred.drive_folder_id,
+        sheetId: cred.sheet_id,
+        sheetTab: cred.sheet_tab,
       },
+      // Reglas de retención del cliente (Sub-fase 2). Si null, el pipeline
+      // deja las retenciones tal como vienen del XML (sin engine).
+      retentionRules: (cred as any).retention_rules ?? null,
+      municipioIca: (cred as any).municipio_ica ?? null,
+      // NIT/cédula del cliente para descartar facturas self-emitted (Migración 0008).
+      nitCliente: (cred as any).nit_cliente ?? null,
+      // Nombre del cliente para fuzzy match cuando LLM no extrae NIT.
+      // Cargado en buildConfig con un query extra (fuera de este return).
+      nombreCliente: await getNombreClienteFromSlug(body.customerId),
       options: {
         dryRun: body.dryRun ?? false,
-        window: body.window ?? "30d",
+        window: resolvedWindow,
+        force: body.force ?? false,
+        monthFilter: body.monthFilter,
+        skipSheetSetup: (body as any).skipSheetSetup ?? false,
       },
     };
   }
 
-  // TODO Proyecto B: leer credenciales del customer desde Supabase
-  // por `body.customerId`. Por ahora throw — la rama no se ejecuta en single-tenant.
-  throw new Error("Multi-tenant aún no implementado (Proyecto B). Sacá customerId del body.");
+  // === Single-tenant (legacy): owner desde env vars del site ===
+  return {
+    google: {
+      clientId: requireEnv("GOOGLE_CLIENT_ID"),
+      clientSecret: requireEnv("GOOGLE_CLIENT_SECRET"),
+      refreshToken: requireEnv("GOOGLE_OAUTH_REFRESH_TOKEN"),
+      driveFolderId: requireEnv("INVOICES_DRIVE_FOLDER_ID"),
+      sheetId: requireEnv("INVOICES_SHEET_ID"),
+      sheetTab: process.env.INVOICES_SHEET_TAB || "Gastos 2026",
+    },
+    options: {
+      dryRun: body.dryRun ?? false,
+      window: body.window ?? "30d",
+      force: body.force ?? false,
+    },
+  };
 }
 
 function requireEnv(name: string): string {
@@ -130,8 +733,49 @@ function requireEnv(name: string): string {
 
 // ===== Notificaciones (Resend) =====
 
-const SHEET_LINK = "https://docs.google.com/spreadsheets/d/1dwCu-1ooeyOC5PEd2lBIhua4zUmC5ymymQ6X0O4zcMU/edit";
-const DRIVE_LINK = "https://drive.google.com/drive/folders/1ksS7gwlT8OYmMh4Eh2WiIQGNwkERdti2";
+// Fallback links del owner legacy. Para clientes multi-tenant se construyen
+// dinámicamente desde cred.sheet_id y cred.drive_folder_id.
+const OWNER_SHEET_LINK = "https://docs.google.com/spreadsheets/d/1dwCu-1ooeyOC5PEd2lBIhua4zUmC5ymymQ6X0O4zcMU/edit";
+const OWNER_DRIVE_LINK = "https://drive.google.com/drive/folders/1ksS7gwlT8OYmMh4Eh2WiIQGNwkERdti2";
+
+interface NotifyTarget {
+  to: string;
+  sheetLink: string;
+  driveLink: string;
+}
+
+/**
+ * Resuelve a quién mandar el correo y qué links usar.
+ * Multi-tenant: usa cred.notify_email + IDs del cliente.
+ * Legacy: env vars del site.
+ */
+async function resolveNotifyTarget(customerId?: string): Promise<NotifyTarget> {
+  if (customerId) {
+    try {
+      const { loadCredentialsBySlug } = await import("../../shared/agents-runtime/src/credentials-by-slug");
+      const cred = await loadCredentialsBySlug(customerId, "facturacion");
+      if (cred?.notify_email) {
+        return {
+          to: cred.notify_email,
+          sheetLink: cred.sheet_id
+            ? `https://docs.google.com/spreadsheets/d/${cred.sheet_id}/edit`
+            : OWNER_SHEET_LINK,
+          driveLink: cred.drive_folder_id
+            ? `https://drive.google.com/drive/folders/${cred.drive_folder_id}`
+            : OWNER_DRIVE_LINK,
+        };
+      }
+    } catch (e: any) {
+      console.warn(`resolveNotifyTarget: failed loading cred for ${customerId}:`, e.message);
+    }
+  }
+  // Fallback legacy — owner
+  return {
+    to: process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com",
+    sheetLink: OWNER_SHEET_LINK,
+    driveLink: OWNER_DRIVE_LINK,
+  };
+}
 
 async function notifyResult(result: PipelineResult, customerId?: string): Promise<void> {
   const apiKey = process.env.RESEND_API_KEY;
@@ -140,8 +784,15 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
     return;
   }
 
-  const to = process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com";
-  const from = process.env.NOTIFY_EMAIL_FROM || "Procesar-Facturas <onboarding@resend.dev>";
+  // Owner (modo legacy single-tenant) NO recibe correo — Tomás monitorea desde
+  // el panel admin. Solo clientes multi-tenant reciben su resumen.
+  if (!customerId) {
+    console.log("notifyResult: skip (modo owner) — Tomás monitorea desde panel");
+    return;
+  }
+
+  const target = await resolveNotifyTarget(customerId);
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
 
   const total = result.procesadas.length + result.errores.length + result.saltadas.length;
   const today = new Date().toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "America/Bogota" });
@@ -155,7 +806,7 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
     subject = `📭 Facturas ${today}: sin novedad`;
   }
 
-  const html = renderHtmlSummary(result, today, customerId);
+  const html = renderHtmlSummary(result, today, customerId, target.sheetLink, target.driveLink);
 
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -163,22 +814,198 @@ async function notifyResult(result: PipelineResult, customerId?: string): Promis
       Authorization: `Bearer ${apiKey}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ from, to: [to], subject, html }),
+    body: JSON.stringify({ from, to: [target.to], subject, html }),
   });
 
   if (!res.ok) {
     const txt = await res.text();
     console.error("Resend error:", res.status, txt);
   } else {
-    console.log(`Email enviado a ${to} — total ${total} items`);
+    console.log(`Email enviado a ${target.to} (cliente: ${customerId ?? "owner"}) — total ${total} items`);
   }
+}
+
+const MES_NAMES = [
+  "enero", "febrero", "marzo", "abril", "mayo", "junio",
+  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+] as const;
+
+/**
+ * Agrupa errores por patrón reconocible para detectar ruido vs problemas reales.
+ *
+ * Patrones que hoy alimentan el contador "errores" y NO son fallas reales:
+ *   - pdf-encrypted     → extractos bancarios con password (Bancolombia, Itaú, tarjetas)
+ *   - pdf-no-text       → PDFs escaneados solo imagen, sin texto extraíble
+ *   - llm-no-invoice    → LLM determinó que el doc no es factura
+ *   - timeout           → red inestable, el daily cron retry-ea
+ *
+ * Devuelve { "pdf-encrypted": 80, "real-llm-fail": 12, "other": 8 } así Tomás
+ * puede entender de un vistazo si el "31% error rate" es ruido bancario o
+ * problema real del pipeline.
+ */
+function countByErrorPattern(errores: Array<{ error: string }>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const e of errores) {
+    const msg = (e.error ?? "").toLowerCase();
+    let pat = "other";
+    if (msg.includes("no password") || msg.includes("password given") || msg.includes("encrypted")) {
+      pat = "pdf-encrypted";
+    } else if (msg.includes("no text") || msg.includes("sin texto")) {
+      pat = "pdf-no-text";
+    } else if (msg.includes("not.*invoice") || msg.includes("no es factura")) {
+      pat = "llm-no-invoice";
+    } else if (msg.includes("timeout") || msg.includes("econnreset") || msg.includes("etimedout")) {
+      pat = "network-timeout";
+    } else if (msg.includes("quota") || msg.includes("rate") || msg.includes("429")) {
+      pat = "api-quota";
+    } else if (msg.includes("invalid_grant") || msg.includes("oauth")) {
+      pat = "oauth-expired";
+    } else if (msg.includes("xml") || msg.includes("parse")) {
+      pat = "xml-parse";
+    } else if (msg.includes("zip")) {
+      pat = "zip-corrupted";
+    }
+    out[pat] = (out[pat] ?? 0) + 1;
+  }
+  return out;
+}
+
+function countByMotivo(saltadas: Array<{ motivo: string }>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const s of saltadas) {
+    const m = s.motivo ?? "unknown";
+    out[m] = (out[m] ?? 0) + 1;
+  }
+  return out;
+}
+
+/**
+ * Email corto "Listo {mes}: N facturas — $X procesado" al terminar cada
+ * mes del fan-out. Feedback incremental durante el backfill para que el
+ * cliente vea progreso real, no espere 15+ min al welcome final.
+ */
+async function notifyMonthDone(
+  customerId: string,
+  monthNumber: number,
+  result: PipelineResult,
+): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return;
+
+  const target = await resolveNotifyTarget(customerId);
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
+
+  const mesName = MES_NAMES[monthNumber - 1] ?? `mes ${monthNumber}`;
+  const totalMonto = result.procesadas.reduce((s, p) => s + (Number(p.total) || 0), 0);
+  const moneyCO = "$" + Math.round(totalMonto).toLocaleString("es-CO");
+
+  const subject = `✅ Listo ${mesName}: ${result.procesadas.length} factura${result.procesadas.length === 1 ? "" : "s"} (${moneyCO})`;
+
+  const html = `
+<div style="font-family:system-ui,-apple-system,sans-serif;max-width:520px;margin:0 auto;color:#222;padding:24px">
+  <div style="background:#f0f9ff;padding:20px;border-radius:8px;border-left:4px solid #1a3a5c;margin-bottom:16px">
+    <div style="font-size:14px;color:#666;margin-bottom:4px">Backfill en curso</div>
+    <h2 style="margin:0 0 12px;font-size:20px;color:#1a3a5c">
+      Listo ${mesName.charAt(0).toUpperCase()}${mesName.slice(1)}
+    </h2>
+    <div style="display:flex;gap:16px;margin-top:12px">
+      <div>
+        <div style="font-size:24px;font-weight:600;color:#1a3a5c;line-height:1">${result.procesadas.length}</div>
+        <div style="font-size:12px;color:#666">factura${result.procesadas.length === 1 ? "" : "s"}</div>
+      </div>
+      <div>
+        <div style="font-size:24px;font-weight:600;color:#1a3a5c;line-height:1">${moneyCO}</div>
+        <div style="font-size:12px;color:#666">monto registrado</div>
+      </div>
+    </div>
+  </div>
+  <p style="margin:0 0 12px;font-size:14px;color:#444;line-height:1.5">
+    Procesamos las facturas de ${mesName} y ya están en tu Sheet con sus PDFs en Drive.
+    Seguimos con los otros meses — te avisamos cuando termine cada uno.
+  </p>
+  <p style="margin:16px 0 0;font-size:13px;color:#666">
+    <a href="${target.sheetLink}" style="color:#1a3a5c;font-weight:600">📊 Abrir Sheet</a>
+    &nbsp;·&nbsp;
+    <a href="${target.driveLink}" style="color:#1a3a5c;font-weight:600">📁 Abrir Drive</a>
+  </p>
+  <p style="margin:24px 0 0;font-size:12px;color:#999;text-align:center">— Operatto</p>
+</div>`;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ from, to: [target.to], subject, html }),
+  });
+  if (!res.ok) {
+    console.error("notifyMonthDone resend error:", res.status, await res.text());
+  } else {
+    console.log(`[month-done] email enviado a ${target.to} — ${mesName} (${result.procesadas.length} facturas)`);
+  }
+}
+
+/**
+ * Email al admin (Tomás) cuando preflight detecta un problema con las
+ * credenciales del cliente. Mejor que enterarse a mitad del pipeline:
+ * tenemos hint accionable + permite Tomás actuar antes del próximo cron.
+ */
+async function notifyPreflightFailed(
+  customerId: string,
+  pf: Extract<PreflightResult, { ok: false }>,
+): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return;
+  // Solo Tomás (admin) — no spam al cliente con errores de OAuth técnicos.
+  const adminEmail = process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com";
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
+
+  const subject = `🚨 Preflight ${pf.check} falló — ${customerId}`;
+  const html = `
+<div style="font-family:system-ui,-apple-system,sans-serif;max-width:560px;color:#222;padding:24px">
+  <h2 style="color:#c00;margin:0 0 12px;font-size:20px">🚨 Preflight failed</h2>
+  <table style="font-size:14px;border-collapse:collapse">
+    <tr>
+      <td style="padding:4px 8px 4px 0;color:#666;font-weight:600">Cliente:</td>
+      <td style="padding:4px 0"><code>${escapeHtml(customerId)}</code></td>
+    </tr>
+    <tr>
+      <td style="padding:4px 8px 4px 0;color:#666;font-weight:600">Check fallado:</td>
+      <td style="padding:4px 0"><code style="background:#fee;padding:2px 6px;border-radius:3px;color:#c00">${pf.check}</code></td>
+    </tr>
+    <tr>
+      <td style="padding:4px 8px 4px 0;color:#666;font-weight:600">Mensaje:</td>
+      <td style="padding:4px 0;font-family:ui-monospace,monospace;font-size:12px">${escapeHtml(pf.message)}</td>
+    </tr>
+  </table>
+  <div style="background:#fef9e7;border-left:4px solid #f0b020;padding:14px 16px;margin:16px 0;border-radius:0 6px 6px 0">
+    <div style="font-weight:600;color:#806600;margin-bottom:4px">Acción sugerida</div>
+    <div style="color:#444;font-size:14px;line-height:1.5">${escapeHtml(pf.hint)}</div>
+  </div>
+  <p style="margin:24px 0 0;font-size:12px;color:#999">
+    El pipeline NO procesó nada — Sheet y Drive del cliente quedan intactos.
+    Cuando arregles las credenciales, el próximo cron diario (o un re-disparo
+    manual) volverá a chequear.
+  </p>
+</div>`;
+
+  await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ from, to: [adminEmail], subject, html }),
+  });
 }
 
 async function notifyError(err: Error, customerId?: string): Promise<void> {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return;
-  const to = process.env.NOTIFY_EMAIL_TO || "tomasramirezvilla@gmail.com";
-  const from = process.env.NOTIFY_EMAIL_FROM || "Procesar-Facturas <onboarding@resend.dev>";
+  // Owner (modo legacy) NO recibe correo de error — Tomás monitorea desde panel.
+  if (!customerId) {
+    console.log("notifyError: skip (modo owner)");
+    return;
+  }
+  // Errores al cliente para que sepa que algo falla.
+  const target = await resolveNotifyTarget(customerId);
+  const to = target.to;
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
 
   const today = new Date().toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "America/Bogota" });
   const hint = err.message?.includes("invalid_grant")
@@ -202,7 +1029,13 @@ async function notifyError(err: Error, customerId?: string): Promise<void> {
   });
 }
 
-function renderHtmlSummary(result: PipelineResult, today: string, customerId?: string): string {
+function renderHtmlSummary(
+  result: PipelineResult,
+  today: string,
+  customerId?: string,
+  sheetLink: string = OWNER_SHEET_LINK,
+  driveLink: string = OWNER_DRIVE_LINK,
+): string {
   const moneyCO = (n: number) =>
     "$" + Math.round(n).toLocaleString("es-CO");
 
@@ -269,12 +1102,235 @@ function renderHtmlSummary(result: PipelineResult, today: string, customerId?: s
       }
 
       <p style="margin:28px 0 4px;color:#666;font-size:13px">
-        <a href="${SHEET_LINK}">📊 Abrir Sheet</a>
+        <a href="${sheetLink}">📊 Abrir Sheet</a>
         &nbsp;·&nbsp;
-        <a href="${DRIVE_LINK}">📁 Abrir Drive</a>
+        <a href="${driveLink}">📁 Abrir Drive</a>
       </p>
     </div>
   `;
+}
+
+/**
+ * Email de BIENVENIDA — sale 1 sola vez después del primer run exitoso del cliente.
+ * Resumen completo del año en curso: total facturas, monto, top proveedores,
+ * breakdown por mes, tiempo ahorrado. Más celebratorio que el email diario.
+ */
+async function notifyWelcome(customerId: string): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.warn("RESEND_API_KEY ausente — no se envía notificación welcome");
+    return;
+  }
+
+  const target = await resolveNotifyTarget(customerId);
+  const from = process.env.NOTIFY_EMAIL_FROM || "Operatto <onboarding@resend.dev>";
+
+  // Cargar nombre del cliente + agregados desde Supabase
+  const supa = getServerClient();
+  const year = new Date().getFullYear();
+
+  const { data: cli } = await supa
+    .from("clientes")
+    .select("id, nombre")
+    .eq("slug", customerId)
+    .single();
+  const clienteNombre = (cli as { nombre?: string } | null)?.nombre ?? customerId;
+  const clienteId = (cli as { id?: string } | null)?.id;
+
+  if (!clienteId) {
+    console.warn(`[welcome] cliente ${customerId} no encontrado en clientes`);
+    return;
+  }
+
+  // Cargar todos los events del año en curso
+  const startYear = `${year}-01-01`;
+  const endYear = `${year + 1}-01-01`;
+  const { data: events } = await supa
+    .from("agent_events")
+    .select("payload")
+    .eq("cliente_id", clienteId)
+    .eq("agente_id", "facturacion")
+    .eq("tipo", "factura_procesada")
+    .gte("payload->>fecha", startYear)
+    .lt("payload->>fecha", endYear);
+
+  const list = (events as Array<{ payload: any }> | null) ?? [];
+  const total = list.length;
+  const totalMonto = list.reduce((s, ev) => s + (Number(ev.payload?.total) || 0), 0);
+  const tiempoMinutos = total * 10; // 10 min/factura
+  const tiempoHoras = Math.round((tiempoMinutos / 60) * 10) / 10;
+  const tiempoDias = Math.round((tiempoHoras / 8) * 10) / 10;
+
+  // Top 5 proveedores
+  const proveedoresMap = new Map<string, { count: number; monto: number }>();
+  for (const ev of list) {
+    const p = ev.payload?.proveedor || "Sin nombre";
+    const t = Number(ev.payload?.total) || 0;
+    const cur = proveedoresMap.get(p) ?? { count: 0, monto: 0 };
+    cur.count++;
+    cur.monto += t;
+    proveedoresMap.set(p, cur);
+  }
+  const topProveedores = Array.from(proveedoresMap.entries())
+    .map(([proveedor, agg]) => ({ proveedor, ...agg }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  // Breakdown por mes
+  const mesesMap = new Map<string, { count: number; monto: number }>();
+  for (const ev of list) {
+    const fecha = ev.payload?.fecha;
+    if (!fecha) continue;
+    const ymKey = fecha.slice(0, 7); // YYYY-MM
+    const cur = mesesMap.get(ymKey) ?? { count: 0, monto: 0 };
+    cur.count++;
+    cur.monto += Number(ev.payload?.total) || 0;
+    mesesMap.set(ymKey, cur);
+  }
+  const mesesOrdenados = Array.from(mesesMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, agg]) => {
+      const [, m] = key.split("-");
+      const mesName = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+                       "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"][parseInt(m, 10) - 1];
+      return { mes: mesName, ...agg };
+    });
+
+  const subject = `🎉 Operatto desatrasó tu ${year} — ${total} facturas listas`;
+  const html = renderWelcomeHtml({
+    clienteNombre,
+    year,
+    total,
+    totalMonto,
+    tiempoHoras,
+    tiempoDias,
+    topProveedores,
+    mesesOrdenados,
+    sheetLink: target.sheetLink,
+    driveLink: target.driveLink,
+  });
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ from, to: [target.to], subject, html }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    console.error("Resend welcome error:", res.status, txt);
+  } else {
+    console.log(`[welcome] email enviado a ${target.to} — ${total} facturas`);
+  }
+}
+
+interface WelcomeData {
+  clienteNombre: string;
+  year: number;
+  total: number;
+  totalMonto: number;
+  tiempoHoras: number;
+  tiempoDias: number;
+  topProveedores: Array<{ proveedor: string; count: number; monto: number }>;
+  mesesOrdenados: Array<{ mes: string; count: number; monto: number }>;
+  sheetLink: string;
+  driveLink: string;
+}
+
+function renderWelcomeHtml(d: WelcomeData): string {
+  const moneyCO = (n: number) => "$" + Math.round(n).toLocaleString("es-CO");
+
+  const proveedoresRows = d.topProveedores
+    .map((p, i) => `
+      <tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;color:#888;font-variant-numeric:tabular-nums">${i + 1}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee">${escapeHtml(p.proveedor)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${p.count}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${moneyCO(p.monto)}</td>
+      </tr>`)
+    .join("");
+
+  const mesesRows = d.mesesOrdenados
+    .map((m) => `
+      <tr>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee">${m.mes}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${m.count}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums">${moneyCO(m.monto)}</td>
+      </tr>`)
+    .join("");
+
+  return `
+<div style="font-family:system-ui,-apple-system,sans-serif;max-width:680px;margin:0 auto;color:#222;padding:24px">
+  <div style="text-align:center;padding:32px 16px;background:linear-gradient(135deg,#1a3a5c 0%,#2c5282 100%);color:#fff;border-radius:12px;margin-bottom:24px">
+    <div style="font-size:48px;margin-bottom:12px">🎉</div>
+    <h1 style="margin:0 0 8px;font-size:28px;font-weight:600">Operatto desatrasó tu ${d.year}</h1>
+    <p style="margin:0;font-size:16px;opacity:0.9">Hola ${escapeHtml(d.clienteNombre)} — esto fue lo que procesamos</p>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:24px">
+    <div style="background:#f5f7fa;padding:20px;border-radius:8px;text-align:center">
+      <div style="font-size:36px;font-weight:600;color:#1a3a5c;line-height:1">${d.total}</div>
+      <div style="font-size:13px;color:#666;margin-top:6px">facturas procesadas</div>
+    </div>
+    <div style="background:#f5f7fa;padding:20px;border-radius:8px;text-align:center">
+      <div style="font-size:36px;font-weight:600;color:#1a3a5c;line-height:1">${moneyCO(d.totalMonto)}</div>
+      <div style="font-size:13px;color:#666;margin-top:6px">monto registrado</div>
+    </div>
+    <div style="background:#fef9e7;padding:20px;border-radius:8px;text-align:center;grid-column:1/3">
+      <div style="font-size:24px;font-weight:600;color:#8a6d00;line-height:1">${d.tiempoHoras} h</div>
+      <div style="font-size:13px;color:#806600;margin-top:6px">≈ ${d.tiempoDias} días de trabajo ahorrado (10 min/factura)</div>
+    </div>
+  </div>
+
+  ${d.mesesOrdenados.length > 0 ? `
+    <h2 style="margin:24px 0 8px;font-size:18px;color:#1a3a5c">📊 Por mes</h2>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;background:#fff">
+      <thead><tr style="background:#fafafa">
+        <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;color:#666;font-weight:600">Mes</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Facturas</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Monto</th>
+      </tr></thead>
+      <tbody>${mesesRows}</tbody>
+    </table>
+  ` : ""}
+
+  ${d.topProveedores.length > 0 ? `
+    <h2 style="margin:24px 0 8px;font-size:18px;color:#1a3a5c">🏆 Top 5 proveedores</h2>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;background:#fff">
+      <thead><tr style="background:#fafafa">
+        <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;color:#666;font-weight:600">#</th>
+        <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;color:#666;font-weight:600">Proveedor</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Facturas</th>
+        <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;color:#666;font-weight:600">Monto</th>
+      </tr></thead>
+      <tbody>${proveedoresRows}</tbody>
+    </table>
+  ` : ""}
+
+  <div style="background:#f0f9ff;padding:20px;border-radius:8px;margin:24px 0;border-left:4px solid #1a3a5c">
+    <h3 style="margin:0 0 12px;font-size:16px;color:#1a3a5c">📁 Tus archivos</h3>
+    <p style="margin:0;font-size:14px;line-height:1.6">
+      <a href="${d.sheetLink}" style="color:#1a3a5c;font-weight:600;text-decoration:none">📊 Abrir tu Sheet con Dashboard →</a><br>
+      <a href="${d.driveLink}" style="color:#1a3a5c;font-weight:600;text-decoration:none">📁 Abrir carpeta Drive con todos los PDFs →</a>
+    </p>
+  </div>
+
+  <div style="background:#fff;padding:20px;border:1px solid #e5e7eb;border-radius:8px;margin:24px 0">
+    <h3 style="margin:0 0 8px;font-size:16px;color:#1a3a5c">¿Qué sigue?</h3>
+    <p style="margin:0;font-size:14px;line-height:1.6;color:#444">
+      Operatto va a procesar todas tus facturas nuevas <strong>todos los días a las 7:00am</strong> (zona Bogotá).
+      Vas a recibir un email diario con el resumen del día. No tenés que hacer nada — solo abrir tu Sheet
+      cuando quieras revisar.
+    </p>
+  </div>
+
+  <p style="margin:32px 0 0;font-size:13px;color:#888;text-align:center">
+    Cualquier cosa, escribime. — Tomás
+  </p>
+</div>
+`;
 }
 
 function escapeHtml(s: any): string {

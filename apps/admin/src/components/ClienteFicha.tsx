@@ -19,6 +19,7 @@ import Sparkline from "./Sparkline";
 import Kpis from "./Kpis";
 import MonthlyBars from "./MonthlyBars";
 import OnboardingProgress from "./OnboardingProgress";
+import SaludArchivo from "./SaludArchivo";
 import { sparkRunsByDay } from "../lib/timeline";
 import type { Cliente, AgentRun, ClientAgent, Agente } from "../types";
 
@@ -244,6 +245,13 @@ export default function ClienteFicha({ slug }: { slug: string }) {
         </div>
         <MonthlyBars data={monthlyAgg} />
       </section>
+
+      {/* === Salud del archivo: validación cross-source 5-fuentes del reparador === */}
+      <SaludArchivo
+        clienteSlug={slug}
+        driveFolderId={credByAgente["facturacion"]?.drive_folder_id ?? null}
+        sheetId={credByAgente["facturacion"]?.sheet_id ?? null}
+      />
 
       <div className="grid grid-cols-2 gap-5">
         {/* Activaciones */}

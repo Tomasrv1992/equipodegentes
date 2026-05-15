@@ -225,6 +225,92 @@ export function useLatestReparadorValidations() {
 }
 
 /**
+ * Último run completo del reparador con payload entero.
+ *
+ * Devuelve el run + payload (validaciones, pdfs_huerfanos, filas_sin_pdf,
+ * auto_repairs, etc) para que el componente SaludArchivo filtre por cliente
+ * y muestre todo en una sola vista. El reparador corre 1 vez al día (8:15
+ * Bogotá) — esto es la fuente de verdad para "Salud del archivo".
+ *
+ * Si necesitás re-correr para un cliente específico (sin esperar al próximo
+ * cron), usar el endpoint admin-reparador-trigger-cliente.
+ */
+export interface ReparadorValidacion {
+  cliente_slug: string;
+  mes: string; // YYYY-MM
+  gmail: number;
+  drive: number;
+  sheet: number;
+  events: number;
+  todo_cuadra: boolean;
+  discrepancias: string[];
+}
+
+export interface ReparadorPdfHuerfano {
+  cliente_slug: string;
+  mes: number;
+  drive_file_id: string;
+  drive_file_name: string;
+}
+
+export interface ReparadorFilaSinPdf {
+  cliente_slug: string;
+  mes: number;
+  proveedor: string;
+  num_factura: string;
+}
+
+export interface ReparadorAutoRepair {
+  cliente_slug: string;
+  tipo: string;
+  num_factura?: string;
+  detalle: string;
+}
+
+export interface ReparadorFullPayload {
+  fecha?: string;
+  ts_generated?: string;
+  validaciones: ReparadorValidacion[];
+  pdfs_huerfanos: ReparadorPdfHuerfano[];
+  filas_sin_pdf: ReparadorFilaSinPdf[];
+  filas_reparadas: any[];
+  auto_repairs: ReparadorAutoRepair[];
+  clientes_inconsistentes: string[];
+  clientes_total?: number;
+  clientes_procesados?: number;
+  clientes_skipped?: number;
+  errores: any[];
+}
+
+export interface ReparadorLastRun {
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  duration_ms: number | null;
+  summary: string | null;
+  payload: ReparadorFullPayload;
+}
+
+export function useReparadorLastRun() {
+  return useQuery({
+    queryKey: ["reparador-last-run"],
+    refetchInterval: 5 * 60_000,
+    queryFn: async (): Promise<ReparadorLastRun | null> => {
+      const { data, error } = await supabase
+        .from("agent_runs")
+        .select("id, started_at, finished_at, status, duration_ms, summary, payload")
+        .eq("agente_id", "reparador")
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return data as ReparadorLastRun | null;
+    },
+  });
+}
+
+/**
  * Trae client_credentials de clientes en onboarding (first_run_done=false).
  *
  * Devuelve para cada cliente en proceso de backfill:

@@ -50,28 +50,56 @@ export async function runPreflight(cfg: PreflightConfig): Promise<PreflightResul
   const t0 = Date.now();
 
   // 1. OAuth: ¿el refresh_token todavía da access_token válido?
+  //
+  // RETRY CON BACKOFF — bug detectado 2026-05-15: cuando el cron dispara
+  // muchos clientes al mismo tiempo, Google rate-limita el endpoint OAuth
+  // por client_id (compartido entre todos los clientes via shared Web Client
+  // de Operatto) y devuelve `invalid_grant` transitorio a algunos. El error
+  // es indistinguible (mismo string) del "token realmente revocado", lo
+  // que causaba falsos positivos y emails alarmantes.
+  //
+  // Solución: si falla con invalid_grant en el PRIMER intento, esperamos
+  // 1.5-2s con jitter y reintentamos. Si vuelve a fallar, sí es real.
   const auth = new google.auth.OAuth2(cfg.clientId, cfg.clientSecret);
   auth.setCredentials({ refresh_token: cfg.refreshToken });
 
-  try {
-    const { token } = await auth.getAccessToken();
-    if (!token) {
-      return {
-        ok: false,
-        check: "oauth",
-        message: "getAccessToken returned no token",
-        hint: "Refresh token inválido o revocado. Cliente debe re-hacer OAuth.",
-        durationMs: Date.now() - t0,
-      };
+  const MAX_OAUTH_ATTEMPTS = 2;
+  let lastErr: any = null;
+  let tokenResult: string | null = null;
+  for (let attempt = 1; attempt <= MAX_OAUTH_ATTEMPTS; attempt++) {
+    try {
+      const { token } = await auth.getAccessToken();
+      if (token) {
+        tokenResult = token;
+        break;
+      }
+      lastErr = new Error("getAccessToken returned no token");
+    } catch (err: any) {
+      lastErr = err;
+      const isInvalidGrant =
+        err.message?.includes("invalid_grant") ||
+        err.response?.data?.error === "invalid_grant";
+      // Solo reintentar invalid_grant (los demás errores son determinísticos
+      // — credentials mal configuradas, etc — no mejoran con retry).
+      if (!isInvalidGrant || attempt >= MAX_OAUTH_ATTEMPTS) break;
+      // Backoff con jitter para no sincronizar reintentos entre clientes
+      const delay = 1500 + Math.floor(Math.random() * 1000);
+      console.warn(
+        `[preflight] oauth invalid_grant attempt ${attempt}/${MAX_OAUTH_ATTEMPTS} — retry in ${delay}ms`,
+      );
+      await new Promise((r) => setTimeout(r, delay));
     }
-  } catch (err: any) {
+  }
+
+  if (!tokenResult) {
+    const err = lastErr;
     const isInvalidGrant =
-      err.message?.includes("invalid_grant") ||
-      err.response?.data?.error === "invalid_grant";
+      err?.message?.includes("invalid_grant") ||
+      err?.response?.data?.error === "invalid_grant";
     return {
       ok: false,
       check: "oauth",
-      message: `OAuth refresh failed: ${err.message}`,
+      message: `OAuth refresh failed (${MAX_OAUTH_ATTEMPTS} attempts): ${err?.message ?? "unknown"}`,
       hint: isInvalidGrant
         ? "Cliente revocó permisos o el token está vencido. Mandar link de re-onboarding."
         : "Verificar GOOGLE_OAUTH_WEB_CLIENT_ID/SECRET en env vars del site.",

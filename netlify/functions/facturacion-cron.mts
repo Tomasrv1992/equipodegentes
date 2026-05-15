@@ -53,31 +53,55 @@ export default async (_req: Request) => {
     );
   }
 
-  // Multi-tenant: dispara N invocaciones en paralelo (no esperamos respuesta).
-  // Cada background fn corre hasta 15min en paralelo con las otras.
+  // Multi-tenant: dispara N invocaciones CON STAGGER 800ms.
+  //
+  // Bug detectado 2026-05-15: 3 clientes recibieron email "OAuth invalid_grant"
+  // a la misma hora exacta (12:06:30 UTC), pero ninguno había revocado permisos.
+  // Causa: cuando dispatchamos 10+ clientes con Promise.allSettled, todos hacen
+  // refresh_token al MISMO Google OAuth client_id (el Web Client compartido de
+  // Operatto) en milisegundos. Google rate-limita por client_id y devuelve
+  // invalid_grant transitorio a algunos.
+  //
+  // Fix: stagger 800ms entre dispatches. Total para 11 clientes: ~9s, bien
+  // dentro del timeout de 30s del cron stub. Cada cliente sigue corriendo
+  // en paralelo en su propio background fn (15min max) — solo se ARRANCAN
+  // separados, después corren simultáneos.
   console.log(JSON.stringify({
     triggered_at: triggeredAt,
-    mode: "multi_tenant",
+    mode: "multi_tenant_staggered",
     n_clients: clientes.length,
+    stagger_ms: 800,
     clients: clientes.map((c) => c.slug),
     target,
   }));
 
-  const results = await Promise.allSettled(
-    clientes.map((c) =>
-      fetch(target, {
+  const DISPATCH_STAGGER_MS = 800;
+  let ok = 0;
+  let failed = 0;
+  for (let i = 0; i < clientes.length; i++) {
+    if (i > 0) {
+      await new Promise((r) => setTimeout(r, DISPATCH_STAGGER_MS));
+    }
+    const c = clientes[i];
+    try {
+      const resp = await fetch(target, {
         method: "POST",
         headers: {
           "x-internal-secret": secret,
           "content-type": "application/json",
         },
         body: JSON.stringify({ customerId: c.slug }),
-      }),
-    ),
-  );
-
-  const ok = results.filter((r) => r.status === "fulfilled").length;
-  const failed = results.length - ok;
+      });
+      if (resp.ok || resp.status === 202) ok++;
+      else {
+        failed++;
+        console.warn(`[cron] ${c.slug} status=${resp.status}`);
+      }
+    } catch (e: any) {
+      failed++;
+      console.warn(`[cron] ${c.slug} dispatch failed: ${e.message}`);
+    }
+  }
 
   console.log(JSON.stringify({
     triggered_at: triggeredAt,

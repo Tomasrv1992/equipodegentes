@@ -49,7 +49,11 @@ export default function ClientesPage() {
   }
   if (!clientes || !facturas || !runs || !activaciones) return null;
 
-  const SYNTHETIC = new Set(["monitor", "reparador", "limpiador", "supervisor", "owner"]);
+  const SYNTHETIC = new Set([
+    "monitor", "inspector",
+    "reparador", "limpiador", "archivero",
+    "supervisor", "owner",
+  ]);
   const clientesOp = clientes.filter((c) => !SYNTHETIC.has(c.slug));
 
   const filas = clientesOp.map((c) =>

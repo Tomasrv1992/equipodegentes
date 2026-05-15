@@ -41,9 +41,8 @@ const EQUIPOS: Array<{
       "Pipeline automático de cuentas por pagar: lee Gmail, identifica facturas DIAN y no-DIAN, organiza en Drive y registra en Sheet. Los 4 agentes administrativos validan y reparan el resultado.",
     agentePrincipal: "facturacion",
     agentesInternos: [
-      { id: "monitor", nombre: "Monitor", rol: "Detecta gaps y zombies", hora: "08:00" },
-      { id: "reparador", nombre: "Reparador", rol: "Auto-repara filas faltantes", hora: "08:15" },
-      { id: "limpiador", nombre: "Limpiador", rol: "Descarta duplicados con LLM", hora: "08:30" },
+      { id: "inspector", nombre: "Inspector", rol: "Observa runs y cierra zombies", hora: "08:00" },
+      { id: "archivero", nombre: "Archivero", rol: "Auto-repara filas + recupera huérfanos (LLM) + cleanup dups", hora: "08:15" },
       { id: "supervisor", nombre: "Supervisor", rol: "Valida resultado final y retriggea", hora: "08:45" },
     ],
   },

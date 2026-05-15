@@ -34,6 +34,10 @@
   path = "/api/admin/reparador-trigger-cliente"
 
 [[edge_functions]]
+  function = "admin-rebuild-sheet-cliente"
+  path = "/api/admin/rebuild-sheet-cliente"
+
+[[edge_functions]]
   function = "diagnostico-reporte"
   path = "/api/diagnostico-reporte"
 

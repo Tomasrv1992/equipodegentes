@@ -30,6 +30,7 @@ import type { Cliente, AgentEvent } from "../types";
 import EmptyState from "./EmptyState";
 import OnboardingEnCurso from "./OnboardingEnCurso";
 import ResumenSaludClientes from "./ResumenSaludClientes";
+import SaludOAuth from "./SaludOAuth";
 
 interface FacturaPayload {
   fecha?: string;
@@ -161,6 +162,9 @@ export default function Matriz() {
           factura procesada.
         </div>
       </section>
+
+      {/* === SALUD OAUTH: alerta clientes con refresh_token próximo a expirar === */}
+      <SaludOAuth />
 
       {/* === CLIENTES EN ONBOARDING (alta prioridad — backfill activo) === */}
       <OnboardingEnCurso clientes={clientes} runs={runs} facturas={facturas} />

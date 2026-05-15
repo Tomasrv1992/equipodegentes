@@ -238,9 +238,146 @@ export default function SaludArchivo({ clienteSlug, driveFolderId, sheetId }: Pr
               )}
             </div>
           )}
+
+          {/* Reconstruir Sheet desde events — solo si hay duplicación detectada */}
+          <RebuildSheetPanel clienteSlug={clienteSlug} validaciones={validaciones} />
         </>
       )}
     </section>
+  );
+}
+
+/**
+ * Botón "Reconstruir Sheet desde events" — solo visible si hay duplicación
+ * sospechosa (sheet/events > 1.5×). Operación destructiva sobre el Sheet,
+ * pide confirmación + permite dryRun primero.
+ */
+function RebuildSheetPanel({
+  clienteSlug,
+  validaciones,
+}: {
+  clienteSlug: string;
+  validaciones: ReparadorValidacion[];
+}) {
+  const [confirmed, setConfirmed] = useState(false);
+  const [lastDryRun, setLastDryRun] = useState<any>(null);
+  const queryClient = useQueryClient();
+
+  // Detectar si hay algún mes con ratio sospechoso (sheet > events × 1.5)
+  const tieneDuplicacion = validaciones.some(
+    (v) => v.events > 0 && v.sheet > v.events * 1.5,
+  );
+
+  if (!tieneDuplicacion) return null;
+
+  const peoresMeses = validaciones
+    .filter((v) => v.events > 0 && v.sheet > v.events * 1.5)
+    .map((v) => {
+      const [, mm] = v.mes.split("-");
+      return { mes: MES_LABELS[parseInt(mm, 10) - 1] ?? v.mes, ratio: v.sheet / v.events, sheet: v.sheet, events: v.events };
+    })
+    .sort((a, b) => b.ratio - a.ratio);
+
+  const mut = useMutation({
+    mutationFn: async (opts: { dryRun: boolean }) => {
+      const { data: sess } = await supabase.auth.getSession();
+      const accessToken = sess.session?.access_token;
+      const resp = await fetch("/api/admin/rebuild-sheet-cliente", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({ clienteSlug, dryRun: opts.dryRun }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      return resp.json();
+    },
+    onSuccess: (data, vars) => {
+      if (vars.dryRun) setLastDryRun(data);
+      else {
+        setLastDryRun(null);
+        setConfirmed(false);
+        // Refresh datos en ~90s (rebuild puede tardar varios min según volumen)
+        setTimeout(() => {
+          queryClient.invalidateQueries({ queryKey: ["reparador-last-run"] });
+        }, 90_000);
+      }
+    },
+  });
+
+  return (
+    <div className="mt-4 p-3 border border-fail/30 bg-fail-soft/30 rounded-md">
+      <div className="font-mono text-[11px] text-fail tracking-[0.04em] uppercase mb-2">
+        ⚠️ Duplicación detectada — reconstruir Sheet desde events
+      </div>
+      <p className="font-sans text-[12px] text-ink-2 mb-2">
+        {peoresMeses.length} mes{peoresMeses.length !== 1 ? "es" : ""} con Sheet inflado.
+        Esta acción <strong>borra todas las filas</strong> de los meses con datos en events
+        y las reescribe limpio (1 fila por event). Es <strong>destructiva pero idempotente</strong>:
+        si después corrés el cron, NO duplica.
+      </p>
+      <div className="font-mono text-[10px] text-ink-3 mb-2">
+        Peores:{" "}
+        {peoresMeses.slice(0, 3).map((m, i) => (
+          <span key={i}>
+            {m.mes} {m.sheet}→{m.events} ({m.ratio.toFixed(1)}×){i < peoresMeses.length - 1 ? " · " : ""}
+          </span>
+        ))}
+      </div>
+
+      {lastDryRun && (
+        <div className="bg-paper p-2 rounded mb-2 font-mono text-[10px]">
+          <div className="text-ok mb-1">✓ Dry-run completo. Borraría:</div>
+          <ul className="space-y-0.5">
+            {(lastDryRun.report ?? [])
+              .filter((r: any) => r.events_encontrados > 0 || r.filas_borradas > 0)
+              .map((r: any) => (
+                <li key={r.mes}>
+                  {r.tab}: {r.filas_borradas} filas → {r.events_encontrados} reales
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => mut.mutate({ dryRun: true })}
+          disabled={mut.isPending}
+          className="font-mono text-[10px] tracking-[0.04em] px-3 py-1.5 rounded border border-edge bg-paper hover:bg-paper-sunken disabled:opacity-50"
+        >
+          {mut.isPending && !confirmed ? "Calculando…" : "Ver qué borraría (dry-run)"}
+        </button>
+        {lastDryRun && !confirmed && (
+          <button
+            onClick={() => setConfirmed(true)}
+            className="font-mono text-[10px] tracking-[0.04em] px-3 py-1.5 rounded bg-fail/10 text-fail border border-fail/40 hover:bg-fail/20"
+          >
+            Confirmar rebuild
+          </button>
+        )}
+        {confirmed && (
+          <button
+            onClick={() => mut.mutate({ dryRun: false })}
+            disabled={mut.isPending}
+            className="font-mono text-[10px] tracking-[0.04em] px-3 py-1.5 rounded bg-fail text-paper hover:bg-fail/90 disabled:opacity-50"
+          >
+            {mut.isPending ? "Reconstruyendo…" : "🔥 EJECUTAR REBUILD"}
+          </button>
+        )}
+        {mut.isError && (
+          <span className="font-mono text-[10px] text-fail">
+            ⚠ {(mut.error as Error).message.slice(0, 80)}
+          </span>
+        )}
+        {mut.isSuccess && !lastDryRun && (
+          <span className="font-mono text-[10px] text-ok">
+            ✓ rebuild disparado · refresh en ~90s
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

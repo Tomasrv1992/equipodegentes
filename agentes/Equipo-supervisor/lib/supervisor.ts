@@ -139,6 +139,8 @@ export async function runSupervisor(): Promise<SupervisorReport> {
       //   2. Si gap events-vs-sheet → retrigger reparador
       //   3. Si gap Drive-vs-Sheet → retrigger PROCESADOR (Idea 2: re-disparar)
       //   4. Si las fuentes NO cuadran → FAIL crítico
+      //   5. Si ratio sheet/events > 2 (duplicación masiva) → FAIL CRÍTICO,
+      //      bloquear todo el procesamiento hasta intervención humana
       //
       // CAPA 3 — Anti-loop: cada retrigger se cuenta en audit_log.
       // Si un cliente ya fue retrigger > MAX_RETRIGGERS_POR_DIA veces →
@@ -147,6 +149,22 @@ export async function runSupervisor(): Promise<SupervisorReport> {
       const gapSheetEvents = Math.abs(chequeo.events_count - chequeo.sheet_count) > 0;
       const gapDriveSheet = Math.abs(chequeo.drive_count - chequeo.sheet_count) > 0;
       const fuentesNoCuadran = gapSheetEvents || gapDriveSheet;
+
+      // BUG E FIX 2026-05-15 — detectar DUPLICACIÓN MASIVA en Sheet.
+      //
+      // Caso real: Freshco abril tenía 407,741 filas en Sheet vs 428 events
+      // (ratio 316×). El supervisor viejo NO detectaba esto porque solo
+      // miraba si los counters eran iguales o no — un gap "grande" se reportaba
+      // pero NO se distinguía de un gap "razonable".
+      //
+      // Nueva regla: si sheet/events > 2 (Sheet tiene MÁS DEL DOBLE de filas
+      // que events), es duplicación catastrófica. NO retrigger nada (los
+      // retriggers SOLO EMPEORAN: appendan más filas). Bloquear y escalar a
+      // Tomás para que decida (rebuild Sheet desde events).
+      const ratioSheetEvents = chequeo.events_count > 0
+        ? chequeo.sheet_count / chequeo.events_count
+        : 0;
+      const duplicacionCatastrofica = ratioSheetEvents > 2;
 
       // Importar helpers de audit + anti-loop
       const { auditLog, contarRetriggersHoy, MAX_RETRIGGERS_POR_DIA } = await import(
@@ -165,6 +183,34 @@ export async function runSupervisor(): Promise<SupervisorReport> {
       // facturacion) por separado. Loop protection sigue activo por agente —
       // si limpiador no resuelve duplicados después de 3 intentos, ese sí
       // escala. Pero no se bloquea por problemas no-relacionados.
+      // GUARD CRÍTICO — si hay duplicación catastrófica (Sheet >2× events),
+      // NO disparar NINGÚN retrigger. Los retriggers solo empeoran el problema
+      // (appenden más filas). Escalar a intervención humana y bloquear procesamiento
+      // del cliente hasta que Tomás haga rebuild manual del Sheet.
+      if (duplicacionCatastrofica) {
+        chequeo.estado = "fail";
+        chequeo.acciones_tomadas.push(
+          `🚨🚨 DUPLICACIÓN CATASTRÓFICA: Sheet=${chequeo.sheet_count} vs Events=${chequeo.events_count} (ratio ${ratioSheetEvents.toFixed(1)}×). Requiere REBUILD MANUAL del Sheet desde agent_events. NO se dispararán retriggers (empeorarían).`,
+        );
+        chequeo.detalle += ` 🚨🚨 RATIO ${ratioSheetEvents.toFixed(1)}× — bloqueado`;
+        await auditLog({
+          agente: "supervisor",
+          accion: "supervisor.escalar_intervencion_humana",
+          clienteSlug: c.slug,
+          clienteId: c.id,
+          motivo: `Duplicación catastrófica: ratio Sheet/Events = ${ratioSheetEvents.toFixed(1)}× (umbral=2×). Bloqueado.`,
+          detalles: {
+            sheet_count: chequeo.sheet_count,
+            events_count: chequeo.events_count,
+            drive_count: chequeo.drive_count,
+            ratio: ratioSheetEvents,
+            accion_recomendada: "Usar /api/admin/rebuild-sheet-cliente para reconstruir Sheet desde events",
+          },
+        });
+        report.requiere_atencion_critica = true;
+        continue; // No procesar más este cliente — pasar al siguiente
+      }
+
       const [retriggersLimpiador, retriggersReparador, retriggersProcesador] =
         await Promise.all([
           contarRetriggersHoy(c.slug, "limpiador"),

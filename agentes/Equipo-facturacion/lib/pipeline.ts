@@ -335,6 +335,23 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
 
   // Caché de Sheet rows POR pestaña-mes (key = "Enero", "Febrero"...).
   // Se carga lazy y se actualiza tras cada append. Soporta multi-mes en una corrida.
+  //
+  // BUG H FIX 2026-05-15 — duplicación masiva (Freshco abril 316×):
+  //   El catch silencioso del try/catch viejo cacheaba `[]` cuando la API
+  //   tiraba quota/timeout. Entonces TODAS las facturas siguientes en ese run
+  //   veían el cache vacío → isDuplicate=false → cada una se appendea otra vez
+  //   → Sheet acumula 1000× la realidad. Las llamadas a appendToSheet sí
+  //   funcionan (escritura), pero como el cache de lectura estaba contaminado,
+  //   no podía detectar dups.
+  //
+  //   Fix: si la lectura falla por error que NO sea "tab no existe", hacemos
+  //   THROW para abortar el cliente entero ese run. Mejor perder un run que
+  //   duplicar 1000× las filas. El próximo cron lo recupera.
+  //
+  //   Cómo distinguimos "tab no existe" (OK, lo crea getOrCreateMonthTab) de
+  //   "quota/timeout" (NO OK, abortar): el error de Sheets API trae .code o
+  //   .response.status. 400 con "Unable to parse range" = tab no existe. Resto
+  //   son errores transitorios o reales — abortar.
   const sheetRowsCache = new Map<string, any[][]>();
   const loadSheetRows = async (tabName: string): Promise<any[][]> => {
     if (sheetRowsCache.has(tabName)) return sheetRowsCache.get(tabName)!;
@@ -347,10 +364,27 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
       const rows = res.data.values || [];
       sheetRowsCache.set(tabName, rows);
       return rows;
-    } catch {
-      // El tab puede no existir todavía — lo creará getOrCreateMonthTab.
-      sheetRowsCache.set(tabName, []);
-      return [];
+    } catch (err: any) {
+      const status = err?.code ?? err?.response?.status;
+      const msg = String(err?.message ?? "");
+      const isTabNotFound =
+        status === 400 &&
+        (msg.includes("Unable to parse range") ||
+          msg.includes("not found"));
+      if (isTabNotFound) {
+        // Tab no existe — lo creará getOrCreateMonthTab. OK cachear [].
+        sheetRowsCache.set(tabName, []);
+        return [];
+      }
+      // Error transitorio o real (quota, timeout, 5xx, network).
+      // NO cachear nada — sino el resto del run vería [] y duplicaría todo.
+      // THROW para abortar este cliente y proteger integridad del Sheet.
+      console.error(
+        `[loadSheetRows] ERROR no-cacheable en ${tabName}: status=${status} msg=${msg}. Abortando para proteger Sheet (sino duplicaríamos).`,
+      );
+      throw new Error(
+        `loadSheetRows ${tabName} failed (status=${status}): ${msg}. Abortando run para evitar duplicación masiva en Sheet.`,
+      );
     }
   };
 
@@ -494,16 +528,32 @@ const MES_TABS = [
 /**
  * Genera el nombre base de un archivo de factura para Drive.
  * El mes NO se incluye porque ya está en la carpeta padre (YYYY-MM/).
+ *
+ * BUG C FIX 2026-05-15: antes el filename era `{consecutivo}. {Proveedor}`,
+ * pero el consecutivo es per-mes y se reasigna en cada re-run. Si re-run-eábamos
+ * facturas, varias terminaban con el mismo "1. Comercializadora..." aunque
+ * fueran facturas distintas (consecutivos DIAN distintos). Drive entonces
+ * sobrescribía archivos (cuando appProperties.unique_key falla) o creaba
+ * "Sas (1).pdf, Sas (2).pdf" lo cual era confuso.
+ *
+ * Ahora el filename incluye también el numero DIAN o equivalente único —
+ * garantiza unicidad sin importar cuántas veces se re-corra. Mantiene el
+ * consecutivo al inicio para preservar orden visual en Drive.
+ *
  * Ejemplos:
- *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA")
- *     → "1. Seguros De Vida Suramericana"
- *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", 1)
- *     → "1.1. Seguros De Vida Suramericana"  (XML idx 1)
- *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", 3)
- *     → "1.3. Seguros De Vida Suramericana"  (futuro: comprobante pago)
+ *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", "FEL428843")
+ *     → "1. FEL428843. Seguros De Vida Suramericana"
+ *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", "FEL428843", 1)
+ *     → "1. FEL428843.1. Seguros De Vida Suramericana"  (XML idx 1)
+ *   buildFileBaseName(1, "Sin Proveedor", null)        // sin numero DIAN
+ *     → "1. Sin Proveedor"                              // fallback al viejo formato
  */
-function buildFileBaseName(n: number, proveedor: string, subIdx?: number): string {
-  const N = subIdx != null ? `${n}.${subIdx}` : `${n}`;
+function buildFileBaseName(
+  n: number,
+  proveedor: string,
+  numeroDIAN?: string | null,
+  subIdx?: number,
+): string {
   // Title-case proveedor (capitaliza primera letra de cada palabra), max 60 chars
   const provClean = String(proveedor || "Sin Proveedor")
     .toLowerCase()
@@ -511,7 +561,22 @@ function buildFileBaseName(n: number, proveedor: string, subIdx?: number): strin
     .replace(/[\\/:*?"<>|]/g, "-")
     .slice(0, 60)
     .trim();
-  return `${N}. ${provClean}`;
+
+  // numeroDIAN sanitizado (sin caracteres que rompan filename)
+  const numClean = numeroDIAN
+    ? String(numeroDIAN).replace(/[\\/:*?"<>|]/g, "-").trim()
+    : "";
+
+  if (!numClean) {
+    // Fallback al formato viejo (cuando no hay numero DIAN — raro, casos
+    // donde el LLM no extrajo numero o son docs no-DIAN sin identificador).
+    const N = subIdx != null ? `${n}.${subIdx}` : `${n}`;
+    return `${N}. ${provClean}`;
+  }
+
+  // Formato nuevo: {consecutivo}. {numeroDIAN}[.{subIdx}]. {Proveedor}
+  const numPart = subIdx != null ? `${numClean}.${subIdx}` : numClean;
+  return `${n}. ${numPart}. ${provClean}`;
 }
 
 // Headers: 15 columnas. Retenciones AHORA entre IVA y Total a Pagar (no al final).
@@ -2008,11 +2073,14 @@ async function processOne(
     const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
 
     let driveLink = "";
-    // Naming: "{N}. {Proveedor}.pdf" — ej "1. Seguros De Vida Suramericana.pdf"
+    // Naming: "{N}. {numeroDIAN}. {Proveedor}.pdf"
+    //         ej "1. FEL428843. Seguros De Vida Suramericana.pdf"
     // El mes está en la carpeta padre YYYY-MM/, no se repite en el filename.
-    // XMLs: "{N}.1. {Proveedor}.xml", "{N}.2. {Proveedor}.xml"...
-    // {N}.3 reservado para comprobante de pago (futuro sub-pipeline).
-    const baseName = buildFileBaseName(consecutivo, data.proveedor);
+    // XMLs: "{N}. {numeroDIAN}.1. {Proveedor}.xml" (idx 1, 2, etc).
+    // BUG C FIX 2026-05-15: incluir numero DIAN evita colisiones cuando un
+    // proveedor envía múltiples facturas en un mes (varias "1. Comercializadora..."
+    // antes sobrescribían entre sí).
+    const baseName = buildFileBaseName(consecutivo, data.proveedor, data.numero);
     // uniqueKey para DIAN: el CUFE es identificador único oficial de la DIAN.
     const dianUniqueKey = data.cufe ? `dian:${data.cufe}` : undefined;
     if (pdfPath) {
@@ -2020,7 +2088,7 @@ async function processOne(
       driveLink = uploaded.webViewLink || "";
     }
     for (let j = 0; j < xmlPaths.length; j++) {
-      const xmlName = buildFileBaseName(consecutivo, data.proveedor, j + 1);
+      const xmlName = buildFileBaseName(consecutivo, data.proveedor, data.numero, j + 1);
       const xmlUniqueKey = dianUniqueKey ? `${dianUniqueKey}:xml${j + 1}` : undefined;
       await uploadFile(drive, xmlPaths[j], folderId, `${xmlName}.xml`, xmlUniqueKey);
     }
@@ -2139,8 +2207,9 @@ async function processPlanilla(
       return "";
     })();
 
-    // 6. Subir PDFs al folder del mes con naming "{N}. Planilla SS" + sub-índices
-    const baseName = buildFileBaseName(consecutivo, proveedor);
+    // 6. Subir PDFs al folder del mes con naming "{N}. {planilla#}. Planilla SS" + sub-índices
+    // Bug C fix: usar numeroPlanilla como identificador único (mismo flow que facturas DIAN).
+    const baseName = buildFileBaseName(consecutivo, proveedor, numeroPlanilla);
     let driveLink = "";
     let n = 0;
     for (const p of planillas) {
@@ -2149,7 +2218,7 @@ async function processPlanilla(
       try {
         const fileName = n === 0
           ? `${baseName}.pdf`
-          : `${buildFileBaseName(consecutivo, proveedor, n + 1)}.pdf`;
+          : `${buildFileBaseName(consecutivo, proveedor, numeroPlanilla, n + 1)}.pdf`;
         // uniqueKey para planillas: messageId + filename original (Gmail no
         // re-genera adjuntos con mismo messageId, así garantizamos idempotencia).
         const planillaKey = `gmail:${messageId}:${p.filename}`;
@@ -2353,7 +2422,9 @@ async function processCuentaCobroDocx(
     const consecutivo = await getNextConsecutivo(tabName);
 
     // 8. Subir el .docx al folder del mes
-    const baseName = buildFileBaseName(consecutivo, extracted.proveedor);
+    // Bug C fix: incluir numero (extracted.numero) en filename para evitar
+    // colisiones cuando un proveedor envía múltiples cuentas de cobro.
+    const baseName = buildFileBaseName(consecutivo, extracted.proveedor, extracted.numero);
     // uniqueKey: messageId del Gmail + filename original — el mismo email
     // procesado dos veces va a reusar el archivo subido la primera vez.
     const docxUniqueKey = `gmail:${messageId}:${d.filename}`;
@@ -2556,7 +2627,9 @@ async function processGenericPdf(
     const consecutivo = await getNextConsecutivo(tabName);
 
     // 9. Subir PDF a Drive
-    const baseName = buildFileBaseName(consecutivo, extracted.proveedor);
+    // Bug C fix: incluir numero (extracted.numero) en filename para evitar
+    // colisiones cuando un proveedor envía múltiples recibos en un mes.
+    const baseName = buildFileBaseName(consecutivo, extracted.proveedor, extracted.numero);
     // uniqueKey: messageId Gmail + filename — re-procesar mismo email no duplica
     const pdfUniqueKey = `gmail:${messageId}:${p.filename}`;
     const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`, pdfUniqueKey);

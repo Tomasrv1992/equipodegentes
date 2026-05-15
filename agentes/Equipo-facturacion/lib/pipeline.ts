@@ -354,6 +354,36 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     }
   };
 
+  // ATOMIC COUNTER del consecutivo POR pestaña-mes.
+  //
+  // Bug detectado 2026-05-15 (Freshco enero, ~50 filas duplicadas con mismo
+  // consecutivo): cuando 5 workers procesaban facturas del mismo proveedor en
+  // paralelo, todos leían el cache de sheetRows al mismo tiempo, calculaban
+  // maxN+1 igual, y todos asignaban el MISMO consecutivo a facturas distintas.
+  // Resultado: 5 filas en Sheet con #101 (números FEL distintos) y 5 PDFs en
+  // Drive llamados "1. Comercializadora...pdf" (mismo nombre, contenido distinto).
+  //
+  // Fix: counter atómico en memoria. Cada worker que necesita un consecutivo
+  // llama getNextConsecutivo() — la operación read+increment es ATOMIC en JS
+  // single-thread entre awaits. Garantiza que cada worker recibe un valor único.
+  const mesConsecutivoCounter = new Map<string, number>();
+  const getNextConsecutivo = async (tabName: string): Promise<number> => {
+    if (!mesConsecutivoCounter.has(tabName)) {
+      // Inicializar lazy: leer cache + encontrar maxN actual del Sheet
+      const rows = await loadSheetRows(tabName);
+      let maxN = 0;
+      for (let i = 1; i < rows.length; i++) {
+        const v = parseInt(String(rows[i][0] ?? ""), 10);
+        if (!isNaN(v) && v > maxN) maxN = v;
+      }
+      mesConsecutivoCounter.set(tabName, maxN);
+    }
+    // Read + write atómico (JS single-thread garantiza esto entre awaits).
+    const next = (mesConsecutivoCounter.get(tabName) ?? 0) + 1;
+    mesConsecutivoCounter.set(tabName, next);
+    return next;
+  };
+
   const result: PipelineResult = { procesadas: [], errores: [], saltadas: [], repetidas: [] };
   const llmTracker: LlmTracker = { calls: 0, preFilteredOut: 0 };
 
@@ -405,6 +435,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
           retentionCtx,
           nitCliente,
           nombreClienteNorm,
+          getNextConsecutivo,  // ← NUEVO: counter atómico per-mes
         );
         if ("ok" in r && r.ok) {
           result.procesadas.push(r);
@@ -1814,6 +1845,7 @@ async function processOne(
   retentionCtx: { rules: unknown | null; municipioIca: string | null } | null,
   nitCliente: string | null,
   nombreClienteNorm: string | null,
+  getNextConsecutivo: (tabName: string) => Promise<number>,
 ): Promise<ProcessOneResult> {
   const msg = await getMessageFull(gmail, messageId);
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
@@ -1829,7 +1861,7 @@ async function processOne(
   if (zips.length === 0 && planillas.length > 0) {
     return await processPlanilla(
       messageId, labelId, gmail, drive, sheets, g, planillas, subject, msg,
-      loadSheetRows, pushToCache,
+      loadSheetRows, pushToCache, getNextConsecutivo,
     );
   }
 
@@ -1863,6 +1895,7 @@ async function processOne(
     return await processCuentaCobroDocx(
       messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
       loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
+      getNextConsecutivo,
     );
   }
 
@@ -1875,6 +1908,7 @@ async function processOne(
       return await processGenericPdf(
         messageId, labelId, gmail, drive, sheets, g, genericPdfs, subject, msg,
         loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
+        getNextConsecutivo,
       );
     }
   }
@@ -1967,13 +2001,9 @@ async function processOne(
       return { dup: true, motivo: `${data.proveedor} ${data.numero} (ya en ${tabName})`, subject };
     }
 
-    // Calcular N° consecutivo del mes: max(col A) + 1. Header en row 0 → data en row 1+.
-    let maxN = 0;
-    for (let i = 1; i < sheetRows.length; i++) {
-      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
-      if (!isNaN(v) && v > maxN) maxN = v;
-    }
-    const consecutivo = maxN + 1;
+    // Consecutivo: counter atómico per-mes (anti race condition workers paralelos).
+    // Fix bug 2026-05-15 (~50 filas duplicadas mismo # en Freshco enero).
+    const consecutivo = await getNextConsecutivo(tabName);
 
     const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
 
@@ -2072,6 +2102,7 @@ async function processPlanilla(
   msg: any,
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void,
+  getNextConsecutivo: (tabName: string) => Promise<number>,
 ): Promise<ProcessOneResult> {
   const tmpPaths: string[] = [];
   try {
@@ -2088,14 +2119,9 @@ async function processPlanilla(
     const tabRange = `'${tabName.replace(/'/g, "''")}'`;
     const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
 
-    // 3. Calcular consecutivo
+    // 3. Calcular consecutivo (counter atómico anti race condition)
     const sheetRows = await loadSheetRows(tabName);
-    let maxN = 0;
-    for (let i = 1; i < sheetRows.length; i++) {
-      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
-      if (!isNaN(v) && v > maxN) maxN = v;
-    }
-    const consecutivo = maxN + 1;
+    const consecutivo = await getNextConsecutivo(tabName);
 
     // 4. Proveedor: hardcoded "Planilla Seguridad Social" (más claro y consistente).
     //    Antes: derivábamos del sender, pero remitentes con display name corto
@@ -2193,6 +2219,7 @@ async function processCuentaCobroDocx(
   llmTracker: LlmTracker,
   nitCliente: string | null,
   nombreClienteNorm: string | null,
+  getNextConsecutivo: (tabName: string) => Promise<number>,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -2322,13 +2349,8 @@ async function processCuentaCobroDocx(
       };
     }
 
-    // 7. Consecutivo
-    let maxN = 0;
-    for (let i = 1; i < sheetRows.length; i++) {
-      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
-      if (!isNaN(v) && v > maxN) maxN = v;
-    }
-    const consecutivo = maxN + 1;
+    // 7. Consecutivo (counter atómico anti race condition)
+    const consecutivo = await getNextConsecutivo(tabName);
 
     // 8. Subir el .docx al folder del mes
     const baseName = buildFileBaseName(consecutivo, extracted.proveedor);
@@ -2402,6 +2424,7 @@ async function processGenericPdf(
   llmTracker: LlmTracker,
   nitCliente: string | null,
   nombreClienteNorm: string | null,
+  getNextConsecutivo: (tabName: string) => Promise<number>,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -2529,13 +2552,8 @@ async function processGenericPdf(
       };
     }
 
-    // 8. Consecutivo
-    let maxN = 0;
-    for (let i = 1; i < sheetRows.length; i++) {
-      const v = parseInt(String(sheetRows[i][0] ?? ""), 10);
-      if (!isNaN(v) && v > maxN) maxN = v;
-    }
-    const consecutivo = maxN + 1;
+    // 8. Consecutivo (counter atómico anti race condition)
+    const consecutivo = await getNextConsecutivo(tabName);
 
     // 9. Subir PDF a Drive
     const baseName = buildFileBaseName(consecutivo, extracted.proveedor);

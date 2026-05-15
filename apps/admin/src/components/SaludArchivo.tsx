@@ -59,11 +59,24 @@ export default function SaludArchivo({ clienteSlug, driveFolderId, sheetId }: Pr
     );
   }
 
-  const p = lastRun.payload;
-  const validaciones = (p.validaciones ?? []).filter((v) => v.cliente_slug === clienteSlug);
-  const pdfsHuerfanos = (p.pdfs_huerfanos ?? []).filter((x) => x.cliente_slug === clienteSlug);
-  const filasSinPdf = (p.filas_sin_pdf ?? []).filter((x) => x.cliente_slug === clienteSlug);
-  const autoRepairs = (p.auto_repairs ?? []).filter((x) => x.cliente_slug === clienteSlug);
+  // GUARDIA DEFENSIVA: aunque el hook filtra status=running, blindamos contra
+  // payloads malformados que pueden venir de runs viejos o crash parcial.
+  // Sin esto, una factura/auto_repairs siendo null crasheaba TODO el componente
+  // y por lo tanto toda la ficha del cliente (bug detectado 2026-05-15).
+  const p = (lastRun.payload ?? {}) as Partial<typeof lastRun.payload>;
+  const safeArray = <T,>(maybe: unknown): T[] => (Array.isArray(maybe) ? (maybe as T[]) : []);
+  const validaciones = safeArray<ReparadorValidacion>(p.validaciones).filter(
+    (v) => v && v.cliente_slug === clienteSlug,
+  );
+  const pdfsHuerfanos = safeArray<{ cliente_slug: string; mes: number; drive_file_id: string; drive_file_name: string }>(
+    p.pdfs_huerfanos,
+  ).filter((x) => x && x.cliente_slug === clienteSlug);
+  const filasSinPdf = safeArray<{ cliente_slug: string; mes: number; proveedor: string; num_factura: string }>(
+    p.filas_sin_pdf,
+  ).filter((x) => x && x.cliente_slug === clienteSlug);
+  const autoRepairs = safeArray<{ cliente_slug: string }>(p.auto_repairs).filter(
+    (x) => x && x.cliente_slug === clienteSlug,
+  );
 
   // Orden ascendente por mes (Ene, Feb, ...)
   const validacionesOrdenadas = validaciones.slice().sort((a, b) => a.mes.localeCompare(b.mes));

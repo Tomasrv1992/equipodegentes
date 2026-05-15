@@ -21,9 +21,11 @@ export default function ResumenSaludClientes() {
 
   if (isLoading || !lastRun) return null;
 
-  const validaciones = lastRun.payload.validaciones ?? [];
-  const pdfsHuerfanos = lastRun.payload.pdfs_huerfanos ?? [];
-  const filasSinPdf = lastRun.payload.filas_sin_pdf ?? [];
+  // Guardias defensivas contra payload null/malformado (bug 2026-05-15)
+  const p = (lastRun.payload ?? {}) as Partial<typeof lastRun.payload>;
+  const validaciones = Array.isArray(p.validaciones) ? p.validaciones : [];
+  const pdfsHuerfanos = Array.isArray(p.pdfs_huerfanos) ? p.pdfs_huerfanos : [];
+  const filasSinPdf = Array.isArray(p.filas_sin_pdf) ? p.filas_sin_pdf : [];
 
   // Agrupar por cliente
   const byCliente = new Map<

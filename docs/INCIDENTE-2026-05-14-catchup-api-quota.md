@@ -77,9 +77,27 @@ no se ven en mayo). Validar con query: "top proveedores de freshco en enero vs m
 - ✅ Andres `google_oauth_status` marcado como `expired` en `client_credentials`
 - ✅ Documentado este incidente
 
+## Bug detectado — marcador OAuth=expired demasiado agresivo
+
+**Síntoma:** Andres mostraba "OAuth expirado · reconectar" en panel, pero sus 11
+runs anteriores (desde 8 al 13 may) eran TODOS `ok`. Solo el run del 14 may falló
+con `invalid_grant` — probable causa transitoria (token cache Google, race
+condition durante refresh, o rate limit OAuth endpoint).
+
+**Causa del falso positivo:** el código en `facturacion-background.mts` (commit
+`098dbc4`) marca `google_oauth_status='expired'` automáticamente al PRIMER
+fallo de preflight con `check='oauth'`. Demasiado agresivo.
+
+**Fix necesario (próxima sesión):**
+1. Marcar `expired` solo después de N (ej: 3) fallos consecutivos
+2. O NO sobrescribir el status si el último `agent_run` previo fue `ok`
+3. Considerar diferenciar `expired` vs `transient_failure` para no asustar al admin
+
+**Action ejecutada:** revertido manualmente a `connected` vía REST PATCH.
+
 ## Acciones pendientes (próxima sesión)
 
-1. **Re-enviar link onboarding a Andres** — desde panel admin `/cliente/andres`
+1. **Fix anti-falso-positivo OAuth** (ver bug arriba)
 2. **Investigar si quedan facturas en Gmail de Freshco ene** — query Gmail-side con `force=true` y `monthFilter=1` UNA SOLA VEZ (no concurrente con otros runs)
 3. **Verificar patrón proveedores Freshco** ene vs mayo para confirmar hipótesis de "negocio cambió"
 4. **Investigar Dentilandia/Mateoramirez/JAVA "CAYÓ"** — pueden ser patrones reales (mes en curso, menos facturas a esta fecha) o problema técnico

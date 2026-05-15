@@ -1,0 +1,7 @@
+{
+  "name": "@equipodegentes/inspector",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agente: inspector diario que valida ejecución correcta de los demás agentes y envía resumen al admin",
+  "main": "lib/inspector.ts"
+}

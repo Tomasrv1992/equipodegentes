@@ -297,6 +297,19 @@ export function useReparadorLastRun() {
     queryKey: ["reparador-last-run"],
     refetchInterval: 5 * 60_000,
     queryFn: async (): Promise<ReparadorLastRun | null> => {
+      // Prioriza el último run del archivero (nuevo agente coordinador que
+      // sustituyó reparador+limpiador a partir de 2026-05-15). Si todavía no
+      // hay archivero runs (deploy reciente), cae al reparador legacy.
+      const { data: archiveroData, error: e1 } = await supabase
+        .from("agent_runs")
+        .select("id, started_at, finished_at, status, duration_ms, summary, payload")
+        .eq("agente_id", "archivero")
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (e1) throw e1;
+      if (archiveroData) return archiveroData as ReparadorLastRun;
+
       const { data, error } = await supabase
         .from("agent_runs")
         .select("id, started_at, finished_at, status, duration_ms, summary, payload")
@@ -309,6 +322,9 @@ export function useReparadorLastRun() {
     },
   });
 }
+
+/** Alias semántico — apunta al mismo hook pero con nombre claro del nuevo agente. */
+export const useArchiveroLastRun = useReparadorLastRun;
 
 /**
  * Trae client_credentials de clientes en onboarding (first_run_done=false).

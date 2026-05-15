@@ -377,7 +377,11 @@ function TopClientesValor({
   tarifaCop: number;
   horasPorFactura: number;
 }) {
-  const SYNTHETIC = new Set(["monitor", "reparador", "limpiador", "supervisor", "owner"]);
+  const SYNTHETIC = new Set([
+    "monitor", "inspector",
+    "reparador", "limpiador", "archivero",
+    "supervisor", "owner",
+  ]);
   const clientesOp = clientes.filter((c) => !SYNTHETIC.has(c.slug));
 
   const rows = clientesOp

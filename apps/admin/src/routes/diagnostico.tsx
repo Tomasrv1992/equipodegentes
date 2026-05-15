@@ -37,13 +37,18 @@ type ClienteRow = {
 
 const AGENTES_ORDEN = [
   { id: "facturacion", nombre: "Procesador facturas de compra", hora: "07:00", emoji: "📥" },
-  { id: "monitor", nombre: "Monitor", hora: "08:00", emoji: "🔍" },
-  { id: "reparador", nombre: "Reparador", hora: "08:15", emoji: "🔧" },
-  { id: "limpiador", nombre: "Limpiador", hora: "08:30", emoji: "🧹" },
+  { id: "inspector", nombre: "Inspector", hora: "08:00", emoji: "🔍" },
+  { id: "archivero", nombre: "Archivero", hora: "08:15", emoji: "🗂" },
   { id: "supervisor", nombre: "Supervisor", hora: "08:45", emoji: "👁" },
 ];
 
-const SYNTHETIC_SLUGS = new Set(["monitor", "reparador", "limpiador", "supervisor", "owner"]);
+// Slugs sintéticos: agentes que aparecen como "cliente" en agent_runs (legacy + nuevos).
+// Mantenemos los viejos (monitor/reparador/limpiador) para retrocompat con runs históricos.
+const SYNTHETIC_SLUGS = new Set([
+  "monitor", "inspector",
+  "reparador", "limpiador", "archivero",
+  "supervisor", "owner",
+]);
 
 function bogotaTodayUtcStart(): string {
   const now = new Date();
@@ -104,14 +109,17 @@ export default function DiagnosticoPage() {
   const aggFact = aggregateFacturacion(runs, clientesOp);
   const lastByAgent = new Map<string, RunRow>();
   for (const r of runs) {
-    if (["monitor", "reparador", "limpiador", "supervisor"].includes(r.agente_id) && !lastByAgent.has(r.agente_id)) {
+    if (["monitor", "inspector", "reparador", "limpiador", "archivero", "supervisor"].includes(r.agente_id) && !lastByAgent.has(r.agente_id)) {
       lastByAgent.set(r.agente_id, r);
     }
   }
 
-  const monitorRun = lastByAgent.get("monitor");
-  const reparadorRun = lastByAgent.get("reparador");
-  const limpiadorRun = lastByAgent.get("limpiador");
+  // Inspector reemplazó monitor — preferir el nuevo, fallback al viejo
+  const monitorRun = lastByAgent.get("inspector") ?? lastByAgent.get("monitor");
+  // Archivero reemplazó reparador+limpiador — preferir el nuevo
+  const archiveroRun = lastByAgent.get("archivero");
+  const reparadorRun = archiveroRun ?? lastByAgent.get("reparador");
+  const limpiadorRun = archiveroRun ?? lastByAgent.get("limpiador");
   const supervisorRun = lastByAgent.get("supervisor");
 
   // Stats de cada agente diario

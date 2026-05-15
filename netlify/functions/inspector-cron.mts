@@ -1,12 +1,14 @@
-// netlify/functions/reparador-cron.mts
+// netlify/functions/inspector-cron.mts
 //
-// DEPRECATED 2026-05-15: el reparador ahora corre dentro del archivero
-// (que coordina reparador + limpiador en una sola pasada a las 8:15 Bogotá).
-// Este cron quedó desactivado (schedule = fecha imposible) pero se mantiene
-// para permitir rollback rápido si el archivero falla.
+// Scheduled function: corre todos los días a las 8am Bogotá (13:00 UTC).
+// 1 hora después del cron de facturación (7am Bogotá / 12:00 UTC) para que
+// todos los runs de los clientes hayan terminado o pasado a timeout.
 //
-// Para reactivar: cambiar schedule de "0 0 31 2 *" a "15 13 * * *"
-// Y desactivar el archivero-cron correspondiente.
+// Dispara el inspector-background que hace los chequeos + (opcional) envía
+// email al admin.
+//
+// Renombrado de monitor-cron → inspector-cron el 2026-05-15 (anti-confusión
+// con Equipo-supervisor).
 
 import type { Config } from "@netlify/functions";
 
@@ -15,17 +17,17 @@ export default async (_req: Request) => {
   const secret = process.env.FACTURACION_INTERNAL_SECRET;
 
   if (!baseUrl || !secret) {
-    console.error("[reparador-cron] falta env: URL o FACTURACION_INTERNAL_SECRET");
+    console.error("[inspector-cron] falta env: URL o FACTURACION_INTERNAL_SECRET");
     return new Response("misconfigured", { status: 500 });
   }
 
-  const target = `${baseUrl}/.netlify/functions/reparador-background`;
+  const target = `${baseUrl}/.netlify/functions/inspector-background`;
   const triggeredAt = new Date().toISOString();
 
   console.log(JSON.stringify({
     triggered_at: triggeredAt,
     target,
-    agent: "reparador",
+    agent: "inspector",
   }));
 
   const res = await fetch(target, {
@@ -45,7 +47,5 @@ export default async (_req: Request) => {
 };
 
 export const config: Config = {
-  // DEPRECATED: 31 de febrero — fecha imposible, nunca corre.
-  // El archivero-cron lo reemplazó. Si querés rollback, volvé a "15 13 * * *".
-  schedule: "0 0 31 2 *",
+  schedule: "0 13 * * *", // 8am Bogotá (UTC-5). Cron es UTC.
 };

@@ -1,17 +1,15 @@
 // Edge function: /api/admin/reparador-trigger-cliente
 //
-// Dispara el reparador-background sin esperar al próximo cron diario (8:15am).
+// Dispara el reparador-background sin esperar al próximo cron diario (8:15am)
+// SOLO para el cliente especificado (el reparador acepta clienteSlugFilter
+// y skipea todos los demás). Más rápido + menos costo Gmail/Drive API.
+//
 // Útil cuando Tomás quiere re-validar la salud del archivo de un cliente
 // después de hacer cambios manuales (mover archivos en Drive, editar Sheet,
 // re-procesar facturas, etc).
 //
-// Nota: el reparador corre globalmente (para todos los clientes en su run),
-// no acepta filtro por cliente. El parámetro clienteSlug es informativo —
-// solo para que el cliente que dispara sepa que su data se va a refrescar
-// junto con la de los demás.
-//
 // Auth: JWT admin.
-// Body: { clienteSlug: string } (informativo)
+// Body: { clienteSlug: string } — se reenvía al reparador-background como filtro
 
 import type { Context } from "@netlify/edge-functions";
 
@@ -58,7 +56,11 @@ export default async (request: Request, _context: Context) => {
     return new Response("server misconfigured", { status: 500 });
   }
 
-  const endpoint = `${mainSiteUrl}/.netlify/functions/reparador-background`;
+  // Apunta al archivero (coordinador reparador+limpiador) — sustituyó al
+  // reparador-background a partir de 2026-05-15.
+  const endpoint = `${mainSiteUrl}/.netlify/functions/archivero-background`;
+  const clienteSlug = (body.clienteSlug ?? "").trim();
+
   // Fire-and-forget — background fn devuelve 202 inmediato, procesa hasta 15min
   fetch(endpoint, {
     method: "POST",
@@ -67,15 +69,19 @@ export default async (request: Request, _context: Context) => {
       "x-trigger": "admin-revalidar",
       "content-type": "application/json",
     },
+    body: clienteSlug
+      ? JSON.stringify({ clienteSlug })
+      : JSON.stringify({}),
   }).catch(() => {});
 
   return new Response(
     JSON.stringify({
       ok: true,
       dispatched: "reparador-background",
-      note: "Reparador corre para todos los clientes — datos de " +
-        (body.clienteSlug ?? "tu cliente") +
-        " se refrescan junto con los demás en ~5-10 min.",
+      filter: clienteSlug || null,
+      note: clienteSlug
+        ? `Reparador corriendo solo para ${clienteSlug} — datos se refrescan en ~1-2 min.`
+        : "Reparador corre para todos los clientes — datos en ~5-10 min.",
     }),
     { headers: { "content-type": "application/json" } },
   );

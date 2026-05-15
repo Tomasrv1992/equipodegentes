@@ -105,7 +105,16 @@ export interface ReparadorReport {
   errores: Array<{ cliente_slug: string; error: string }>;
 }
 
-export async function runReparador(): Promise<ReparadorReport> {
+export interface RunReparadorOptions {
+  /**
+   * Si está set, el reparador solo procesa ESE cliente (skip todos los demás).
+   * Útil para re-validar on-demand desde el panel sin esperar al cron.
+   * Default: undefined → procesa todos los clientes activos (modo cron diario).
+   */
+  clienteSlugFilter?: string;
+}
+
+export async function runReparador(opts: RunReparadorOptions = {}): Promise<ReparadorReport> {
   const supa = getServerClient();
   const ts = new Date();
   const fecha = bogotaDate(ts);
@@ -131,13 +140,20 @@ export async function runReparador(): Promise<ReparadorReport> {
   const MAX_AUTO_REPAIRS_POR_RUN = 50;
 
   // 1. Cargar clientes activos con agente facturacion
-  const { data: clientesActivos, error: cErr } = await supa
+  let query = supa
     .from("clientes")
     .select("id, slug, nombre, activo")
     .eq("activo", true)
     .neq("slug", "monitor")
     .neq("slug", "owner")
     .order("slug");
+
+  // Filtro opcional por cliente (re-trigger desde panel admin)
+  if (opts.clienteSlugFilter) {
+    query = query.eq("slug", opts.clienteSlugFilter);
+  }
+
+  const { data: clientesActivos, error: cErr } = await query;
 
   if (cErr) throw new Error(`fetch clientes failed: ${cErr.message}`);
 
@@ -147,6 +163,10 @@ export async function runReparador(): Promise<ReparadorReport> {
     nombre: string;
   }>;
   report.clientes_total = clientes.length;
+
+  if (opts.clienteSlugFilter && clientes.length === 0) {
+    console.warn(`[reparador] clienteSlugFilter="${opts.clienteSlugFilter}" no matchea ningún cliente activo`);
+  }
 
   const oauthClientId = process.env.GOOGLE_OAUTH_WEB_CLIENT_ID ?? "";
   const oauthClientSecret = process.env.GOOGLE_OAUTH_WEB_CLIENT_SECRET ?? "";

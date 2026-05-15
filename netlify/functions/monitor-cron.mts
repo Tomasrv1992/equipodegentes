@@ -1,10 +1,8 @@
 // netlify/functions/monitor-cron.mts
 //
-// Scheduled function: corre todos los días a las 8am Bogotá (13:00 UTC).
-// 1 hora después del cron de facturación (7am Bogotá / 12:00 UTC) para que
-// todos los runs de los clientes hayan terminado o pasado a timeout.
-//
-// Dispara el monitor-background que hace los chequeos + envía email al admin.
+// DEPRECATED 2026-05-15: renombrado a inspector-cron.mts.
+// Schedule desactivado (fecha imposible). Para rollback: volver schedule
+// a "0 13 * * *" y desactivar inspector-cron.
 
 import type { Config } from "@netlify/functions";
 
@@ -43,5 +41,7 @@ export default async (_req: Request) => {
 };
 
 export const config: Config = {
-  schedule: "0 13 * * *", // 8am Bogotá (UTC-5). Cron es UTC.
+  // DEPRECATED: 31 de febrero — fecha imposible, nunca corre.
+  // El inspector-cron lo reemplazó. Rollback: volver a "0 13 * * *".
+  schedule: "0 0 31 2 *",
 };

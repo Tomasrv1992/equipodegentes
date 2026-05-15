@@ -108,10 +108,82 @@ en la memoria de VSCode.
 ## Pendiente: capturar transcript Fathom + screenshots Tomás
 
 Tomás va a pasar:
-- Transcript de Fathom con la sesión perdida
+- Transcript de Fathom con la sesión perdida (Fathom se quedó sin créditos)
 - Screenshots que tomó durante la auditoría
 
-Acá van a quedar tab por tab los hallazgos cuando lleguen.
+---
+
+# Hallazgos de auditoría manual — sesión 2026-05-15 (parte 2, dictada por Tomás)
+
+## CLIENTE 1 · FRESHCO
+
+### Inventario real (fuente de verdad = correos Gmail)
+
+| Mes | Gmail (real) | agent_events (DB) | Sheet | Δ Gmail-Events |
+|---|---:|---:|---:|---:|
+| Enero | **1,340** | 350 | ? (ver Bug A) | **-990** |
+| Febrero | **1,303** | 439 | ? | **-864** |
+| Marzo | **1,157** | 338 | ? | **-819** |
+| Abril | **1,291** | 428 | **407,741** (316×) | **-863** |
+| Mayo | **673** | 669 | 2,351 (3.5×) | **-4** (OK) |
+| TOTAL | **5,764** | 2,224 | — | **-3,540** |
+
+**🚨 Hallazgo #1 (CRÍTICO):** ~3,540 facturas DIAN NUNCA fueron procesadas. Solo se procesó el **38%** del volumen real del cliente en enero–abril. Mayo es el único mes "OK" (procesado a 99%).
+
+**Implicación:** la hipótesis previa de "Freshco empezó relación con proveedor único en marzo" era FALSA. La realidad es que el procesador estaba sub-procesando crónicamente. Los gaps no son por cambio de patrón del negocio.
+
+### Bug A · Duplicación masiva del Sheet (ya identificado, fix deployado para futuro)
+- Abril: 1,291 correos vs **407,741** filas Sheet (316× duplicado)
+- Mayo: 673 correos vs **2,351** filas Sheet (3.5× duplicado)
+- Causa: bug supervisor fan-out (`commit 268d1ea` ya en prod fixea hacia adelante)
+- Pendiente: cleanup retroactivo
+
+### Bug B · Sub-procesamiento histórico (NUEVO, alta prioridad)
+- Solo 38% de las facturas reales llegaron a `agent_events`
+- Posibles causas a investigar:
+  1. Pipeline saltea facturas por `isDuplicate` overzealous (verifica numero+nit, pero esos pueden colisionar entre proveedores distintos)
+  2. Window `30d` del cron diario perdía facturas viejas que llegaron tarde al Gmail
+  3. Errores de extracción XML/LLM que descartaban facturas válidas
+  4. Self-emitted filter atrapando legítimos
+
+**Acción:** investigar antes de re-procesar. Forzar un re-procesamiento ciego puede multiplicar problemas. Necesitamos saber POR QUÉ se perdieron.
+
+### Bug C · Renombrado por proveedor genera colisiones (NUEVO)
+
+**Síntoma reportado:** En enero hay **5 PDFs renombrados "1. Comercializadora De Frutas Y Legumbres Sas.pdf"** — todos con el MISMO prefijo "1." pero cada uno corresponde a una factura distinta (consecutivos DIAN distintos: 4.288.39, 4.288.40, 4.288.41, 4.288.43, 4.288.44).
+
+**Lo mismo con "23. Comercializadora ..." × N** y se repite en todos los meses.
+
+**Causa probable:** la función `buildFileBaseName(n, proveedor)` usa `n = consecutivo del Sheet` (que es por-mes), pero cuando el Sheet tiene el bug de duplicación + las facturas se reapendean → el consecutivo se reasigna a 1, 2, 3 cada vez.
+
+O alternativamente: el renombrado se hace por orden de procesamiento del mes pero workers paralelos asignan consecutivos colisionando.
+
+**Tomás:** "el que da la fila y digamos como la fuente, es el número de facturación. Si el número, el consecutivo de la factura es diferente, tiene que ser otra línea."
+
+**Acción:** el filename debe usar el **CUFE o número DIAN único**, NO el consecutivo del Sheet. Eso garantiza unicidad por factura. Ej: `4288439-Comercializadora-Frutas-Legumbres-Sas.pdf` o `FEL448242-Comercializadora.pdf`.
+
+### Bug D · Dashboard 999 (cap visual)
+
+**Síntoma:** "dashboard de Freshco y todo debería permitir contabilizar más de 1.000 porque sale 999"
+
+**Causa probable:** Sheets API por default trae 1000 rows; en el dashboard se usa COUNTA o equivalente que se topea ahí.
+
+**Acción:** revisar fórmulas del Dashboard del Sheet. Probable fix: usar `=COUNTA(Mes!A2:A100000)` con rango explícito grande, no `A:A` que Sheets puede ofrecer trunco.
+
+### Resumen Freshco
+
+- 4 bugs identificados (A, B, C, D)
+- 3,540 facturas perdidas estimadas
+- Bug A: fix deployado para futuro, falta cleanup
+- Bug B: ROOT CAUSE pendiente investigar
+- Bug C: rename pipeline necesita usar numero DIAN no consecutivo
+- Bug D: Dashboard formula fix
+
+---
+
+## CLIENTE 2 · DENTILANDIA (pendiente — Tomás está dictando)
+
+(Tomás continúa la auditoría)
 
 ---
 

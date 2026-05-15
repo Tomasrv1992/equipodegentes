@@ -237,8 +237,18 @@ export default async (req: Request) => {
         console.error(`[preflight] notify failed: ${e.message}`);
       }
 
-      // Para errores de OAuth, marcar credenciales como expired/revoked
-      // para que el panel admin lo refleje y los próximos crons skipeen.
+      // Para errores de OAuth, marcar credenciales como expired SOLO si
+      // hay PATRÓN — no en el primer error.
+      //
+      // Bug arreglado 2026-05-14: Andres tuvo 1 invalid_grant aislado y se
+      // marcó como expired aunque los 11 runs anteriores estaban OK. Era un
+      // hiccup transitorio (token cache Google, race condition al refresh).
+      // Marcar expired al primer error rompe el flow del cliente sin
+      // necesidad — la auto-corrección de Google suele resolverlo en horas.
+      //
+      // Regla nueva: marcar expired solo si hay >=3 fallos consecutivos de
+      // OAuth en las últimas 24h, sin runs OK entremedio. Si el último run
+      // antes de este preflight_fail era OK, NO marcamos — es transitorio.
       if (preflightResult.check === "oauth") {
         try {
           const supa = getServerClient();
@@ -248,7 +258,13 @@ export default async (req: Request) => {
             .eq("slug", body.customerId)
             .single();
           if (cliente) {
-            await markOAuthStatus((cliente as any).id, "facturacion", "expired");
+            const shouldMark = await shouldMarkOAuthExpired(supa, (cliente as any).id);
+            if (shouldMark) {
+              await markOAuthStatus((cliente as any).id, "facturacion", "expired");
+              console.log(`[preflight] oauth marcado expired (>=3 fallos consecutivos, sin runs OK entremedio)`);
+            } else {
+              console.log(`[preflight] oauth fallo transitorio (último run anterior OK o <3 fallos) — no marcamos expired`);
+            }
           }
         } catch (e: any) {
           console.error(`[preflight] markOAuthStatus failed: ${e.message}`);
@@ -618,6 +634,87 @@ async function getNombreClienteFromSlug(slug: string | undefined): Promise<strin
     return (data as { nombre?: string } | null)?.nombre ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Decide si marcar oauth_status='expired' después de un preflight fail
+ * con check='oauth'. Anti-falso-positivo: solo retornar true si hay
+ * patrón claro de expiración, no por hiccups transitorios.
+ *
+ * Reglas:
+ *   - Si el último agent_run anterior (excluyendo el propio preflight
+ *     en curso) fue 'ok' o 'warn' (= corrió, no preflight_fail), NO
+ *     marcar — el problema es transitorio.
+ *   - Si hay >=3 runs consecutivos con preflight failed por oauth en las
+ *     últimas 24h, sí marcar.
+ *   - Si error_message del último run contiene 'invalid_grant' Y ya hay
+ *     2 errores similares en las últimas 24h, marcar.
+ *
+ * Devuelve false si está borderline — preferimos NO marcar y dejar que
+ * Tomás vea el preflight_fail en panel y decida.
+ */
+async function shouldMarkOAuthExpired(
+  supa: ReturnType<typeof getServerClient>,
+  clienteId: string,
+): Promise<boolean> {
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data: recent } = await supa
+      .from("agent_runs")
+      .select("status, triggered_by, error_message, started_at")
+      .eq("cliente_id", clienteId)
+      .eq("agente_id", "facturacion")
+      .gte("started_at", since)
+      .order("started_at", { ascending: false })
+      .limit(10);
+
+    const runs = (recent ?? []) as Array<{
+      status: string;
+      triggered_by: string | null;
+      error_message: string | null;
+    }>;
+
+    // Excluir el preflight actual (el que está corriendo) — todavía no se
+    // guardó pero el siguiente está en curso. Filtramos por triggered_by != 'preflight'
+    // del último para asegurar que no contamos el actual.
+    // En la práctica el run actual aún no se guardó cuando llegamos acá, así
+    // que `recent` solo trae los previos.
+
+    // Buscar el último run no-preflight (que efectivamente corrió):
+    const ultimoRunReal = runs.find((r) => r.triggered_by !== "preflight");
+    if (ultimoRunReal && (ultimoRunReal.status === "ok" || ultimoRunReal.status === "warn")) {
+      // El último run real funcionó OK → el preflight fail de ahora es
+      // probablemente transitorio. NO marcar.
+      return false;
+    }
+
+    // Contar preflight fails de oauth en las últimas 24h
+    const preflightOauthFails = runs.filter(
+      (r) =>
+        r.triggered_by === "preflight" &&
+        r.status === "fail" &&
+        (r.error_message ?? "").toLowerCase().includes("oauth"),
+    ).length;
+    if (preflightOauthFails >= 2) {
+      // 2 fallos previos + el actual = 3 consecutivos → patrón confirmado
+      return true;
+    }
+
+    // Contar invalid_grant en error_message
+    const invalidGrants = runs.filter((r) =>
+      (r.error_message ?? "").toLowerCase().includes("invalid_grant"),
+    ).length;
+    if (invalidGrants >= 2) {
+      return true;
+    }
+
+    // Borderline → no marcar, preferimos visibility via panel
+    return false;
+  } catch (e: any) {
+    console.warn(`[preflight] shouldMarkOAuthExpired query failed: ${e.message}`);
+    // En caso de error, ser conservador: no marcar
+    return false;
   }
 }
 

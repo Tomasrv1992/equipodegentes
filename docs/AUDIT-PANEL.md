@@ -220,3 +220,101 @@ Los cambios afectan tanto el sitio principal (`equipodegentes-cron`) como el pan
 **Commits**: 10 nuevos en `feat/admin-panel`.
 **Branch state**: limpia, todos los commits con mensaje descriptivo.
 **Push**: pendiente tu OK explícito.
+
+---
+
+# Sesión overnight — 2026-05-14 → 2026-05-15 (parte 2)
+
+Continuación de la sesión anterior. Se ejecutaron 4 bloques de trabajo:
+**A.** Fusión reparador + limpiador → archivero
+**B.** Rename monitor → inspector
+**C.** Bug fixes (contexto en payload + classifier)
+**D.** Performance (code splitting, cache, OAuth stagger)
+**E.** Playbook de agentes (documentación completa)
+
+## Commits adicionales (post-merge anterior)
+
+| Commit | Categoría | Qué hace |
+|---|---|---|
+| `27cce63` | Salud Archivo | Componente SaludArchivo + ResumenSaludClientes + edge function reparador-trigger-cliente |
+| `155e004` | Reliability | Anti-falso-positivo OAuth (requiere PATRÓN antes de marcar expired) |
+| `3126b69` | Reparador | clienteSlugFilter para re-validar 1 cliente sin esperar al cron global |
+| `1206687` | Pipeline | Reclasificar PDFs encriptados como `saltadas`, agregar sample_errors[] al payload |
+| `382d54d` | Refactor agentes | **Equipo-archivero coordinador** (reparador + limpiador en 1 cron) |
+| `68b0283` | Refactor agentes | **Rename Equipo-monitor → Equipo-inspector** (anti-confusión con supervisor) |
+| `9d56f13` | Observability | monthFilter/customerId/window en payload + classifier 20+ patterns |
+| `21538ff` | Performance | Code splitting por route (bundle 574KB → 454KB, -21%) |
+| `6e93a1f` | OAuth fix | **URGENTE**: stagger 800ms en cron + retry preflight (fix 3 emails falsos) |
+| `82ab729` | Docs+Perf | PLAYBOOK-AGENTES.md (400+ líneas) + cache 5min en queries pesadas |
+
+## Lo más importante de esta sesión
+
+### Incidente 2026-05-15: emails OAuth falsos
+
+Tomás recibió 3 emails "Preflight oauth falló — andres / tomas92 / mateoramirez" a las **12:06:30 UTC EXACTAS** los 3. Investigación reveló:
+- Ninguno había revocado OAuth
+- Sus runs previos del 13/14 may estaban OK
+- Causa: el cron `facturacion-cron` dispatchaba con `Promise.allSettled` 11 clientes simultáneos al MISMO `client_id` OAuth de Google → rate limit transitorio del endpoint OAuth
+
+**Fix (commit `6e93a1f`):**
+- `facturacion-cron`: ahora dispatcha con stagger 800ms entre clientes (total ~9s para 11)
+- `preflight.ts`: retry 1 vez con backoff 1.5-2s al primer `invalid_grant`
+- Combinado: 0 emails falsos esperados mientras los clientes realmente conectados
+
+Ya mergeado a main `babf40d` — el cron del 16-may ya usa el nuevo código.
+
+### Refactor de agentes (anti-confusión + sin duplicación)
+
+**Antes:** 4 agentes admin (monitor 8:00, reparador 8:15, limpiador 8:30, supervisor 8:45). Monitor y supervisor sonaban casi igual. Reparador y limpiador procesaban los mismos huérfanos con LLM, duplicando costo Anthropic.
+
+**Ahora:** 3 agentes admin (inspector 8:00, archivero 8:15, supervisor 8:45). Inspector es claramente pasivo (observa). Archivero coordina reparador+limpiador internamente — un solo `agent_run` con `agente_id='archivero'`.
+
+**Rollback disponible:** los crons viejos de monitor/reparador/limpiador siguen presentes con schedule `0 0 31 2 *` (31-feb, nunca corre). Revertir es cambiar 3 schedules.
+
+### Performance
+
+- **Code splitting** (`21538ff`): initial bundle del panel admin bajó de 574KB → 454KB (-21%), 8 chunks lazy por route.
+- **Cache 5min** (`82ab729`): `useAllFacturas`, `useFacturasByCliente`, `useFacturasByAgente` ahora cachean 5min en lugar de 1min. Estos queries paginan hasta 50k events y eran el cuello de botella de navegación.
+- **gcTime 30min**: si Tomás navega entre routes y vuelve, no re-fetch.
+
+### Documentación
+
+`docs/PLAYBOOK-AGENTES.md` (nuevo, 400+ líneas):
+- Arquitectura actual de los 4 agentes + nombres antes/después del rename
+- Flujo del día completo
+- 8 escenarios de fallo con diagnóstico SQL específico + acción concreta:
+  1. Email OAuth falso (rate limit Google)
+  2. Muchos errores (interpretación error_pattern_breakdown)
+  3. Discrepancias 5-fuentes
+  4. Cliente no corrió
+  5. Zombies persistentes
+  6. PDFs huérfanos sin fila Sheet
+  7. Archivero falló
+  8. Supervisor con muchos retriggers
+- Acciones manuales: re-disparar cliente, re-procesar mes, revertir oauth
+- Métricas saludables esperadas
+- Histórico de incidentes con commits
+
+## Acciones operativas ejecutadas overnight
+
+- ✅ 6 zombies de Freshco cerrados manualmente (post incidente catchup)
+- ✅ Andres `oauth_status='connected'` revertido (era falso positivo)
+- ✅ Cliente fantasma `falso-idolo` confirmado (onboarding incompleto, deshabilitar manualmente cuando tiempo)
+- ✅ Merge `feat/admin-panel` → `main` `babf40d` (Netlify deploya antes del cron de mañana)
+
+## Lo que queda pendiente para próximas sesiones
+
+| Item | Razón | Prioridad |
+|---|---|---|
+| Eliminar definitivamente `Equipo-monitor` + `Equipo-reparador` + `Equipo-limpiador` | Confirmar 1 semana en prod que inspector+archivero funcionan, después borrar | Media |
+| Limpiador acepte `clienteSlugFilter` | Hoy el archivero pasa filter al reparador pero limpiador siempre corre global | Baja |
+| Wizard "rápido vs completo" (modo onboarding 30d vs año) | Migration + type ya listos (commit `ac43937`), falta UI radio + backend skip-fanout-if-rapido | Media |
+| Tests automatizados | Si hacemos otro incidente serio | Baja |
+| Anti-spike global (cola si 2+ clientes en first_run) | LOW prio con 11 clientes | Baja |
+| Migration DB que mueva `agente_id='monitor'` → 'inspector', `'reparador'/'limpiador'` → 'archivero' | Histórico queda como está, runs nuevos usan nombres nuevos | Baja |
+
+---
+
+**Total commits sesión overnight (parte 1 + parte 2)**: 20+ en `feat/admin-panel`.
+**Branch state**: mergeada a main, todo deployado a Netlify.
+**Push**: ✅ todo en `origin/main` y `origin/feat/admin-panel`.

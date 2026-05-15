@@ -116,7 +116,9 @@ export function useFacturasByCliente(clienteId: string) {
       }
       return all;
     },
-    staleTime: 60_000,
+    // Cache 5 min — events cambian solo con runs del cron/retrigger
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
   });
 }
 
@@ -153,7 +155,9 @@ export function useFacturasByAgente(agenteId: string) {
       }
       return all;
     },
-    staleTime: 60_000,
+    // Cache 5 min — events cambian solo con runs del cron/retrigger
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
   });
 }
 
@@ -190,8 +194,13 @@ export function useAllFacturas() {
       }
       return all;
     },
-    // Cache 1 min — query pesada con muchos events
-    staleTime: 60_000,
+    // Cache 5 min — query muy pesada (hasta 50k events paginados).
+    // Events cambian solo cuando corre el cron facturacion (1×/día) o un
+    // retrigger; 5 min es seguro y ahorra mucha latencia al navegar.
+    staleTime: 5 * 60_000,
+    // GC 30 min (vs default 5 min): si Tomás navega entre routes y vuelve,
+    // no re-fetch.
+    gcTime: 30 * 60_000,
   });
 }
 

@@ -319,6 +319,101 @@ Los hallazgos de Freshco y Dentilandia revelan **patrones sistémicos**, no prob
 
 ---
 
+# FASE 1, 2 y 3 EJECUTADAS — RESULTADOS
+
+## ✅ FASE 1 · Prevención (commits + deploys)
+
+| Commit | Bug | Fix |
+|---|---|---|
+| `3aa8986` | H | `loadSheetRows` THROW si Sheets API falla (no más cache contaminado [] que causaba duplicación) |
+| `3aa8986` | C | `buildFileBaseName` ahora incluye numero DIAN (filenames únicos garantizado) |
+| `3aa8986` | E | Supervisor bloquea retriggers si ratio sheet/events > 2× (era el bug "los agentes no detectan ni mierda") |
+
+**Mergeado a main `0c3bf88`** — el cron 7am de mañana corre con todo arreglado.
+
+## ✅ FASE 2 · Cleanup retroactivo (rebuild Sheets desde events)
+
+Endpoint `rebuild-sheet-from-events-background` + botón en panel cliente
+(visible solo si hay duplicación detectada).
+
+**Resultado del rebuild masivo ejecutado 2026-05-15 ~21:40 UTC:**
+
+| Cliente | Filas Sheet antes | Events reales | Filas eliminadas | Ratio dup |
+|---|---:|---:|---:|---:|
+| Freshco | **660,846** | 2,224 | **658,622** | **296×** 🚨 |
+| Dentilandia | 11,793 | 641 | **11,152** | **18×** |
+| paulina-zarrabe | 3,702 | 184 | **3,518** | **20×** |
+| mp-patricia | 2,325 | 256 | **2,069** | **9×** |
+| tomas | 1,828 | 218 | **1,610** | **8×** |
+| **TOTAL** | **680,494** | **3,523** | **676,971** | |
+
+5 clientes limpiados exitosamente. **4 fallaron por OAuth invalid_grant (rate limit Google)** — re-disparados con stagger 3min (en curso).
+
+## 🔬 FASE 3 · Bug B investigado — root cause identificado
+
+**Hipótesis confirmada:** las facturas históricas (pre-onboarding) de los clientes
+están en Gmail pero NO en `agent_events`. El fan-out de onboarding las procesó
+parcialmente y hit `api-quota` Anthropic en mid-stream.
+
+**Evidencia:**
+
+| Cliente | Onboarded | Mes con 99% (post-onboard) | Mes con <40% (pre-onboard) |
+|---|---|---|---|
+| Freshco | 13-may | Mayo 99% (669/673) | Enero 26% (350/1,340) |
+
+**Datos del histórico de runs Freshco:**
+- 30 runs analizados
+- 514 facturas procesadas total
+- 611 dedup (ya estaban)
+- **Solo 16 saltadas legítimas** (no es problema de filtros)
+- **2,346 errores `api-quota`** del incidente catchup 14-may
+
+**Conclusión Bug B:**
+- NO es bug del pipeline filtrando facturas
+- NO es bug de extracción LLM
+- ES consecuencia del incidente catchup del 14-may: el fan-out reapendeaba con `force=true`, hit api-quota Anthropic, ~2,200 facturas marcadas como error
+- Esos emails probablemente quedaron con label `Procesado` aplicado (¿al inicio del run?) pero SIN event guardado → cron diario los excluye por label
+- Resultado: facturas "perdidas" para siempre por el bug del fan-out (que YA está fixeado en commit 268d1ea + 3aa8986)
+
+**Acción recomendada para recovery (próxima sesión):**
+1. Con `VAULT_KEY`, para cada cliente afectado:
+   - Listar emails Gmail con label `Procesado` del rango fechas pre-onboarding
+   - Cross-check contra `agent_events` por mes
+   - Para emails con `Procesado` pero sin event → quitar el label
+2. Forzar re-procesamiento con monthFilter del mes afectado
+3. Token bucket Anthropic ya está activo (commit `f0c0bc2`) — esta vez no debería hit api-quota
+
+**OR (más simple):** Reset selectivo. Para clientes con Bug B confirmado, borrar
+TODOS los events del cliente para meses pre-onboarding y re-procesar con monthFilter.
+Riesgo: si el LLM extrae distinto, los números pueden variar levemente.
+
+## 🎯 Resumen sesión 2026-05-15 (~10h trabajo)
+
+### Bugs fixeados y deployados
+- ✅ Bug supervisor fan-out (commit 268d1ea)
+- ✅ Bug panel admin payload null (commit c557b0e)
+- ✅ Bug H · loadSheetRows fail-loud (commit 3aa8986)
+- ✅ Bug C · rename con numero DIAN (commit 3aa8986)
+- ✅ Bug E · supervisor detecta ratio sheet/events > 2 (commit 3aa8986)
+- ✅ Endpoint rebuild-sheet-from-events + botón panel (commit c495686)
+
+### Datos limpiados
+- **676,971 filas duplicadas eliminadas** de los Sheets de 5 clientes
+- 4 clientes con OAuth rate limit pendientes retry
+- Events en DB confirmados como fuente limpia (~3,523 facturas totales 2026)
+
+### Bugs identificados pero NO fixeados (próxima sesión)
+- 🟡 Bug B · Sub-procesamiento crónico — root cause identificado, recovery requiere VAULT_KEY
+- 🟡 Bug F · Caso específico Jeisy Salinas — parte de Bug B
+- 🟡 Bug D · Dashboard valores irreales — se mitigará automático con rebuilds Sheets
+
+### Acciones pendientes de Tomás
+1. **Upgrade Netlify Pro** ($19/mes) — admin panel sigue paused por usage limit
+2. **Rotar credenciales** post-sesión (service_role, internal_secret)
+3. **Pasar VAULT_KEY** para Fase 3 recovery (cuando retomemos)
+
+---
+
 ## Plan de acción (priorizado)
 
 ### Inmediato (esta sesión)

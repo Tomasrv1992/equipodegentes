@@ -306,6 +306,10 @@ export function useReparadorLastRun() {
     queryKey: ["reparador-last-run"],
     refetchInterval: 5 * 60_000,
     queryFn: async (): Promise<ReparadorLastRun | null> => {
+      // CRÍTICO: filtrar status NEQ 'running' — un run en curso tiene payload=NULL
+      // y crashea SaludArchivo si lo intenta deserializar. Esperar a que termine
+      // (status=ok/warn/fail) para mostrar.
+      //
       // Prioriza el último run del archivero (nuevo agente coordinador que
       // sustituyó reparador+limpiador a partir de 2026-05-15). Si todavía no
       // hay archivero runs (deploy reciente), cae al reparador legacy.
@@ -313,6 +317,8 @@ export function useReparadorLastRun() {
         .from("agent_runs")
         .select("id, started_at, finished_at, status, duration_ms, summary, payload")
         .eq("agente_id", "archivero")
+        .in("status", ["ok", "warn", "fail"])
+        .not("payload", "is", null)
         .order("started_at", { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -323,6 +329,8 @@ export function useReparadorLastRun() {
         .from("agent_runs")
         .select("id, started_at, finished_at, status, duration_ms, summary, payload")
         .eq("agente_id", "reparador")
+        .in("status", ["ok", "warn", "fail"])
+        .not("payload", "is", null)
         .order("started_at", { ascending: false })
         .limit(1)
         .maybeSingle();

@@ -56,7 +56,9 @@ export default async (request: Request, _context: Context) => {
     return new Response("server misconfigured", { status: 500 });
   }
 
-  const endpoint = `${mainSiteUrl}/.netlify/functions/reparador-background`;
+  // Apunta al archivero (coordinador reparador+limpiador) — sustituyó al
+  // reparador-background a partir de 2026-05-15.
+  const endpoint = `${mainSiteUrl}/.netlify/functions/archivero-background`;
   const clienteSlug = (body.clienteSlug ?? "").trim();
 
   // Fire-and-forget — background fn devuelve 202 inmediato, procesa hasta 15min

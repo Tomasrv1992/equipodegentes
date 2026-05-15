@@ -1,8 +1,12 @@
 // netlify/functions/reparador-cron.mts
 //
-// Scheduled function: corre todos los días a las 8:15am Bogotá (13:15 UTC).
-// 15 min después del monitor (8:00am), para no solaparse y dar tiempo al
-// monitor a terminar su check.
+// DEPRECATED 2026-05-15: el reparador ahora corre dentro del archivero
+// (que coordina reparador + limpiador en una sola pasada a las 8:15 Bogotá).
+// Este cron quedó desactivado (schedule = fecha imposible) pero se mantiene
+// para permitir rollback rápido si el archivero falla.
+//
+// Para reactivar: cambiar schedule de "0 0 31 2 *" a "15 13 * * *"
+// Y desactivar el archivero-cron correspondiente.
 
 import type { Config } from "@netlify/functions";
 
@@ -41,5 +45,7 @@ export default async (_req: Request) => {
 };
 
 export const config: Config = {
-  schedule: "15 13 * * *", // 8:15am Bogotá (UTC-5). Cron es UTC.
+  // DEPRECATED: 31 de febrero — fecha imposible, nunca corre.
+  // El archivero-cron lo reemplazó. Si querés rollback, volvé a "15 13 * * *".
+  schedule: "0 0 31 2 *",
 };

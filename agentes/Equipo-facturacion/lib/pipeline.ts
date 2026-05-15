@@ -72,6 +72,20 @@ export interface PipelineConfig {
      */
     monthFilter?: number;
     /**
+     * Window personalizada por rango de fechas (alternativa a monthFilter).
+     * Útil para CHUNKS pequeños cuando un mes entero NO cabe en 15min Netlify.
+     *
+     * Ejemplo: para procesar primeros 5 días de enero:
+     *   windowFrom = "2026/01/01", windowTo = "2026/01/06"
+     *
+     * Genera: `after:2026/01/01 before:2026/01/06` (Gmail incluye after, excluye before)
+     *
+     * Si está set, OVERRIDE monthFilter y window. Si NO, comportamiento normal.
+     * Bug recovery 2026-05-15: Freshco enero (1340 emails) no cabía en 15min.
+     */
+    windowFrom?: string; // YYYY/MM/DD
+    windowTo?: string;   // YYYY/MM/DD
+    /**
      * Si true, NO ejecuta ensureSheetSetup. Usado por el multi-pass: solo
      * el primer dispatch (mes=1) hace el setup, los otros 11 saltean
      * porque ya está hecho. Evita race conditions + reduce drásticamente
@@ -245,23 +259,33 @@ const PROCESSED_LABEL = "Procesado";
 
 export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   const { google: g, options = {} } = cfg;
-  const { dryRun = false, limit = null, window = "30d", force = false, monthFilter, skipSheetSetup = false } = options;
+  const {
+    dryRun = false,
+    limit = null,
+    window = "30d",
+    force = false,
+    monthFilter,
+    windowFrom,
+    windowTo,
+    skipSheetSetup = false,
+  } = options;
 
   // Query amplia: facturas DIAN (ZIP) + planillas SS + Word/PDFs no-DIAN.
   // El processOne distingue qué tipo es y aplica el sub-pipeline correspondiente.
   //
-  // El parámetro `window` acepta dos formatos:
-  //   - "30d" / "365d" → newer_than:Nd (rolling, último N días)
-  //   - "2026/01/01"   → after:YYYY/MM/DD (fecha absoluta, ideal para backfill anual)
-  //
-  // Si `monthFilter` está set (1-12), sobreescribe window y usa after:YYYY/MM/01
-  // before:YYYY/MM+1/01 — filtra a UN solo mes. Usado por multi-pass para
-  // clientes grandes (12 invocaciones paralelas, 1 por mes).
+  // Prioridad del date filter (de mayor a menor):
+  //   1. windowFrom + windowTo (chunks personalizados) — recovery Bug B
+  //   2. monthFilter (1-12) — multi-pass por mes (estándar)
+  //   3. window (legacy) — "30d" rolling o "YYYY/MM/DD" absoluta
   //
   // Si `force=true`, el query NO excluye `-label:Procesado` → re-lee emails
-  // ya procesados.
+  // ya procesados (re-procesamiento explícito).
   let dateFilter: string;
-  if (monthFilter && monthFilter >= 1 && monthFilter <= 12) {
+  if (windowFrom && windowTo) {
+    // Chunk personalizado: from inclusive, to exclusive (Gmail semántica)
+    dateFilter = `after:${windowFrom} before:${windowTo}`;
+    console.log(`[windowChunk] procesando ${windowFrom} → ${windowTo} (${dateFilter})`);
+  } else if (monthFilter && monthFilter >= 1 && monthFilter <= 12) {
     const year = new Date().getFullYear();
     const mm = String(monthFilter).padStart(2, "0");
     const nextMonth = monthFilter === 12 ? 1 : monthFilter + 1;

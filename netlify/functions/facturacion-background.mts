@@ -53,6 +53,16 @@ interface RequestBody {
    */
   monthFilter?: number;
   /**
+   * Window personalizada por rango fechas (alternativa a monthFilter).
+   * Útil para CHUNKS chicos en recovery de clientes grandes que NO caben
+   * en 15min de Netlify Background (ej Freshco enero = 1340 emails).
+   *
+   * Ambos en formato YYYY/MM/DD. windowFrom inclusivo, windowTo exclusivo.
+   * Override monthFilter y window si están presentes.
+   */
+  windowFrom?: string;
+  windowTo?: string;
+  /**
    * Si true y customerId presente, en lugar de un único run, dispara 12
    * invocaciones (una por mes) y termina. Útil para primer run + force=true
    * en clientes con alto volumen — evita timeout de Netlify 15min.
@@ -830,6 +840,8 @@ async function buildConfig(
         window: resolvedWindow,
         force: body.force ?? false,
         monthFilter: body.monthFilter,
+        windowFrom: body.windowFrom,
+        windowTo: body.windowTo,
         skipSheetSetup: (body as any).skipSheetSetup ?? false,
       },
     };

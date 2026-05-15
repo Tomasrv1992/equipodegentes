@@ -494,6 +494,22 @@ export default async (req: Request) => {
           llm_calls: result.llmStats?.calls ?? 0,
           llm_cost_usd: result.llmStats?.estimatedCostUsd ?? 0,
           llm_pre_filtered: result.llmStats?.preFilteredOut ?? 0,
+          // CONTEXTO DEL RUN — para diagnóstico SQL sin tener que adivinar
+          // qué tipo de run fue. Bug detectado 2026-05-14: las queries por
+          // payload->>'monthFilter' devolvían 0 rows porque el campo NO se
+          // guardaba; ahora sí. También guardamos customerId, force, window
+          // para entender el run completo desde una sola fila.
+          monthFilter: body.monthFilter ?? null,
+          customerId: body.customerId ?? null,
+          force: body.force ?? false,
+          window: body.window ?? null,
+          dryRun: body.dryRun ?? false,
+          skipSheetSetup: body.skipSheetSetup ?? false,
+          skipPreflight: body.skipPreflight ?? false,
+          notifyMonthComplete: body.notifyMonthComplete ?? false,
+          silent: body.silent ?? false,
+          wasFirstRun: wasFirstRun,
+          trigger_header: req.headers.get("x-trigger") ?? null,
           // Sample primeros 10 errores con detalle para diagnóstico SQL.
           // Antes solo se guardaba el count `errores: N` — para investigar
           // qué falló había que escarbar en Netlify logs (caros y lentos).
@@ -944,27 +960,73 @@ function countByErrorPattern(errores: Array<{ error: string }>): Record<string, 
   const out: Record<string, number> = {};
   for (const e of errores) {
     const msg = (e.error ?? "").toLowerCase();
-    let pat = "other";
-    if (msg.includes("no password") || msg.includes("password given") || msg.includes("encrypted")) {
-      pat = "pdf-encrypted";
-    } else if (msg.includes("no text") || msg.includes("sin texto")) {
-      pat = "pdf-no-text";
-    } else if (msg.includes("not.*invoice") || msg.includes("no es factura")) {
-      pat = "llm-no-invoice";
-    } else if (msg.includes("timeout") || msg.includes("econnreset") || msg.includes("etimedout")) {
-      pat = "network-timeout";
-    } else if (msg.includes("quota") || msg.includes("rate") || msg.includes("429")) {
-      pat = "api-quota";
-    } else if (msg.includes("invalid_grant") || msg.includes("oauth")) {
-      pat = "oauth-expired";
-    } else if (msg.includes("xml") || msg.includes("parse")) {
-      pat = "xml-parse";
-    } else if (msg.includes("zip")) {
-      pat = "zip-corrupted";
-    }
+    const pat = classifyErrorMessage(msg);
     out[pat] = (out[pat] ?? 0) + 1;
   }
   return out;
+}
+
+/**
+ * Clasifica un mensaje de error en categorías reconocibles. Centralizada para
+ * que sea fácil agregar nuevos patrones cuando los descubrimos en prod.
+ *
+ * Orden importante: más específico → más genérico. El primer match gana.
+ */
+function classifyErrorMessage(msg: string): string {
+  // 1. Anthropic API issues (rate limit, overload, auth)
+  if (/quota|rate.?limit|429|too many requests/i.test(msg)) return "api-quota";
+  if (/overload|529|503/i.test(msg)) return "api-overload";
+  if (/anthropic.*401|claude.*unauthorized/i.test(msg)) return "anthropic-auth";
+
+  // 2. OAuth issues
+  if (/invalid_grant/i.test(msg)) return "oauth-invalid-grant";
+  if (/oauth|refresh.token|access.token expired/i.test(msg)) return "oauth-expired";
+
+  // 3. Google APIs quotas (Drive, Sheets, Gmail)
+  if (/sheets.*quota|sheets.*read.requests|spreadsheets.*quota/i.test(msg)) return "sheets-quota";
+  if (/drive.*quota|drive.*rate/i.test(msg)) return "drive-quota";
+  if (/gmail.*quota|gmail.*rate/i.test(msg)) return "gmail-quota";
+  if (/google.*quota|userratelimitexceeded/i.test(msg)) return "google-quota";
+
+  // 4. PDF processing
+  if (/no password|password given|encrypted/i.test(msg)) return "pdf-encrypted";
+  if (/no text|sin texto|pdf.*empty|pdf vacío/i.test(msg)) return "pdf-no-text";
+  if (/pdf.*corrupt|pdf.*invalid|invalid pdf/i.test(msg)) return "pdf-corrupted";
+
+  // 5. ZIP / XML processing (DIAN)
+  if (/zip.*corrupt|invalid zip|bad zip/i.test(msg)) return "zip-corrupted";
+  if (/zip.*sin xml|no xml in zip/i.test(msg)) return "zip-no-xml";
+  if (/xml.*parse|invalid xml|malformed xml/i.test(msg)) return "xml-parse";
+
+  // 6. LLM extraction issues
+  if (/not.?invoice|no es factura|not a factura/i.test(msg)) return "llm-no-invoice";
+  if (/baja confianza|low confidence/i.test(msg)) return "llm-low-confidence";
+  if (/llm.*timeout|claude.*timeout/i.test(msg)) return "llm-timeout";
+  if (/llm.*json|invalid json from llm/i.test(msg)) return "llm-malformed-json";
+
+  // 7. Network / transient
+  if (/timeout|econnreset|etimedout|aborted/i.test(msg)) return "network-timeout";
+  if (/dns|enotfound|getaddrinfo/i.test(msg)) return "network-dns";
+  if (/socket hang up|connection reset/i.test(msg)) return "network-reset";
+
+  // 8. Sheet writes specific
+  if (/range_not_found|rango no encontrado|range not found/i.test(msg)) return "sheet-range-not-found";
+  if (/sheet.*forbidden|spreadsheet.*forbidden/i.test(msg)) return "sheet-forbidden";
+
+  // 9. Drive issues
+  if (/drive.*not_found|file not found.*drive|fileid.*404/i.test(msg)) return "drive-not-found";
+  if (/drive.*forbidden|drive.*403/i.test(msg)) return "drive-forbidden";
+
+  // 10. Dedup / DB
+  if (/duplicate key|unique constraint|agent_events_factura_unique/i.test(msg)) return "db-dedup";
+  if (/supabase.*5\d\d|postgres.*5\d\d/i.test(msg)) return "supabase-error";
+
+  // 11. Custom motivos del nuevo classifier (en pipeline.ts, commit 1206687)
+  // Estos NO deberían llegar acá porque ya se reclasifican como saltadas,
+  // pero por si quedó alguno legacy:
+  if (/doc-no-procesable/i.test(msg)) return "doc-no-procesable-legacy";
+
+  return "other";
 }
 
 function countByMotivo(saltadas: Array<{ motivo: string }>): Record<string, number> {

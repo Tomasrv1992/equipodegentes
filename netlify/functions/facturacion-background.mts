@@ -285,15 +285,30 @@ export default async (req: Request) => {
     }
   }
 
-  // 3.5. AUTO MULTI-PASS para clientes en first_run o force=true.
-  //      Disparamos 12 invocaciones paralelas (1 por mes) para evitar timeout
-  //      en clientes grandes. Si el body trae monthFilter o multiPass=false
-  //      explícito, NO auto-disparamos (respetamos lo que vino).
+  // 3.5. AUTO MULTI-PASS — solo para PRIMER RUN del cliente (onboarding).
+  //
+  //      Si el cliente está en first_run (first_run_done=false), disparamos
+  //      N invocaciones paralelas (1 por mes) para procesar histórico anual
+  //      sin que ningún mes timeoutee (Netlify Background = 15min).
+  //
+  //      BUG CRÍTICO 2026-05-15: ANTES la condición incluía `body.force === true`
+  //      → cualquier retrigger del supervisor (que pasa force=true sin monthFilter)
+  //      disparaba fan-out completo. Resultado:
+  //        - Cliente onboardeado recibía 5 emails "Listo {mes}" cada vez que el
+  //          supervisor lo retriggeaba (notifyMonthComplete se propagaba al fan-out)
+  //        - 5 runs concurrentes hit api-quota Anthropic + duplicaban filas Sheet
+  //          (407k filas en Sheet de Freshco abril = 316× duplicado, vs 428 events reales)
+  //
+  //      Fix: solo wasFirstRun activa fan-out. force=true se respeta como
+  //      "re-lee emails con label Procesado" pero corre EN UN SOLO run, no fan-out.
+  //
+  //      Si Tomás quiere fan-out manual para un cliente ya onboardeado (catchup),
+  //      tiene que pasar explícitamente `multiPass: true`.
   const shouldAutoFanOut =
     body.customerId &&
     body.monthFilter == null &&
     !body.multiPass &&
-    (wasFirstRun || body.force === true);
+    wasFirstRun;
 
   if (shouldAutoFanOut) {
     const baseUrl = process.env.URL;

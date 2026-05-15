@@ -29,6 +29,7 @@ import {
 import type { Cliente, AgentEvent } from "../types";
 import EmptyState from "./EmptyState";
 import OnboardingEnCurso from "./OnboardingEnCurso";
+import ResumenSaludClientes from "./ResumenSaludClientes";
 
 interface FacturaPayload {
   fecha?: string;
@@ -163,6 +164,9 @@ export default function Matriz() {
 
       {/* === CLIENTES EN ONBOARDING (alta prioridad — backfill activo) === */}
       <OnboardingEnCurso clientes={clientes} runs={runs} facturas={facturas} />
+
+      {/* === SALUD DEL ARCHIVO: clientes con discrepancias 5-fuentes === */}
+      <ResumenSaludClientes />
 
       {/* === TOP CLIENTES POR VALOR ENTREGADO === */}
       <section className="mb-9">

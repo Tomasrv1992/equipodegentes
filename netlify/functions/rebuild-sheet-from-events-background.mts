@@ -189,16 +189,60 @@ export default async (req: Request) => {
         continue;
       }
 
-      // 7.b Borrar filas de datos (preserva header en fila 1)
+      // 7.b Borrar filas FÍSICAS de datos (preserva header en fila 1)
+      //
+      // BUG ENCONTRADO 2026-05-16: clear() solo borra valores. Las filas
+      // físicas siguen existiendo y cuentan hacia el límite 10M celdas de
+      // Google Sheets. Freshco después del rebuild masivo tenía 0 filas
+      // VISIBLES pero ~660k filas físicas vacías → hit límite al appendear.
+      //
+      // Fix: usar batchUpdate.deleteDimension para ELIMINAR las filas físicas,
+      // no solo limpiar contenido. Después de eso, Sheet vuelve a tener
+      // capacidad real.
       if (filasActuales > 0) {
         try {
-          await sheets.spreadsheets.values.clear({
+          // Necesito el sheetId numérico de la pestaña (no el spreadsheet ID)
+          const meta = await sheets.spreadsheets.get({
             spreadsheetId: sheetId,
-            range: `'${tab}'!A2:O`,
+            fields: "sheets(properties(sheetId,title,gridProperties))",
           });
-          console.log(`[rebuild-sheet] ${tab}: ${filasActuales} filas borradas`);
+          const sheetProp = (meta.data.sheets ?? []).find(
+            (s: any) => s.properties?.title === tab,
+          );
+          const tabSheetId = sheetProp?.properties?.sheetId;
+          const totalRows = sheetProp?.properties?.gridProperties?.rowCount ?? 0;
+
+          if (tabSheetId != null && totalRows > 1) {
+            // Eliminar filas físicas desde fila 2 hasta el final (preserva header)
+            // deleteDimension usa índices 0-based, así que startIndex=1 = fila 2.
+            await sheets.spreadsheets.batchUpdate({
+              spreadsheetId: sheetId,
+              requestBody: {
+                requests: [
+                  {
+                    deleteDimension: {
+                      range: {
+                        sheetId: tabSheetId,
+                        dimension: "ROWS",
+                        startIndex: 1, // fila 2 en 0-based
+                        endIndex: totalRows, // exclusive
+                      },
+                    },
+                  },
+                ],
+              },
+            });
+            console.log(`[rebuild-sheet] ${tab}: ${totalRows - 1} filas físicas ELIMINADAS (deleteDimension)`);
+          } else {
+            // Fallback: clear si no encontramos sheetId (raro)
+            await sheets.spreadsheets.values.clear({
+              spreadsheetId: sheetId,
+              range: `'${tab}'!A2:O`,
+            });
+            console.log(`[rebuild-sheet] ${tab}: ${filasActuales} filas valores limpiados (fallback)`);
+          }
         } catch (e: any) {
-          console.warn(`[rebuild-sheet] ${tab}: clear failed: ${e.message}`);
+          console.warn(`[rebuild-sheet] ${tab}: delete failed: ${e.message}`);
         }
       }
 

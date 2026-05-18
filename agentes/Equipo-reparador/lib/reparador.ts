@@ -26,6 +26,47 @@ const MES_TABS = [
   "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ];
 
+/**
+ * Lee TODAS las filas de una pestaña paginando por bloques de 1000.
+ *
+ * INCIDENTE 2026-05-18: la versión anterior con range fijo `A2:O1000`
+ * truncaba a 999 filas. En Freshco enero (1647 facturas), las filas
+ * 1001-1648 eran invisibles para el reparador → re-insertaba las
+ * facturas como si faltaran → DUPLICACIÓN masiva (1647 facturas pero
+ * 2894 filas físicas con datos).
+ *
+ * Ahora pagina hasta MAX_ROWS (50k) — Sheets devuelve la última página
+ * incompleta cuando llega al final real de los datos.
+ */
+async function loadAllSheetRows(
+  sheets: any,
+  spreadsheetId: string,
+  tabName: string,
+): Promise<any[][]> {
+  const PAGE = 1000;
+  const MAX_ROWS = 50_000;
+  const all: any[][] = [];
+  let from = 2;
+  while (from < MAX_ROWS + 2) {
+    const to = from + PAGE - 1;
+    let batch: any[][] = [];
+    try {
+      const resp = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `'${tabName}'!A${from}:O${to}`,
+      });
+      batch = (resp.data.values ?? []) as any[][];
+    } catch {
+      break; // tab no existe / range inválido — fin
+    }
+    if (batch.length === 0) break;
+    all.push(...batch);
+    if (batch.length < PAGE) break; // última página incompleta = fin de datos
+    from += PAGE;
+  }
+  return all;
+}
+
 /** Headers del Sheet (deben coincidir con pipeline.ts SHEET_HEADERS). */
 const SHEET_COL_COUNT = 15;
 const COL_NUMERO_DOCUMENTO = 4; // E = índice 4 (0-based)
@@ -224,17 +265,17 @@ export async function runReparador(opts: RunReparadorOptions = {}): Promise<Repa
 
         if (eventsMes.length === 0) continue;
 
-        // 1b) Cargar filas del Sheet del mes
+        // 1b) Cargar filas del Sheet del mes (paginado — no truncar a 1000)
         let rowsSheet: any[][] = [];
         try {
-          const resp = await sheets.spreadsheets.values.get({
-            spreadsheetId: cred.sheet_id,
-            range: `'${tabName}'!A2:O1000`,
-          });
-          rowsSheet = resp.data.values ?? [];
+          rowsSheet = await loadAllSheetRows(sheets, cred.sheet_id, tabName);
         } catch {
           // Tab no existe — el reparador no la crea, eso es responsabilidad del pipeline.
           continue;
+        }
+        if (rowsSheet.length === 0) {
+          // Tab vacío: continuar al siguiente mes.
+          // El append de etapa 1d sí necesita la tab creada por el pipeline.
         }
 
         // Set de números de factura ya en Sheet
@@ -341,13 +382,10 @@ export async function runReparador(opts: RunReparadorOptions = {}): Promise<Repa
           } while (pageToken);
 
           // 2b) Re-cargar filas del Sheet del mes actual (con repairs ya hechos)
+          //     Paginado: no truncar a 1000 — ver loadAllSheetRows() arriba.
           let rowsSheet: any[][] = [];
           try {
-            const resp = await sheets.spreadsheets.values.get({
-              spreadsheetId: cred.sheet_id,
-              range: `'${tabName}'!A2:O1000`,
-            });
-            rowsSheet = resp.data.values ?? [];
+            rowsSheet = await loadAllSheetRows(sheets, cred.sheet_id, tabName);
           } catch {
             /* tab vacío */
           }

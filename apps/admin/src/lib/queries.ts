@@ -50,16 +50,50 @@ export function useLatestRuns() {
   return useQuery({
     queryKey: ["latest-runs"],
     queryFn: async (): Promise<AgentRun[]> => {
-      // AUDIT 2026-05-13: limit subido de 200 a 1000.
-      // Con 10 clientes × 13 runs/día (multi-pass + 4 admin) ≈ 130 runs/día.
-      // 200 cubre solo ~1.5 días. Con 1000 cubrimos 7+ días para /operacion + /agentes.
+      // INCIDENTE 2026-05-18: con limit=1000 + payloads gigantes del reparador
+      // masivo (filas_reparadas[], pdfs_huerfanos[], etc.) la query devuelve
+      // 500 a >14s y deja el panel en CARGANDO. Excluimos el payload de la
+      // query y solo traemos las sub-keys que la lista de Operación necesita
+      // (llm_calls, procesadas, mes/monthFilter). Para detalle pleno del run,
+      // useRun(id) sigue trayendo payload completo bajo demanda.
       const { data, error } = await supabase
         .from("agent_runs")
-        .select("*")
+        .select(
+          "id,cliente_id,agente_id,status,started_at,finished_at,duration_ms,triggered_by,summary,error_message,error_stack," +
+            "llm_calls:payload->llm_calls," +
+            "procesadas:payload->procesadas," +
+            "repetidas:payload->repetidas," +
+            "saltadas:payload->saltadas," +
+            "errores:payload->errores," +
+            "monthFilter:payload->monthFilter," +
+            "mes:payload->mes",
+        )
         .order("started_at", { ascending: false })
-        .limit(1000);
+        .limit(500);
       if (error) throw error;
-      return data as AgentRun[];
+      // Reconstruir shape `payload: {...}` para compat con código existente.
+      return (data ?? []).map((r: any) => ({
+        id: r.id,
+        cliente_id: r.cliente_id,
+        agente_id: r.agente_id,
+        status: r.status,
+        started_at: r.started_at,
+        finished_at: r.finished_at,
+        duration_ms: r.duration_ms,
+        triggered_by: r.triggered_by,
+        summary: r.summary,
+        error_message: r.error_message,
+        error_stack: r.error_stack,
+        payload: {
+          llm_calls: r.llm_calls,
+          procesadas: r.procesadas,
+          repetidas: r.repetidas,
+          saltadas: r.saltadas,
+          errores: r.errores,
+          monthFilter: r.monthFilter,
+          mes: r.mes,
+        },
+      })) as AgentRun[];
     },
   });
 }

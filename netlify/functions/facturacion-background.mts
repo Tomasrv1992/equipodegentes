@@ -63,6 +63,11 @@ interface RequestBody {
   windowFrom?: string;
   windowTo?: string;
   /**
+   * Workers paralelos del pipeline. Default 5. Bajar a 2-3 si hay
+   * Sheets API quota issues (caso real Freshco 67/130 errores 18-may).
+   */
+  concurrency?: number;
+  /**
    * Si true y customerId presente, en lugar de un único run, dispara 12
    * invocaciones (una por mes) y termina. Útil para primer run + force=true
    * en clientes con alto volumen — evita timeout de Netlify 15min.
@@ -842,6 +847,7 @@ async function buildConfig(
         monthFilter: body.monthFilter,
         windowFrom: body.windowFrom,
         windowTo: body.windowTo,
+        concurrency: body.concurrency,
         skipSheetSetup: (body as any).skipSheetSetup ?? false,
       },
     };

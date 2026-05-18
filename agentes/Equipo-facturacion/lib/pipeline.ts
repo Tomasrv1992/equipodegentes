@@ -86,6 +86,19 @@ export interface PipelineConfig {
     windowFrom?: string; // YYYY/MM/DD
     windowTo?: string;   // YYYY/MM/DD
     /**
+     * Workers paralelos en el worker pool del pipeline. Default 5.
+     *
+     * REDUCIR a 2-3 cuando hay riesgo de hit Sheets API quota (300 reads/min
+     * por usuario). Cada worker hace 3-4 reads/factura — 5 workers × 4 reads
+     * × 8 fact/min = ~160 reads/min OK, pero con isDuplicate cache cold puede
+     * escalar a 300+ RPM = quota exceeded.
+     *
+     * Caso real 2026-05-18 Freshco: 67/130 facturas erroraron con
+     * 'Quota exceeded sheets.googleapis.com Read requests per minute'.
+     * Bajar concurrency=2 resolvió.
+     */
+    concurrency?: number;
+    /**
      * Si true, NO ejecuta ensureSheetSetup. Usado por el multi-pass: solo
      * el primer dispatch (mes=1) hace el setup, los otros 11 saltean
      * porque ya está hecho. Evita race conditions + reduce drásticamente
@@ -267,6 +280,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     monthFilter,
     windowFrom,
     windowTo,
+    concurrency,
     skipSheetSetup = false,
   } = options;
 
@@ -468,7 +482,10 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // - llmTracker (counters): JS atomic. OK.
   // - El consecutivo Sheet ya no es cronológico, pero la col B (Fecha) es
   //   la verdad temporal — sin impacto funcional.
-  const CONCURRENCY = 5;
+  // CONCURRENCY configurable via options.concurrency (default 5).
+  // Bajar a 2-3 cuando hay riesgo de Sheets API quota exceeded.
+  const CONCURRENCY = Math.max(1, Math.min(10, concurrency ?? 5));
+  console.log(`[pipeline] CONCURRENCY=${CONCURRENCY} para ${emails.length} emails`);
   const queue = [...emails];
 
   async function worker() {

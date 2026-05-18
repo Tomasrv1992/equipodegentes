@@ -2121,16 +2121,24 @@ async function processOne(
     // BUG C FIX 2026-05-15: incluir numero DIAN evita colisiones cuando un
     // proveedor envía múltiples facturas en un mes (varias "1. Comercializadora..."
     // antes sobrescribían entre sí).
-    const baseName = buildFileBaseName(consecutivo, data.proveedor, data.numero);
-    // uniqueKey para DIAN: el CUFE es identificador único oficial de la DIAN.
-    const dianUniqueKey = data.cufe ? `dian:${data.cufe}` : undefined;
+    // FIX 2026-05-18: cuando data.numero queda null (LLM no logró extraer),
+    // el filename queda "N. Proveedor" sin numero DIAN. Si la misma factura
+    // sin numero se procesa en chunks diferentes del recovery, cada chunk
+    // genera un PDF distinto con MISMO nombre → Drive permite mismo nombre
+    // y duplica el archivo. Fallback: usar CUFE si existe, sino primeros
+    // 12 chars del messageId. Garantiza filename único + idempotencia.
+    const identificadorUnico =
+      data.numero || data.cufe || `m${messageId.slice(0, 12)}`;
+    const baseName = buildFileBaseName(consecutivo, data.proveedor, identificadorUnico);
+    // uniqueKey en Drive: CUFE > messageId. Garantiza dedupe de re-uploads.
+    const dianUniqueKey = data.cufe ? `dian:${data.cufe}` : `gmail:${messageId}`;
     if (pdfPath) {
       const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`, dianUniqueKey);
       driveLink = uploaded.webViewLink || "";
     }
     for (let j = 0; j < xmlPaths.length; j++) {
-      const xmlName = buildFileBaseName(consecutivo, data.proveedor, data.numero, j + 1);
-      const xmlUniqueKey = dianUniqueKey ? `${dianUniqueKey}:xml${j + 1}` : undefined;
+      const xmlName = buildFileBaseName(consecutivo, data.proveedor, identificadorUnico, j + 1);
+      const xmlUniqueKey = `${dianUniqueKey}:xml${j + 1}`;
       await uploadFile(drive, xmlPaths[j], folderId, `${xmlName}.xml`, xmlUniqueKey);
     }
 

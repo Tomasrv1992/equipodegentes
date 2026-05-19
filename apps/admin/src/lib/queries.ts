@@ -125,6 +125,27 @@ export function useRun(id: string) {
  * Dentilandia con 610), la versión anterior con limit(1000) truncaba.
  * Ahora pagina hasta 50_000 (hard ceiling).
  */
+// INCIDENTE 2026-05-19: tras recovery masivo (Freshco enero ~5K events nuevos),
+// las queries que bajan agent_events con `select("*")` cargan ~10-20MB de
+// payloads JSONB y rompen PostgREST o quedan colgadas. Las UI solo usan dos
+// sub-keys del payload (fecha y total). Por eso bajamos sólo esos via PostgREST
+// y reconstruimos el shape `payload: {fecha, total}` en cliente.
+const EVENTS_SELECT = (
+  "id,run_id,cliente_id,agente_id,tipo,created_at," +
+  "fecha:payload->>fecha,total:payload->>total"
+);
+function mapEventRow(r: any): AgentEvent {
+  return {
+    id: r.id,
+    run_id: r.run_id,
+    cliente_id: r.cliente_id,
+    agente_id: r.agente_id,
+    tipo: r.tipo,
+    created_at: r.created_at,
+    payload: { fecha: r.fecha, total: r.total != null ? Number(r.total) : null },
+  };
+}
+
 export function useFacturasByCliente(clienteId: string) {
   return useQuery({
     queryKey: ["facturas-cliente", clienteId],
@@ -137,13 +158,13 @@ export function useFacturasByCliente(clienteId: string) {
       while (from < HARD_CEILING) {
         const { data, error } = await supabase
           .from("agent_events")
-          .select("*")
+          .select(EVENTS_SELECT)
           .eq("cliente_id", clienteId)
           .eq("tipo", "factura_procesada")
           .order("created_at", { ascending: false })
           .range(from, from + PAGE_SIZE - 1);
         if (error) throw error;
-        const batch = (data ?? []) as AgentEvent[];
+        const batch = (data ?? []).map(mapEventRow);
         all.push(...batch);
         if (batch.length < PAGE_SIZE) break;
         from += PAGE_SIZE;
@@ -176,13 +197,13 @@ export function useFacturasByAgente(agenteId: string) {
       while (from < HARD_CEILING) {
         const { data, error } = await supabase
           .from("agent_events")
-          .select("*")
+          .select(EVENTS_SELECT)
           .eq("agente_id", agenteId)
           .eq("tipo", "factura_procesada")
           .order("created_at", { ascending: false })
           .range(from, from + PAGE_SIZE - 1);
         if (error) throw error;
-        const batch = (data ?? []) as AgentEvent[];
+        const batch = (data ?? []).map(mapEventRow);
         all.push(...batch);
         if (batch.length < PAGE_SIZE) break;
         from += PAGE_SIZE;
@@ -216,12 +237,12 @@ export function useAllFacturas() {
       while (from < HARD_CEILING) {
         const { data, error } = await supabase
           .from("agent_events")
-          .select("*")
+          .select(EVENTS_SELECT)
           .eq("tipo", "factura_procesada")
           .order("created_at", { ascending: false })
           .range(from, from + PAGE_SIZE - 1);
         if (error) throw error;
-        const batch = (data ?? []) as AgentEvent[];
+        const batch = (data ?? []).map(mapEventRow);
         all.push(...batch);
         if (batch.length < PAGE_SIZE) break; // última página
         from += PAGE_SIZE;

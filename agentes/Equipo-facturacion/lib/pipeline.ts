@@ -506,9 +506,11 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // - llmTracker (counters): JS atomic. OK.
   // - El consecutivo Sheet ya no es cronológico, pero la col B (Fecha) es
   //   la verdad temporal — sin impacto funcional.
-  // CONCURRENCY configurable via options.concurrency (default 5).
-  // Bajar a 2-3 cuando hay riesgo de Sheets API quota exceeded.
-  const CONCURRENCY = Math.max(1, Math.min(10, concurrency ?? 5));
+  // CONCURRENCY configurable via options.concurrency (default 3).
+  // INCIDENTE 2026-05-19: default 5 con safeAppendToSheet (lectura extra
+  // pre-append) dispara quota Sheets (300 reads/min/user). Bajamos default
+  // a 3 — clientes con alto volumen pueden subirla via options.concurrency.
+  const CONCURRENCY = Math.max(1, Math.min(10, concurrency ?? 3));
   console.log(`[pipeline] CONCURRENCY=${CONCURRENCY} para ${emails.length} emails`);
   const queue = [...emails];
 
@@ -1991,26 +1993,54 @@ async function safeAppendToSheet(
 ): Promise<any[] | null> {
   const numTrim = numero ? String(numero).trim() : "";
   if (numTrim.length > 0) {
-    try {
-      const resp = await sheets.spreadsheets.values.get({
-        spreadsheetId: sheetId,
-        range: `${tabRange}!E:E`,
-      });
-      const values = (resp.data.values ?? []) as any[][];
-      for (let i = 1; i < values.length; i++) {
-        const existing = String(values[i]?.[0] ?? "").trim();
-        if (existing === numTrim) {
-          console.log(
-            `[safeAppend] DUP pre-append detectado en ${tabName}: numero="${numTrim}" ya está en fila ${i + 1}. Skip append.`,
-          );
-          return null;
+    // Retry con backoff exponencial cuando Sheets responde 429 quota.
+    // Sin esto, en runs con muchas facturas el guard pre-append dispara
+    // quota y devuelve error → emails que SÍ procesarían sin dedup fallan.
+    const MAX_RETRIES = 3;
+    const BACKOFF_MS = [2000, 5000, 12000]; // 2s, 5s, 12s
+    let lastErr: any = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const resp = await sheets.spreadsheets.values.get({
+          spreadsheetId: sheetId,
+          range: `${tabRange}!E:E`,
+        });
+        const values = (resp.data.values ?? []) as any[][];
+        for (let i = 1; i < values.length; i++) {
+          const existing = String(values[i]?.[0] ?? "").trim();
+          if (existing === numTrim) {
+            console.log(
+              `[safeAppend] DUP pre-append detectado en ${tabName}: numero="${numTrim}" ya está en fila ${i + 1}. Skip append.`,
+            );
+            return null;
+          }
         }
+        lastErr = null;
+        break; // lectura exitosa → salir del retry loop
+      } catch (err: any) {
+        lastErr = err;
+        const code = err?.code ?? err?.response?.status;
+        const msg = String(err?.message ?? "");
+        const isQuota =
+          code === 429 ||
+          (code === 403 && /quota/i.test(msg)) ||
+          /quota.*exceeded/i.test(msg);
+        if (!isQuota || attempt === MAX_RETRIES) {
+          console.error(
+            `[safeAppend] lectura pre-append de E:E en ${tabName} falló (attempt ${attempt + 1}): ${msg}. Abortando append.`,
+          );
+          throw new Error(`safeAppend pre-check failed (${tabName}): ${msg}`);
+        }
+        const wait = BACKOFF_MS[attempt];
+        console.warn(
+          `[safeAppend] quota Sheets en ${tabName}, retry ${attempt + 1}/${MAX_RETRIES} en ${wait}ms...`,
+        );
+        await new Promise((res) => setTimeout(res, wait));
       }
-    } catch (err: any) {
-      console.error(
-        `[safeAppend] lectura pre-append de E:E en ${tabName} falló: ${err.message}. Abortando append para evitar duplicación masiva.`,
-      );
-      throw new Error(`safeAppend pre-check failed (${tabName}): ${err.message}`);
+    }
+    if (lastErr) {
+      // Defensa: si después de todos los retries seguimos en error, no appendees.
+      throw new Error(`safeAppend pre-check failed (${tabName}): ${lastErr.message}`);
     }
   }
   return appendToSheet(sheets, sheetId, tabRange, consecutivo, d);

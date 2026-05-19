@@ -20,6 +20,7 @@ import {
   useLatestRuns,
   useClientAgents,
   useAllFacturas,
+  useOAuthHealth,
 } from "../lib/queries";
 import {
   facturasThisMonth,
@@ -31,6 +32,7 @@ import EmptyState from "./EmptyState";
 import OnboardingEnCurso from "./OnboardingEnCurso";
 import ResumenSaludClientes from "./ResumenSaludClientes";
 import SaludOAuth from "./SaludOAuth";
+import SaludPlataformas from "./SaludPlataformas";
 
 interface FacturaPayload {
   fecha?: string;
@@ -44,6 +46,7 @@ export default function Matriz() {
   const { data: runs, isLoading: lr } = useLatestRuns();
   const { data: activaciones, isLoading: lac } = useClientAgents();
   const { data: facturas, isLoading: lf } = useAllFacturas();
+  const { data: oauthHealth } = useOAuthHealth();
   const onboarding = useOnboardingPipeline();
 
   if (lc || la || lr || lac || lf) {
@@ -94,6 +97,13 @@ export default function Matriz() {
 
   return (
     <div>
+      {/* === SALUD DE PLATAFORMAS (alertas + estado externo) === */}
+      <SaludPlataformas
+        runs={runs}
+        clientes={clientes}
+        oauthHealth={oauthHealth ?? []}
+      />
+
       {/* === HERO: VALOR ENTREGADO === */}
       <section className="border-b border-edge pb-7 mb-9">
         <div className="font-mono text-[10px] tracking-[0.18em] uppercase text-ink-3 font-medium mb-2">

@@ -15,6 +15,30 @@ export function useClientAgents() {
   });
 }
 
+/**
+ * Estado OAuth por cliente+agente. Usado por el widget SaludPlataformas
+ * para listar clientes con OAuth expired/revoked.
+ */
+export interface OAuthHealthRow {
+  cliente_id: string;
+  agente_id: string;
+  google_oauth_status: string | null;
+}
+
+export function useOAuthHealth() {
+  return useQuery({
+    queryKey: ["oauth-health"],
+    queryFn: async (): Promise<OAuthHealthRow[]> => {
+      const { data, error } = await supabase
+        .from("client_credentials")
+        .select("cliente_id, agente_id, google_oauth_status");
+      if (error) throw error;
+      return (data ?? []) as OAuthHealthRow[];
+    },
+    staleTime: 60_000,
+  });
+}
+
 export function useClientes() {
   return useQuery({
     queryKey: ["clientes"],

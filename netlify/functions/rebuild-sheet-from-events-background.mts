@@ -50,6 +50,20 @@ export default async (req: Request) => {
     return new Response("unauthorized", { status: 401 });
   }
 
+  // KILL SWITCH 2026-05-19: endpoint deshabilitado temporalmente.
+  // Algún proceso desconocido está disparando rebuilds en loop (Freshco enero
+  // pasó de 1089 → 28000+ filas con cada factura duplicada N×). Hasta
+  // identificar la fuente, este endpoint NO ejecuta nada — solo log y exit.
+  // Para reactivar: borrar este bloque y redeploy.
+  console.error("[rebuild-sheet] KILL SWITCH activo — request rechazada sin procesar");
+  return new Response(
+    JSON.stringify({
+      ok: false,
+      error: "endpoint temporalmente deshabilitado (kill switch 2026-05-19)",
+    }),
+    { status: 503, headers: { "content-type": "application/json" } },
+  );
+
   let body: RequestBody;
   try {
     body = await req.json();

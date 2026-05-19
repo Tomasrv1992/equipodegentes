@@ -284,7 +284,10 @@ export default async (_req: Request) => {
 };
 
 export const config: Config = {
-  // Cada 30 minutos. Suficiente para reaccionar rápido sin spam.
-  // Costo: 48 invocaciones/día (~1500/mes), bien dentro del free tier de Netlify.
-  schedule: "*/30 * * * *",
+  // DESACTIVADO 2026-05-19: estaba re-disparando facturación cada 30min para
+  // clientes con OAuth expired/revoked → 50+ disparos extra al día contra
+  // OAuth roto → gasto en Anthropic + Netlify sin valor.
+  // Para reactivar: cambiar schedule a "*/30 * * * *" y agregar guard que
+  // skipee clientes con oauth_status='expired'|'revoked'.
+  schedule: "0 0 31 2 *", // fecha imposible (Feb 31 no existe)
 };

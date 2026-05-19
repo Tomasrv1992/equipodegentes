@@ -440,8 +440,33 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // single-thread entre awaits. Garantiza que cada worker recibe un valor único.
   const mesConsecutivoCounter = new Map<string, number>();
   const getNextConsecutivo = async (tabName: string): Promise<number> => {
+    const clienteSlug = cfg.nombreCliente ?? "unknown";
+
+    // Intento 1: lock distribuido en Supabase (fuente de verdad entre chunks paralelos)
+    try {
+      const { getServerClient } = await import(
+        "../../../shared/agents-runtime/src/supabase-server"
+      );
+      const supa = getServerClient();
+
+      // Upsert atómico: si no existe la fila, la crea con el maxN del Sheet.
+      // Si existe, incrementa. El RPC garantiza atomicidad (no hay race condition).
+      const { data, error } = await supa.rpc("get_next_consecutivo", {
+        p_cliente_slug: clienteSlug,
+        p_tab_name: tabName,
+      });
+
+      if (!error && data != null) {
+        return data as number;
+      }
+      // Si falla el RPC, fallback al counter en memoria
+      console.warn(`[consecutivo] RPC falló (${error?.message}), usando counter en memoria`);
+    } catch (e: any) {
+      console.warn(`[consecutivo] Supabase no disponible (${e.message}), usando counter en memoria`);
+    }
+
+    // Fallback: counter en memoria (funciona dentro de un solo run)
     if (!mesConsecutivoCounter.has(tabName)) {
-      // Inicializar lazy: leer cache + encontrar maxN actual del Sheet
       const rows = await loadSheetRows(tabName);
       let maxN = 0;
       for (let i = 1; i < rows.length; i++) {
@@ -450,7 +475,6 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
       }
       mesConsecutivoCounter.set(tabName, maxN);
     }
-    // Read + write atómico (JS single-thread garantiza esto entre awaits).
     const next = (mesConsecutivoCounter.get(tabName) ?? 0) + 1;
     mesConsecutivoCounter.set(tabName, next);
     return next;
@@ -1244,9 +1268,11 @@ async function findInvoiceEmails(gmail: any, query: string) {
     } while (pageToken);
   } catch (err: any) {
     console.error(
-      `[gmail-list] EARLY-EXIT after page=${pages} total=${out.length}: ${err.message}`,
+      `[gmail-list] FATAL after page=${pages} total=${out.length}: ${err.message}`,
     );
-    // No re-throw — devolvemos lo que tenemos hasta acá
+    throw new Error(
+      `findInvoiceEmails falló en página ${pages} con ${out.length} emails leídos: ${err.message}. El run se aborta para evitar procesamiento parcial silencioso.`,
+    );
   }
   console.log(`[gmail-list] DONE pages=${pages} total=${out.length} query="${query}"`);
   return out;
@@ -1834,7 +1860,15 @@ async function uploadFile(
         return existing.data.files[0];
       }
     } catch (err: any) {
-      console.warn(`[upload-dedup] query falló, sigo con upload normal: ${err.message}`);
+      // INCIDENTE 2026-05-19: si la query de dedup falla y caemos al upload
+      // normal, podemos DUPLICAR el archivo en Drive (el archivo SÍ existía,
+      // pero la query lo "ocultó"). Preferimos perder el upload a duplicar.
+      console.error(
+        `[upload-dedup] query con uniqueKey="${uniqueKey.slice(0, 30)}..." falló: ${err.message}. Abortando upload para evitar duplicación.`,
+      );
+      throw new Error(
+        `upload-dedup query falló (uniqueKey=${uniqueKey.slice(0, 30)}): ${err.message}`,
+      );
     }
   }
 
@@ -2345,7 +2379,12 @@ async function processPlanilla(
         if (n === 0) driveLink = uploaded.webViewLink || "";
         n++;
       } catch (e: any) {
-        console.warn(`processPlanilla: upload "${p.filename}" failed: ${e.message}`);
+        // Log ERROR (no warn) para que se vea en logs/Sentry. No throw —
+        // permitimos que las demás planillas del email se procesen. La fila
+        // del Sheet queda con driveLink="" si TODOS los uploads fallan.
+        console.error(
+          `[processPlanilla] upload "${p.filename}" falló: ${e.message}. Sigo con siguiente adjunto.`,
+        );
       }
     }
 

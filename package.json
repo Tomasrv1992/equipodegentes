@@ -12,6 +12,7 @@
     "facturacion:procesar": "npx tsx --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/procesar-facturas.ts",
     "facturacion:dry-run": "npx tsx --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/procesar-facturas.ts --dry-run",
     "facturacion:diagnostico": "npx tsx --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/diagnostico-facturas.ts",
+    "facturacion:auditoria": "npx tsx --env-file=agentes/Equipo-facturacion/.env.local agentes/Equipo-facturacion/scripts/auditoria.ts",
     "facturacion:setup-oauth": "node --env-file=agentes/facturacion/.env.local agentes/facturacion/scripts/setup-oauth.mjs",
     "typecheck": "tsc --noEmit"
   },

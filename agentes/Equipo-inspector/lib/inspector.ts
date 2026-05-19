@@ -268,8 +268,27 @@ export async function runInspector(): Promise<InspectorReport> {
           r.estado = "warn";
           r.detalle = r.coincidencia.detalle;
         }
+
+        // VALIDACIÓN ANTI-DUPLICACIÓN 2026-05-19: si el Sheet del mes actual
+        // tiene MUCHO más filas que emails procesados en Gmail (ratio > 1.1),
+        // es señal clara de duplicación masiva — el incidente Freshco enero
+        // pasó porque el reparador truncaba lectura del Sheet a 1000 filas y
+        // re-insertaba las facturas >1000 como si faltaran. Esta validación
+        // hubiera detectado el problema antes de que llegara a 11K filas.
+        const sheetCount = r.coincidencia.sheet_count;
+        const gmailCount = r.coincidencia.gmail_count;
+        if (
+          r.estado === "ok" &&
+          gmailCount > 0 &&
+          sheetCount > gmailCount * 1.1
+        ) {
+          r.estado = "warn";
+          r.detalle = `Sheet tiene ${sheetCount} filas pero solo ${gmailCount} emails procesados — posible duplicación (ratio ${(
+            sheetCount / gmailCount
+          ).toFixed(2)}×).`;
+        }
       } catch (err: any) {
-        console.warn(
+        console.error(
           `[inspector] coincidencia falló para ${r.slug}: ${err.message}`,
         );
       }

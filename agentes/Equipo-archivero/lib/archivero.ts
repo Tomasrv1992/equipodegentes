@@ -108,6 +108,49 @@ export async function runArchivero(opts: RunArchiveroOptions = {}): Promise<Arch
   }
   durRep = Date.now() - t0;
 
+  // Guard: si el reparador reportó errores graves, no correr el limpiador.
+  // El limpiador con LLM puede insertar filas duplicadas si el Sheet está
+  // en estado inconsistente. Más seguro abortar y dejar que el próximo cron
+  // corra con el Sheet estabilizado.
+  const erroresGravesReparador = errores.filter(
+    (e) => e.etapa === "reparador"
+  ).length;
+  const hayInconsistencias = reparadorReport.clientes_inconsistentes?.length > 0;
+
+  if (erroresGravesReparador > 0 || hayInconsistencias) {
+    console.error(
+      `[archivero] ABORTANDO limpiador: reparador tuvo ${erroresGravesReparador} errores y ${reparadorReport.clientes_inconsistentes?.length ?? 0} clientes inconsistentes. Limpiador no corre para proteger integridad del Sheet.`
+    );
+    // Construir resumen parcial sin limpiador
+    const resumenParcial: ArchiveroReport["resumen"] = {
+      clientes_total: reparadorReport.clientes_total,
+      clientes_procesados: reparadorReport.clientes_procesados,
+      filas_reparadas: reparadorReport.filas_reparadas.length,
+      pdfs_huerfanos_residuales: reparadorReport.pdfs_huerfanos.length,
+      filas_sin_pdf: reparadorReport.filas_sin_pdf.length,
+      huerfanos_recuperados: 0,
+      duplicados_movidos: 0,
+      no_identificables: 0,
+      filas_sheet_duplicadas_grupos: 0,
+      filas_basura: 0,
+      clientes_inconsistentes: reparadorReport.clientes_inconsistentes,
+      costo_llm_usd_total: 0,
+    };
+    return {
+      fecha,
+      ts_generated: ts.toISOString(),
+      duration_ms_reparador: durRep,
+      duration_ms_limpiador: 0,
+      reparador: reparadorReport,
+      limpiador: null,
+      resumen: resumenParcial,
+      errores: [...errores, {
+        etapa: "limpiador",
+        error: "Limpiador abortado por errores en reparador — Sheet posiblemente inconsistente",
+      }],
+    };
+  }
+
   // === Etapa 5-6: LIMPIADOR ===
   let limpiadorReport: LimpiadorReport | null = null;
   let durLimp = 0;

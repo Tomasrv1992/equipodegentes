@@ -189,61 +189,64 @@ export default async (req: Request) => {
         continue;
       }
 
-      // 7.b Borrar filas FÍSICAS de datos (preserva header en fila 1)
+      // 7.b NUKE tab completo (deleteSheet + addSheet con headers + frozen row).
       //
-      // BUG ENCONTRADO 2026-05-16: clear() solo borra valores. Las filas
-      // físicas siguen existiendo y cuentan hacia el límite 10M celdas de
-      // Google Sheets. Freshco después del rebuild masivo tenía 0 filas
-      // VISIBLES pero ~660k filas físicas vacías → hit límite al appendear.
-      //
-      // Fix: usar batchUpdate.deleteDimension para ELIMINAR las filas físicas,
-      // no solo limpiar contenido. Después de eso, Sheet vuelve a tener
-      // capacidad real.
-      if (filasActuales > 0) {
-        try {
-          // Necesito el sheetId numérico de la pestaña (no el spreadsheet ID)
-          const meta = await sheets.spreadsheets.get({
-            spreadsheetId: sheetId,
-            fields: "sheets(properties(sheetId,title,gridProperties))",
-          });
-          const sheetProp = (meta.data.sheets ?? []).find(
-            (s: any) => s.properties?.title === tab,
-          );
-          const tabSheetId = sheetProp?.properties?.sheetId;
-          const totalRows = sheetProp?.properties?.gridProperties?.rowCount ?? 0;
+      // INCIDENTE 2026-05-19: deleteDimension de 600K filas físicas timeoutea
+      // o satura quota Sheets. deleteSheet es INSTANT sin importar cuántas
+      // filas tenga (es metadata, no toca celdas). addSheet recrea la pestaña
+      // vacía con headers. Como el Dashboard referencia por NOMBRE de tab
+      // (no por sheetId), las fórmulas siguen funcionando.
+      try {
+        const meta = await sheets.spreadsheets.get({
+          spreadsheetId: sheetId,
+          fields: "sheets(properties(sheetId,title))",
+        });
+        const sheetProp = (meta.data.sheets ?? []).find(
+          (s: any) => s.properties?.title === tab,
+        );
+        const tabSheetId = sheetProp?.properties?.sheetId;
 
-          if (tabSheetId != null && totalRows > 1) {
-            // Eliminar filas físicas desde fila 2 hasta el final (preserva header)
-            // deleteDimension usa índices 0-based, así que startIndex=1 = fila 2.
-            await sheets.spreadsheets.batchUpdate({
-              spreadsheetId: sheetId,
-              requestBody: {
-                requests: [
-                  {
-                    deleteDimension: {
-                      range: {
-                        sheetId: tabSheetId,
-                        dimension: "ROWS",
-                        startIndex: 1, // fila 2 en 0-based
-                        endIndex: totalRows, // exclusive
-                      },
+        if (tabSheetId != null) {
+          // Borrar pestaña entera y recrearla con headers + frozen row
+          await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: sheetId,
+            requestBody: {
+              requests: [
+                { deleteSheet: { sheetId: tabSheetId } },
+                {
+                  addSheet: {
+                    properties: {
+                      title: tab,
+                      gridProperties: { frozenRowCount: 1, columnCount: 15 },
                     },
                   },
-                ],
-              },
-            });
-            console.log(`[rebuild-sheet] ${tab}: ${totalRows - 1} filas físicas ELIMINADAS (deleteDimension)`);
-          } else {
-            // Fallback: clear si no encontramos sheetId (raro)
-            await sheets.spreadsheets.values.clear({
-              spreadsheetId: sheetId,
-              range: `'${tab}'!A2:O`,
-            });
-            console.log(`[rebuild-sheet] ${tab}: ${filasActuales} filas valores limpiados (fallback)`);
-          }
-        } catch (e: any) {
-          console.warn(`[rebuild-sheet] ${tab}: delete failed: ${e.message}`);
+                },
+              ],
+            },
+          });
+          // Escribir headers en row 1 de la pestaña nueva
+          await sheets.spreadsheets.values.update({
+            spreadsheetId: sheetId,
+            range: `'${tab}'!A1:O1`,
+            valueInputOption: "RAW",
+            requestBody: {
+              values: [[
+                "#", "Fecha", "Proveedor", "NIT", "# Documento",
+                "Subtotal", "IVA",
+                "ReteFuente", "ReteIVA", "ReteICA",
+                "Total a Pagar",
+                "Concepto", "Categoría", "Cuenta PYG", "Link PDF",
+              ]],
+            },
+          });
+          console.log(`[rebuild-sheet] ${tab}: pestaña recreada (deleteSheet + addSheet)`);
+        } else {
+          // Tab no existe — el addSheet del próximo bloque la creará
+          console.log(`[rebuild-sheet] ${tab}: no existe, se creará nueva`);
         }
+      } catch (e: any) {
+        console.error(`[rebuild-sheet] ${tab}: nuke failed: ${e.message}`);
+        throw new Error(`rebuild-sheet nuke failed para ${tab}: ${e.message}`);
       }
 
       // 7.c Re-appendear eventos como filas (15 cols, formato pipeline)

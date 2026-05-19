@@ -1930,6 +1930,58 @@ async function appendToSheet(
   return row;
 }
 
+/**
+ * Guard de emergencia que envuelve appendToSheet (FIX A 2026-05-19).
+ *
+ * Antes de cada append hace una LECTURA DIRECTA a la Sheets API (no al cache
+ * cached por loadSheetRows) de la columna E del tab, y verifica que el
+ * `numero` recibido no exista ya. Si existe, retorna null → el caller debe
+ * tratar el email como duplicado y marcarlo procesado.
+ *
+ * Solo aplica cuando `numero` tiene valor — los emails sin numero los maneja
+ * el FIX C (skip en processOne) y los sub-pipelines que confían en otros
+ * dedupes (planilla/docx/pdf genérico usan messageId en uniqueKey de Drive).
+ *
+ * Si la lectura falla (quota Sheets, network, etc.), lanza error en vez de
+ * appendear — preferimos perder el email a duplicar masivamente como pasó
+ * en Freshco enero (628K filas físicas).
+ */
+async function safeAppendToSheet(
+  sheets: any,
+  sheetId: string,
+  tabRange: string,
+  tabName: string,
+  consecutivo: number,
+  d: ProcessedRow,
+  numero: string | undefined | null,
+): Promise<any[] | null> {
+  const numTrim = numero ? String(numero).trim() : "";
+  if (numTrim.length > 0) {
+    try {
+      const resp = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${tabRange}!E:E`,
+      });
+      const values = (resp.data.values ?? []) as any[][];
+      for (let i = 1; i < values.length; i++) {
+        const existing = String(values[i]?.[0] ?? "").trim();
+        if (existing === numTrim) {
+          console.log(
+            `[safeAppend] DUP pre-append detectado en ${tabName}: numero="${numTrim}" ya está en fila ${i + 1}. Skip append.`,
+          );
+          return null;
+        }
+      }
+    } catch (err: any) {
+      console.error(
+        `[safeAppend] lectura pre-append de E:E en ${tabName} falló: ${err.message}. Abortando append para evitar duplicación masiva.`,
+      );
+      throw new Error(`safeAppend pre-check failed (${tabName}): ${err.message}`);
+    }
+  }
+  return appendToSheet(sheets, sheetId, tabRange, consecutivo, d);
+}
+
 // ===== Pipeline per email =====
 
 type ProcessOneResult =
@@ -2056,6 +2108,18 @@ async function processOne(
     }
     if (!data) return { skip: true, reason: "no-es-factura-dian", subject };
 
+    // FIX C 2026-05-19: si parseInvoiceXml no extrajo numero (XML malformado o
+    // ZIP corrupto), marcamos el email como procesado y salimos. Sin numero
+    // no podemos dedup → si re-procesamos el mismo email duplica fila.
+    if (!data.numero || data.numero.trim() === "") {
+      await markEmailProcessed(gmail, messageId, labelId);
+      return {
+        skip: true,
+        reason: "dian-sin-numero (XML malformado o ZIP corrupto)",
+        subject,
+      };
+    }
+
     // BLOQUE I — Validación preventiva exigente.
     // Antes de meter la factura al Sheet, validamos formato del número,
     // fecha, monto, etc. Si falla, NO se procesa y queda en Gmail con label
@@ -2180,7 +2244,13 @@ async function processOne(
     if (retencionSource) {
       (row as any).retencionSource = retencionSource;
     }
-    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
+    const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, data.numero);
+    if (!newRow) {
+      // Guard de emergencia detectó duplicado pre-append — marcar email y salir.
+      await markEmailProcessed(gmail, messageId, labelId);
+      await applyMonthLabel(gmail, messageId, year, month);
+      return { dup: true, motivo: `guard-emergencia: ${data.proveedor} ${data.numero}`, subject };
+    }
     pushToCache(tabName, newRow);
     await markEmailProcessed(gmail, messageId, labelId);
     await applyMonthLabel(gmail, messageId, year, month);
@@ -2299,7 +2369,12 @@ async function processPlanilla(
       cuentaPyg: "5202 - Seguridad social",
       tipo: "planilla_ss",
     };
-    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
+    const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, numeroPlanilla);
+    if (!newRow) {
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyMonthLabel(gmail, messageId, year, month);
+      return { dup: true, motivo: `guard-emergencia: ${proveedor} ${numeroPlanilla}`, subject };
+    }
     pushToCache(tabName, newRow);
 
     // 8. Labels: Procesado + Facturas/YYYY-MM (mismo flujo que facturas DIAN)
@@ -2501,7 +2576,12 @@ async function processCuentaCobroDocx(
       cuentaPyg,
       tipo: "cuenta_cobro",
     };
-    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
+    const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, extracted.numero);
+    if (!newRow) {
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyMonthLabel(gmail, messageId, year, month);
+      return { dup: true, motivo: `guard-emergencia: ${extracted.proveedor} ${extracted.numero}`, subject };
+    }
     pushToCache(tabName, newRow);
 
     // 10. Labels
@@ -2708,7 +2788,12 @@ async function processGenericPdf(
       cuentaPyg,
       tipo: presumedType, // "recibo_internacional" o "recibo_servicio"
     };
-    const newRow = await appendToSheet(sheets, g.sheetId, tabRange, consecutivo, row);
+    const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, extracted.numero);
+    if (!newRow) {
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyMonthLabel(gmail, messageId, year, month);
+      return { dup: true, motivo: `guard-emergencia: ${extracted.proveedor} ${extracted.numero}`, subject };
+    }
     pushToCache(tabName, newRow);
 
     // 11. Labels

@@ -23,7 +23,9 @@ import {
 // Definición de la jerarquía. Si un agente no aparece acá, se muestra "standalone".
 // Slugs de agentes que NO se muestran en "Otros agentes" porque están
 // inactivos o no son parte del producto actual.
-const AGENTES_OCULTOS = new Set(["cartera"]);
+// Equipo-limpiador, Equipo-monitor, Equipo-reparador: fusionados en
+// Equipo-archivero — no se muestran 2026-05-19.
+const AGENTES_OCULTOS = new Set(["cartera", "limpiador", "monitor", "reparador"]);
 
 const EQUIPOS: Array<{
   id: string;

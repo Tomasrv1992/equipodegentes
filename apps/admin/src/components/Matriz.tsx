@@ -142,17 +142,6 @@ export default function Matriz() {
             accent="neutral"
           />
           <ValorCard
-            label="ROI"
-            value={ratioROI > 0 ? `${Math.round(ratioROI)}×` : "—"}
-            unit="valor / costo"
-            sub={
-              ratioROI > 0
-                ? `Cada $1 invertido en LLM devuelve $${Math.round(ratioROI)} en tiempo humano`
-                : "Sin gasto LLM aún"
-            }
-            accent={ratioROI >= 100 ? "ok" : ratioROI >= 50 ? "neutral" : "warn"}
-          />
-          <ValorCard
             label="Volumen activo"
             value={`${factMes.toLocaleString("es-CO")}`}
             unit="facturas · mes"
@@ -173,8 +162,9 @@ export default function Matriz() {
         </div>
       </section>
 
-      {/* === SALUD OAUTH: alerta clientes con refresh_token próximo a expirar === */}
-      <SaludOAuth />
+      {/* SaludOAuth quitado 2026-05-19: hardcoded modo Testing, app YA está en
+          Production. Tokens nuevos no expiran. Se removió hasta tener detección
+          dinámica del estado real. */}
 
       {/* === CLIENTES EN ONBOARDING (alta prioridad — backfill activo) === */}
       <OnboardingEnCurso clientes={clientes} runs={runs} facturas={facturas} />
@@ -245,13 +235,8 @@ export default function Matriz() {
         )}
       </section>
 
-      {/* === CHARTS COMPARATIVOS 6 MESES === */}
-      <section className="mb-9">
-        <div className="flex items-baseline justify-between mb-4">
-          <h2 className="section-title">Histórico · últimos 6 meses</h2>
-        </div>
-        <HistoricoMensual facturas={facturas} />
-      </section>
+      {/* Histórico 6 meses quitado 2026-05-19: poca utilidad práctica
+          mientras la operación enfoca clientes/meses activos. */}
     </div>
   );
 }

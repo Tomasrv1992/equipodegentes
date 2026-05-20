@@ -50,25 +50,41 @@ export default async (req: Request) => {
     return new Response("unauthorized", { status: 401 });
   }
 
-  // KILL SWITCH 2026-05-19: endpoint deshabilitado temporalmente.
-  // Algún proceso desconocido está disparando rebuilds en loop (Freshco enero
-  // pasó de 1089 → 28000+ filas con cada factura duplicada N×). Hasta
-  // identificar la fuente, este endpoint NO ejecuta nada — solo log y exit.
-  // Para reactivar: borrar este bloque y redeploy.
-  console.error("[rebuild-sheet] KILL SWITCH activo — request rechazada sin procesar");
-  return new Response(
-    JSON.stringify({
-      ok: false,
-      error: "endpoint temporalmente deshabilitado (kill switch 2026-05-19)",
-    }),
-    { status: 503, headers: { "content-type": "application/json" } },
-  );
-
+  // Leer body UNA VEZ y reusarlo (el body es stream, no se puede re-leer).
   let body: RequestBody;
+  let rawBody: any = null;
   try {
-    body = await req.json();
+    rawBody = await req.json();
+    body = rawBody as RequestBody;
   } catch {
     return new Response("invalid json", { status: 400 });
+  }
+
+  // LOG FORENSE 2026-05-19: registrar CADA invocación (timestamp, IP, headers,
+  // body) en tabla rebuild_invocation_log de Supabase. Si volvemos a tener
+  // rebuilds disparados misteriosamente, vamos a poder identificar la fuente
+  // (IP, user-agent, referer).
+  // Best-effort: si el insert falla, NO bloquear la ejecución.
+  try {
+    const ip =
+      req.headers.get("x-nf-client-connection-ip") ||
+      req.headers.get("x-forwarded-for") ||
+      "unknown";
+    const supaForLog = getServerClient();
+    await supaForLog.from("rebuild_invocation_log").insert({
+      cliente_slug: body?.clienteSlug ?? null,
+      month_filter: Number(body?.monthFilter) || null,
+      ip,
+      user_agent: req.headers.get("user-agent"),
+      x_trigger: req.headers.get("x-trigger"),
+      referer: req.headers.get("referer"),
+      body_raw: rawBody,
+    });
+    console.log(
+      `[rebuild-sheet] invocación registrada: cliente=${body?.clienteSlug} ip=${ip} trigger=${req.headers.get("x-trigger") ?? "none"}`,
+    );
+  } catch (e: any) {
+    console.warn(`[rebuild-sheet] log forense falló (continuando igual): ${e.message}`);
   }
 
   const clienteSlug = (body.clienteSlug ?? "").trim();

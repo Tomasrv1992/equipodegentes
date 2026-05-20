@@ -1277,7 +1277,11 @@ async function findInvoiceEmails(gmail: any, query: string) {
     );
   }
   console.log(`[gmail-list] DONE pages=${pages} total=${out.length} query="${query}"`);
-  return out;
+  // Gmail API devuelve por defecto orden DESC (más nuevo primero). Reverse →
+  // orden cronológico ASC (más viejo primero). Esto asegura procesamiento
+  // ordenado: factura 1 del mes → factura N. Importante cuando concurrency=1
+  // y cuando se asigna consecutivo (Drive/Sheet quedan en orden temporal real).
+  return out.reverse();
 }
 
 async function getMessageFull(gmail: any, messageId: string) {

@@ -71,15 +71,57 @@ function useDiagnosticoData() {
         .eq("activo", true)
         .order("slug");
 
+      // INCIDENTE 2026-05-19: select(*) traía payload completo. Algunos
+      // runs del reparador/archivero tienen payload con arrays gigantes
+      // (filas_reparadas[], pdfs_huerfanos[]) que pasaban MB y rompían
+      // la query (HTTP 500). Bajamos a sub-keys del payload que la página
+      // realmente usa (procesadas, repetidas, saltadas, errores, llm_calls,
+      // monthFilter, mes, validaciones, total_huerfanos_analizados, etc).
       const { data: runs } = await supabase
         .from("agent_runs")
-        .select("*")
+        .select(
+          "id,cliente_id,agente_id,status,started_at,finished_at,duration_ms,summary,error_message," +
+            "procesadas:payload->procesadas," +
+            "repetidas:payload->repetidas," +
+            "saltadas:payload->saltadas," +
+            "errores:payload->errores," +
+            "llm_calls:payload->llm_calls," +
+            "llamadas_llm:payload->llamadas_llm," +
+            "total_huerfanos_analizados:payload->total_huerfanos_analizados," +
+            "monthFilter:payload->monthFilter," +
+            "mes:payload->mes," +
+            "validaciones:payload->validaciones",
+        )
         .gte("started_at", dayStart)
         .order("started_at", { ascending: false });
 
+      const runsReconstructed = (runs ?? []).map((r: any) => ({
+        id: r.id,
+        cliente_id: r.cliente_id,
+        agente_id: r.agente_id,
+        status: r.status,
+        started_at: r.started_at,
+        finished_at: r.finished_at,
+        duration_ms: r.duration_ms,
+        summary: r.summary,
+        error_message: r.error_message,
+        payload: {
+          procesadas: r.procesadas,
+          repetidas: r.repetidas,
+          saltadas: r.saltadas,
+          errores: r.errores,
+          llm_calls: r.llm_calls,
+          llamadas_llm: r.llamadas_llm,
+          total_huerfanos_analizados: r.total_huerfanos_analizados,
+          monthFilter: r.monthFilter,
+          mes: r.mes,
+          validaciones: r.validaciones,
+        },
+      }));
+
       return {
         clientes: (clientes ?? []) as ClienteRow[],
-        runs: (runs ?? []) as RunRow[],
+        runs: runsReconstructed as RunRow[],
       };
     },
   });

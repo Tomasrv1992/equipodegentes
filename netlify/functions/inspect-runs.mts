@@ -19,7 +19,7 @@ export default async (req: Request) => {
 
   const { data, error } = await supa
     .from("agent_runs")
-    .select("id, status, started_at, ended_at, summary, payload->procesadas, payload->errores, payload->saltadas, payload->repetidas, triggered_by")
+    .select("id, status, started_at, finished_at, duration_ms, summary, payload->procesadas, payload->errores, payload->saltadas, payload->repetidas, triggered_by")
     .eq("cliente_id", (cli as any).id)
     .order("started_at", { ascending: false })
     .limit(limit);
@@ -30,10 +30,8 @@ export default async (req: Request) => {
     id: r.id,
     status: r.status,
     started_at: r.started_at,
-    ended_at: r.ended_at,
-    duration_min: r.started_at && r.ended_at
-      ? Math.round((new Date(r.ended_at).getTime() - new Date(r.started_at).getTime()) / 6000) / 10
-      : null,
+    finished_at: r.finished_at,
+    duration_min: r.duration_ms ? Math.round(r.duration_ms / 6000) / 10 : null,
     triggered_by: r.triggered_by,
     procesadas: Array.isArray(r.procesadas) ? r.procesadas.length : (r.procesadas ?? 0),
     errores: Array.isArray(r.errores) ? r.errores.length : (r.errores ?? 0),

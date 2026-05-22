@@ -578,6 +578,7 @@ export default async (req: Request) => {
             proveedor: p.proveedor,
             nit: p.nit,
             numero: p.numero,
+            consecutivo: (p as any).consecutivo,
             cufe: p.cufe,
             subtotal: p.subtotal,
             iva: p.iva,

@@ -164,6 +164,13 @@ export interface ProcessedRow extends InvoiceData {
    *   - planilla_ss: PDF planillas seguridad social PILA Colombia
    */
   tipo?: string;
+  /**
+   * Consecutivo asignado en Sheet/Drive. Se propaga al payload del
+   * agent_event para que el rebuild pueda recrear el Sheet con la
+   * misma numeración que existe en Drive — sino los nombres de PDF
+   * "244. FEL..." quedan desincronizados del row # del Sheet.
+   */
+  consecutivo?: number;
 }
 
 // ===== Categorización =====
@@ -506,11 +513,14 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // - llmTracker (counters): JS atomic. OK.
   // - El consecutivo Sheet ya no es cronológico, pero la col B (Fecha) es
   //   la verdad temporal — sin impacto funcional.
-  // CONCURRENCY configurable via options.concurrency (default 3).
+  // CONCURRENCY configurable via options.concurrency (default 1 = una por una).
   // INCIDENTE 2026-05-19: default 5 con safeAppendToSheet (lectura extra
-  // pre-append) dispara quota Sheets (300 reads/min/user). Bajamos default
-  // a 3 — clientes con alto volumen pueden subirla via options.concurrency.
-  const CONCURRENCY = Math.max(1, Math.min(10, concurrency ?? 3));
+  // pre-append) dispara quota Sheets (300 reads/min/user). Bajamos a 3.
+  // INCIDENTE 2026-05-22 (Freshco): orden cronológico se rompe con paralelo
+  // (factura del 31-ene puede recibir consecutivo antes que la del 02-ene).
+  // Default permanente: 1 (serial, una por una, garantiza orden temporal).
+  // Clientes con alto volumen pueden subirla via options.concurrency.
+  const CONCURRENCY = Math.max(1, Math.min(10, concurrency ?? 1));
   console.log(`[pipeline] CONCURRENCY=${CONCURRENCY} para ${emails.length} emails`);
   const queue = [...emails];
 
@@ -2306,6 +2316,7 @@ async function processOne(
     const row: ProcessedRow = {
       ...data, driveLink, subject, categoria, cuentaPyg,
       tipo: "factura_dian",
+      consecutivo,
     };
     // Adjuntar audit trail al row (lo usa el background fn para guardar en
     // agent_events.payload.retencionSource). No va al Sheet — campo interno.
@@ -2441,6 +2452,7 @@ async function processPlanilla(
       categoria: "Seguridad Social",
       cuentaPyg: "5202 - Seguridad social",
       tipo: "planilla_ss",
+      consecutivo,
     };
     const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, numeroPlanilla);
     if (!newRow) {
@@ -2648,6 +2660,7 @@ async function processCuentaCobroDocx(
       categoria,
       cuentaPyg,
       tipo: "cuenta_cobro",
+      consecutivo,
     };
     const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, extracted.numero);
     if (!newRow) {
@@ -2860,6 +2873,7 @@ async function processGenericPdf(
       categoria,
       cuentaPyg,
       tipo: presumedType, // "recibo_internacional" o "recibo_servicio"
+      consecutivo,
     };
     const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, extracted.numero);
     if (!newRow) {

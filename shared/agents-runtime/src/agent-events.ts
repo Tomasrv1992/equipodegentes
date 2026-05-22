@@ -11,6 +11,14 @@ export interface FacturaEventPayload {
   proveedor: string;
   nit: string;
   numero: string;
+  /**
+   * Consecutivo asignado en Sheet/Drive durante el procesamiento.
+   * CRÍTICO para rebuilds: sin este campo, al recrear el Sheet desde events
+   * se asignan consecutivos nuevos 1..N que NO matchean los nombres de PDF
+   * en Drive (bug detectado 2026-05-22 en Freshco). Persistir acá es la
+   * única fuente de verdad cross-Sheet/Drive/BD.
+   */
+  consecutivo?: number;
   cufe?: string;
   subtotal: number;
   iva: number;

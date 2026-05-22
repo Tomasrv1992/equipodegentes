@@ -171,12 +171,18 @@ export default async (req: Request) => {
       requestBody: { values: [SHEET_HEADERS] },
     });
 
-    // 7) Convertir events a filas y appendear en chunks
+    // 7) Convertir events a filas y appendear en chunks.
+    //    CRÍTICO: usar `consecutivo` del payload si existe — preserva la
+    //    indexación original que matchea los nombres de PDF en Drive. Si NO
+    //    existe (events legacy), asigna fallback secuencial 1..N (genera
+    //    desalineación con Drive). Anti-bug 2026-05-22 (Freshco).
+    const eventsConConsec = events.filter((e: any) => typeof e.payload?.consecutivo === "number");
+    const usarOriginal = eventsConConsec.length === events.length && events.length > 0;
     const values: any[][] = [];
-    let consec = 0;
+    let fallbackConsec = 0;
     for (const e of events) {
-      consec++;
       const p = e.payload as any;
+      const consec = usarOriginal ? Number(p.consecutivo) : (++fallbackConsec);
       const subtotal = Number(p?.subtotal ?? 0);
       const iva = Number(p?.iva ?? 0);
       const rtf = Number(p?.reteFuente ?? 0);
@@ -222,6 +228,7 @@ export default async (req: Request) => {
         tab,
         events_encontrados: events.length,
         filas_appendeadas: values.length,
+        consecutivo_origen: usarOriginal ? "payload (preservado)" : "fallback secuencial (events legacy sin consecutivo)",
       }),
       { headers: { "content-type": "application/json" } },
     );

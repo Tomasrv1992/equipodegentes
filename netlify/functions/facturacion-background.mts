@@ -232,7 +232,12 @@ export default async (req: Request) => {
           "try_acquire_dispatch_lock",
           {
             p_cliente_id: (cliLock as any).id,
-            p_max_age_seconds: 30,
+            // 15 min = duración máxima de un run en Netlify background.
+            // Antes era 30s lo cual era MUY corto: si 2 dispatches venían
+            // separados por 31s+, el lock del primero expiraba y el segundo
+            // pasaba. Bug detectado Dentilandia 2026-05-26 — dispatches
+            // separados por 31 seg creaban 2 runs paralelos.
+            p_max_age_seconds: 900,
           },
         );
         if (!lockErr && acquired === false) {

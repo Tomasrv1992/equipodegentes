@@ -365,11 +365,15 @@ export default async (req: Request) => {
   //
   //      Si Tomás quiere fan-out manual para un cliente ya onboardeado (catchup),
   //      tiene que pasar explícitamente `multiPass: true`.
-  const shouldAutoFanOut =
-    body.customerId &&
-    body.monthFilter == null &&
-    !body.multiPass &&
-    wasFirstRun;
+  // DESACTIVADO 2026-05-26 (post bug paralelismo Dentilandia):
+  //   El auto-fan-out viene siendo fuente persistente de runs paralelos que
+  //   rompen orden cronológico de consecutivos y saturan quota Sheets API.
+  //   Decisión: NUNCA auto-fan-out. Si un cliente necesita backfill anual,
+  //   Tomás lo dispara MANUALMENTE con endpoint dedicado pasando chainNextMonths.
+  //   El primer run del onboarding queda en monthFilter=null → procesa con
+  //   window default ("YYYY/01/01" = desde inicio año) en UN SOLO run serial.
+  //   Si no cabe en 15min, el resto queda para el cron diario o disparo manual.
+  const shouldAutoFanOut = false;
 
   if (shouldAutoFanOut) {
     const baseUrl = process.env.URL;

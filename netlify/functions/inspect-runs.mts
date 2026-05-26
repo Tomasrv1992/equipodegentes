@@ -19,7 +19,7 @@ export default async (req: Request) => {
 
   const { data, error } = await supa
     .from("agent_runs")
-    .select("id, status, started_at, finished_at, duration_ms, summary, payload->procesadas, payload->errores, payload->saltadas, payload->repetidas, triggered_by")
+    .select("id, status, started_at, finished_at, duration_ms, summary, error_message, payload->procesadas, payload->errores, payload->saltadas, payload->repetidas, payload->preflight, triggered_by")
     .eq("cliente_id", (cli as any).id)
     .order("started_at", { ascending: false })
     .limit(limit);

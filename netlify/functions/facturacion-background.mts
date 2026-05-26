@@ -186,6 +186,36 @@ export default async (req: Request) => {
   }
   const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
 
+  // 3.0. GUARD anti-spam: si oauth_status NO está 'connected', skipear todo
+  //   el run silenciosamente. Casos típicos:
+  //     - Cliente recién reseteado (oauth_status='pending'): espera reonboarding
+  //     - OAuth expirado: ya hay notificación, no spamear cron diario con más mails
+  //   Sin este guard, cada cron diario para los 10 clientes reseteados manda
+  //   N emails "preflight oauth falló" al admin → spam masivo.
+  //   Cuando el cliente complete reonboarding, oauth_status pasa a 'connected'
+  //   y el cron lo recoge naturalmente.
+  if (
+    body.customerId &&
+    credBefore &&
+    credBefore.google_oauth_status !== "connected" &&
+    !body.skipOAuthGuard
+  ) {
+    console.log(JSON.stringify({
+      skipped: true,
+      reason: "oauth_status_not_connected",
+      customerId: body.customerId,
+      oauth_status: credBefore.google_oauth_status,
+    }));
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        skipped: true,
+        reason: `oauth_status=${credBefore.google_oauth_status} (esperando reonboarding)`,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }
+
   // 3.25. PRE-FLIGHT VALIDATION (multi-tenant, no skipPreflight).
   //
   //   Si tenemos credBefore válido y body.skipPreflight!=true, chequear las 4

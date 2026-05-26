@@ -96,6 +96,22 @@ interface RequestBody {
    * repetirlo (gastaría 4 llamadas API extra * N meses).
    */
   skipPreflight?: boolean;
+  /**
+   * Cadena de meses pendientes para procesamiento SECUENCIAL post-onboarding.
+   * Al terminar el run de este mes, se dispara el siguiente mes con el array
+   * reducido. Cuando array está vacío, no se dispara nada y termina.
+   *
+   * Reemplaza el paralelismo del auto-fan-out anterior. Garantiza:
+   *   1. Solo 1 mes corre a la vez (no compite por Sheets quota)
+   *   2. Consecutivos respetan orden cronológico real (mes 1 antes que 2)
+   */
+  chainNextMonths?: number[];
+  /**
+   * Si true, skipea el guard que rechaza runs cuando oauth_status != 'connected'.
+   * El cron lo deja undefined; dispatches manuales pueden setearlo para
+   * forzar un run (raramente útil).
+   */
+  skipOAuthGuard?: boolean;
 }
 
 export default async (req: Request) => {
@@ -392,44 +408,47 @@ export default async (req: Request) => {
         }
       }
 
+      // CAMBIO 2026-05-26: SECUENCIAL en lugar de paralelo.
+      //   Bug: disparar N meses en paralelo (aún con stagger 3.5s) genera
+      //   contención sobre Sheets API (300 reads/min) y rompe orden cronológico
+      //   de consecutivos — factura del mes 5 podía recibir #1 si llegaba
+      //   primero al lock distribuido.
+      //
+      //   Fix: dispatch SOLO el mes más viejo (enero) con chainNextMonths
+      //   conteniendo los meses pendientes. Al final del run, ese background
+      //   dispara el siguiente mes. Cada mes corre SECUENCIAL, no compite por
+      //   quota Sheets, y los consecutivos respetan orden temporal real.
+      const mesesAsc = [...meses].reverse(); // [1,2,3,...,currentMonth]
+      const firstMes = mesesAsc[0]; // enero (más viejo)
+      const chainNextMonths = mesesAsc.slice(1); // [2,3,...,currentMonth]
+
       console.log(
-        `[auto-fan-out] cliente=${body.customerId} (${wasFirstRun ? "first_run" : "force"}) ` +
-        `→ disparando ${meses.length} meses [${meses.join(",")}] ` +
-        `(currentMonth=${currentMonth}, desc, stagger 3.5s)`,
+        `[auto-fan-out-sequential] cliente=${body.customerId} → ` +
+        `inicio mes=${firstMes}, chain=[${chainNextMonths.join(",")}] ` +
+        `(secuencial, cada mes espera al anterior)`,
       );
 
-      // El PRIMER mes en disparar (el actual) hace setup completo del Sheet;
-      // los siguientes lo skipean para evitar quota exceeded.
-      const firstMes = meses[0];
-      const dispatches: Array<Promise<any>> = [];
-      for (const mes of meses) {
-        // Stagger 3.5s entre dispatches para evitar Google Sheets quota
-        // "Read requests" exceeded (300/min).
-        if (mes !== firstMes) await new Promise((r) => setTimeout(r, 3500));
-        dispatches.push(
-          fetch(target, {
-            method: "POST",
-            headers: {
-              "x-internal-secret": secret,
-              "x-trigger": "auto-multi-pass",
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({
-              customerId: body.customerId,
-              force: body.force ?? false,
-              silent: true,
-              monthFilter: mes,
-              // Solo el primer dispatch (mes actual) hace setup completo.
-              skipSheetSetup: mes !== firstMes,
-              // Email corto "listo {mes}" al terminar cada mes — feedback incremental.
-              notifyMonthComplete: true,
-              // Preflight ya corrió en el orquestador — los dispatches no repiten.
-              skipPreflight: true,
-            }),
-          }).catch((e) => console.warn(`[auto-fan-out] mes ${mes} failed: ${e.message}`)),
-        );
-      }
-      await Promise.all(dispatches);
+      // Solo UN dispatch ahora: el mes más viejo. Al terminar, dispara el siguiente.
+      await fetch(target, {
+        method: "POST",
+        headers: {
+          "x-internal-secret": secret,
+          "x-trigger": "auto-multi-pass-sequential",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          customerId: body.customerId,
+          force: body.force ?? false,
+          silent: true,
+          monthFilter: firstMes,
+          // Primer mes hace setup completo del Sheet
+          skipSheetSetup: false,
+          notifyMonthComplete: true,
+          skipPreflight: true,
+          // Cadena de meses a procesar después de este (orden ascendente).
+          chainNextMonths,
+        }),
+      }).catch((e) => console.warn(`[auto-fan-out-sequential] dispatch failed: ${e.message}`));
       return new Response(
         JSON.stringify({
           ok: true,
@@ -681,6 +700,54 @@ export default async (req: Request) => {
     } catch (err: any) {
       console.error("notify failed:", err.message);
     }
+  }
+
+  // ENCADENAMIENTO SECUENCIAL: si vino chainNextMonths con elementos,
+  // dispatch el siguiente mes AHORA (justo antes de devolver). Esto garantiza
+  // que el siguiente mes arranca solo después de que este terminó — cero
+  // paralelismo, cero contención de quota Sheets, consecutivos en orden real.
+  if (
+    body.customerId &&
+    body.chainNextMonths &&
+    body.chainNextMonths.length > 0 &&
+    result.errores.length < 50 // no encadenar si este mes fue catástrofe
+  ) {
+    const baseUrl = process.env.URL;
+    if (baseUrl) {
+      const target = `${baseUrl}/.netlify/functions/facturacion-background`;
+      const [nextMes, ...resto] = body.chainNextMonths;
+      console.log(
+        `[chain-next] mes ${body.monthFilter} OK (${result.procesadas.length} procesadas) → ` +
+        `dispatch mes ${nextMes}, restantes=[${resto.join(",")}]`,
+      );
+      try {
+        await fetch(target, {
+          method: "POST",
+          headers: {
+            "x-internal-secret": secret,
+            "x-trigger": "chain-next-month",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            customerId: body.customerId,
+            force: body.force ?? false,
+            silent: true,
+            monthFilter: nextMes,
+            skipSheetSetup: true, // setup ya hecho por el primer mes
+            notifyMonthComplete: true,
+            skipPreflight: true,
+            chainNextMonths: resto,
+          }),
+        });
+      } catch (e: any) {
+        console.warn(`[chain-next] dispatch mes ${nextMes} failed: ${e.message}`);
+      }
+    }
+  } else if (body.customerId && body.chainNextMonths !== undefined) {
+    console.log(
+      `[chain-next] cadena terminada en mes ${body.monthFilter} ` +
+      `(restantes=${body.chainNextMonths?.length ?? 0}, errores=${result.errores.length})`,
+    );
   }
 
   return new Response(JSON.stringify({ ok: true, durationMs, runId }), {
@@ -954,7 +1021,23 @@ async function resolveNotifyTarget(customerId?: string): Promise<NotifyTarget> {
   };
 }
 
+/**
+ * MUTE GLOBAL DE EMAILS — modo testing post-reset masivo 2026-05-26.
+ *
+ * Por default TODOS los emails (cliente + admin) están silenciados. Para
+ * reactivarlos, setear env var EMAILS_ENABLED=true en Netlify. Cuando el
+ * onboarding de los 10 clientes esté validado y todo opere bien, Tomás
+ * pone la env var y los emails vuelven a salir.
+ */
+function emailsMuted(): boolean {
+  return process.env.EMAILS_ENABLED !== "true";
+}
+
 async function notifyResult(result: PipelineResult, customerId?: string): Promise<void> {
+  if (emailsMuted()) {
+    console.log("notifyResult: skip (EMAILS_ENABLED!=true, modo testing)");
+    return;
+  }
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     console.warn("RESEND_API_KEY ausente — no se envía notificación");
@@ -1112,6 +1195,10 @@ async function notifyMonthDone(
   monthNumber: number,
   result: PipelineResult,
 ): Promise<void> {
+  if (emailsMuted()) {
+    console.log("notifyMonthDone: skip (EMAILS_ENABLED!=true)");
+    return;
+  }
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return;
 
@@ -1175,6 +1262,10 @@ async function notifyPreflightFailed(
   customerId: string,
   pf: Extract<PreflightResult, { ok: false }>,
 ): Promise<void> {
+  if (emailsMuted()) {
+    console.log("notifyPreflightFailed: skip (EMAILS_ENABLED!=true)");
+    return;
+  }
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return;
   // Solo Tomás (admin) — no spam al cliente con errores de OAuth técnicos.
@@ -1218,6 +1309,10 @@ async function notifyPreflightFailed(
 }
 
 async function notifyError(err: Error, customerId?: string): Promise<void> {
+  if (emailsMuted()) {
+    console.log("notifyError: skip (EMAILS_ENABLED!=true)");
+    return;
+  }
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) return;
   // Owner (modo legacy) NO recibe correo de error — Tomás monitorea desde panel.
@@ -1339,6 +1434,10 @@ function renderHtmlSummary(
  * breakdown por mes, tiempo ahorrado. Más celebratorio que el email diario.
  */
 async function notifyWelcome(customerId: string): Promise<void> {
+  if (emailsMuted()) {
+    console.log("notifyWelcome: skip (EMAILS_ENABLED!=true)");
+    return;
+  }
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     console.warn("RESEND_API_KEY ausente — no se envía notificación welcome");

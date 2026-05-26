@@ -998,6 +998,11 @@ async function buildConfig(
       // Nombre del cliente para fuzzy match cuando LLM no extrae NIT.
       // Cargado en buildConfig con un query extra (fuera de este return).
       nombreCliente: await getNombreClienteFromSlug(body.customerId),
+      // Slug real lowercase sin espacios - usado por RPC get_next_consecutivo
+      // FIX 2026-05-26: antes pipeline usaba nombreCliente (con mayusculas y
+      // espacios) como clave del RPC, creando rows "Dentilandia " que no se
+      // borraban con reset que buscaba "dentilandia".
+      clienteSlug: body.customerId,
       options: {
         dryRun: body.dryRun ?? false,
         window: resolvedWindow,

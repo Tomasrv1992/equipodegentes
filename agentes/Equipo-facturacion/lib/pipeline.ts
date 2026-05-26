@@ -43,12 +43,18 @@ export interface PipelineConfig {
    */
   nitCliente?: string | null;
   /**
-   * Nombre/slug del cliente (ej "DENTILANDIA", "Tomás Ramírez Villa").
+   * Nombre del cliente (ej "DENTILANDIA", "Tomás Ramírez Villa").
    * Backup filter cuando el LLM no extrae NIT pero sí extrae el nombre del
    * proveedor — si el nombre coincide con el cliente (normalizado), se
    * detecta como auto-factura y skipea.
    */
   nombreCliente?: string | null;
+  /**
+   * SLUG real del cliente (ej "dentilandia", "freshco"). Lowercase, sin espacios.
+   * Usado por el RPC get_next_consecutivo y otros lookups que requieren
+   * identificador único. Si no se pasa, fallback a nombreCliente normalizado.
+   */
+  clienteSlug?: string | null;
   /** Comportamiento. */
   options?: {
     dryRun?: boolean;
@@ -447,7 +453,17 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // single-thread entre awaits. Garantiza que cada worker recibe un valor único.
   const mesConsecutivoCounter = new Map<string, number>();
   const getNextConsecutivo = async (tabName: string): Promise<number> => {
-    const clienteSlug = cfg.nombreCliente ?? "unknown";
+    // FIX 2026-05-26: usar cfg.clienteSlug (el slug real lowercase, sin espacios)
+    // en vez de cfg.nombreCliente (nombre con mayúsculas y espacios). El RPC
+    // get_next_consecutivo guarda rows por (cliente_slug, tab_name), y si el
+    // slug es "Dentilandia " (capital + espacio), un reset que busca
+    // "dentilandia" NO encuentra esos rows y el contador queda alto eternamente.
+    // Bug detectado en Dentilandia: consecutivos quedaron en 433-1630 incluso
+    // tras resets sucesivos porque el slug guardado tenía espacio al final.
+    const clienteSlug = (cfg.clienteSlug ?? cfg.nombreCliente ?? "unknown")
+      .toString()
+      .trim()
+      .toLowerCase();
 
     // Intento 1: lock distribuido en Supabase (fuente de verdad entre chunks paralelos)
     try {

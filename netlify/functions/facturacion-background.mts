@@ -208,49 +208,53 @@ export default async (req: Request) => {
   }
   const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
 
-  // 3.-1. GUARD anti-stampede V2 (2026-05-26 — segundo intento):
+  // 3.-1. GUARD ATÓMICO V3 (2026-05-26 — migration 0011):
   //
-  //   Lookback CORTO (8 seg). Si hay CUALQUIER run del cliente registrado
-  //   hace <8 seg, descartar nuevo dispatch silenciosamente.
+  //   Usa RPC try_acquire_dispatch_lock en BD. ATÓMICO via UNIQUE constraint
+  //   (PRIMARY KEY en dispatch_locks). Sin race conditions:
+  //     - INSERT con UNIQUE → solo 1 gana, otros reciben unique_violation
+  //     - Capturamos excepción y retornamos FALSE → caller descarta
+  //   Lock expira tras 30 seg para que si el run muere por timeout, el
+  //   próximo dispatch pueda tomar el lock.
   //
-  //   Por qué 8 seg y no 60: con 60 seg se auto-bloqueaba en cron diario
-  //   legítimo. 8 seg solo bloquea stampedes (10 dispatches en 16 seg).
-  //
-  //   DEFENSIVE: try/catch con fail-OPEN. Si el query a BD falla, NO
-  //   bloqueamos — preferimos procesar duplicado a romper endpoint.
+  //   DEFENSIVE: try/catch con fail-OPEN. Si el RPC falla (red, BD down),
+  //   procesamos normal — mejor duplicar que romper endpoint completamente.
   if (body.customerId && !body.skipDuplicateGuard) {
     try {
-      const supaG = getServerClient();
-      const { data: cliG } = await supaG
+      const supaLock = getServerClient();
+      const { data: cliLock } = await supaLock
         .from("clientes")
         .select("id")
         .eq("slug", body.customerId)
         .single();
-      if (cliG) {
-        const cutoff = new Date(Date.now() - 8_000).toISOString();
-        const { data: recG } = await supaG
-          .from("agent_runs")
-          .select("id")
-          .eq("cliente_id", (cliG as any).id)
-          .eq("agente_id", "facturacion")
-          .gte("started_at", cutoff)
-          .limit(1);
-        if (recG && recG.length > 0) {
+      if (cliLock) {
+        const { data: acquired, error: lockErr } = await supaLock.rpc(
+          "try_acquire_dispatch_lock",
+          {
+            p_cliente_id: (cliLock as any).id,
+            p_max_age_seconds: 30,
+          },
+        );
+        if (!lockErr && acquired === false) {
           console.log(JSON.stringify({
             skipped: true,
-            reason: "stampede_protection_8s",
+            reason: "atomic_lock_held_by_other",
             customerId: body.customerId,
-            existing_run: (recG[0] as any).id,
           }));
           return new Response(
-            JSON.stringify({ ok: true, skipped: true, reason: "stampede protection (<8s)" }),
+            JSON.stringify({ ok: true, skipped: true, reason: "lock atómico (otro dispatch activo)" }),
             { status: 200, headers: { "content-type": "application/json" } },
           );
+        }
+        if (lockErr) {
+          console.warn(`[atomic-lock] RPC error (fail-open): ${lockErr.message}`);
+        } else {
+          console.log(`[atomic-lock] acquired by customerId=${body.customerId}`);
         }
       }
     } catch (e: any) {
       // FAIL-OPEN: si guard falla, procesamos normal. Mejor duplicar que romper.
-      console.warn(`[stampede-guard] fail-open: ${e.message}`);
+      console.warn(`[atomic-lock] fail-open: ${e.message}`);
     }
   }
 

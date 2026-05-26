@@ -112,14 +112,6 @@ interface RequestBody {
    * forzar un run (raramente útil).
    */
   skipOAuthGuard?: boolean;
-  /**
-   * Si true, skipea el guard anti-duplicate-dispatch (60s lookback).
-   * Útil para chain-next-month que dispara secuencialmente — el chain manda
-   * el siguiente mes inmediatamente al terminar el actual, pueden caer
-   * dentro de los 60s del run anterior. Sin este escape, el chain se
-   * romperia. Set por chainNextMonths internally.
-   */
-  skipDuplicateGuard?: boolean;
 }
 
 export default async (req: Request) => {
@@ -209,60 +201,6 @@ export default async (req: Request) => {
     credBefore = await loadCredentialsForBackground(body.customerId);
   }
   const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
-
-  // 3.-1. GUARD anti-duplicate-dispatch:
-  //   Si el mismo cliente tiene un run en status='running' iniciado hace <60s,
-  //   skipear silenciosamente. Eso bloquea CUALQUIER fuente de dispatches
-  //   duplicados rápidos:
-  //     - Doble-click del cliente
-  //     - 3 edge functions disparando independiente (bug Dentilandia 2026-05-26)
-  //     - Polling del frontend
-  //     - Cron concurrente con dispatch manual
-  //     - Auto-fan-out (aunque ya está off)
-  //   Segunda capa de defensa. El primer dispatch entra; los demás se descartan.
-  if (body.customerId && !body.skipDuplicateGuard) {
-    try {
-      const supa = getServerClient();
-      const { data: cli } = await supa
-        .from("clientes")
-        .select("id")
-        .eq("slug", body.customerId)
-        .single();
-      if (cli) {
-        const sinceCutoff = new Date(Date.now() - 60_000).toISOString();
-        const { data: recientes } = await supa
-          .from("agent_runs")
-          .select("id, started_at, status")
-          .eq("cliente_id", (cli as any).id)
-          .eq("agente_id", "facturacion")
-          .gte("started_at", sinceCutoff)
-          .order("started_at", { ascending: false })
-          .limit(5);
-        const reciente = (recientes ?? []).find(
-          (r: any) => r.status === "running" || r.status === "ok",
-        );
-        if (reciente) {
-          console.log(JSON.stringify({
-            skipped: true,
-            reason: "duplicate_dispatch_within_60s",
-            customerId: body.customerId,
-            existing_run_id: (reciente as any).id,
-            existing_status: (reciente as any).status,
-          }));
-          return new Response(
-            JSON.stringify({
-              ok: true,
-              skipped: true,
-              reason: `duplicate dispatch (run ${(reciente as any).id} ya activo)`,
-            }),
-            { status: 200, headers: { "content-type": "application/json" } },
-          );
-        }
-      }
-    } catch (e: any) {
-      console.warn(`[duplicate-guard] check failed (no-fatal): ${e.message}`);
-    }
-  }
 
   // 3.0. GUARD anti-spam: si oauth_status NO está 'connected', skipear todo
   //   el run silenciosamente. Casos típicos:
@@ -802,7 +740,6 @@ export default async (req: Request) => {
             skipSheetSetup: true, // setup ya hecho por el primer mes
             notifyMonthComplete: true,
             skipPreflight: true,
-            skipDuplicateGuard: true, // chain encadenado, no es duplicate
             chainNextMonths: resto,
           }),
         });

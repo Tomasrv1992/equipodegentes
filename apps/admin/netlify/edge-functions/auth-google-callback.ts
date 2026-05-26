@@ -274,10 +274,16 @@ export default async (request: Request, context: Context) => {
   // 8. Si el agente NO es facturacion, disparar primer run aquí (flow viejo).
   //    Si SÍ es facturacion, el primer run se dispara desde la edge function
   //    onboarding-save-fiscal-data después de que el cliente complete el wizard.
+  //
+  // FIX 2026-05-26: el operador estaba al revés (`===` en lugar de `!==`) —
+  // disparaba facturacion-background CADA vez que el cliente volvía del OAuth
+  // (incluido cuando reabría el link múltiples veces). Eso generaba 2-3
+  // dispatches paralelos al onboarding y rompía la indexación. Ahora respeta
+  // el comentario: solo dispara para agentes NO-facturacion (flow viejo).
   if (nextStep === "completed") {
     const mainSiteUrl = Netlify.env.get("MAIN_SITE_URL");
     const internalSecret = Netlify.env.get("FACTURACION_INTERNAL_SECRET");
-    if (mainSiteUrl && internalSecret && onboarding.agente_id === "facturacion") {
+    if (mainSiteUrl && internalSecret && onboarding.agente_id !== "facturacion") {
       try {
         const dispatchResp = await fetch(`${mainSiteUrl}/.netlify/functions/facturacion-background`, {
           method: "POST",
@@ -292,6 +298,8 @@ export default async (request: Request, context: Context) => {
       } catch (e: any) {
         console.warn(`[first-run] dispatch failed (no-fatal): ${e.message}`);
       }
+    } else if (onboarding.agente_id === "facturacion") {
+      console.log(`[first-run] skip dispatch — facturacion dispara desde save-fiscal-data, no desde auth-callback`);
     }
   }
 

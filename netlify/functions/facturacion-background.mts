@@ -112,6 +112,12 @@ interface RequestBody {
    * forzar un run (raramente útil).
    */
   skipOAuthGuard?: boolean;
+  /**
+   * Si true, skipea el guard anti-stampede (8s lookback). Útil para
+   * chain-next-month que dispara secuencialmente — el chain encadenado
+   * es legítimo.
+   */
+  skipDuplicateGuard?: boolean;
 }
 
 export default async (req: Request) => {
@@ -201,6 +207,52 @@ export default async (req: Request) => {
     credBefore = await loadCredentialsForBackground(body.customerId);
   }
   const wasFirstRun = !!(credBefore && !credBefore.first_run_done);
+
+  // 3.-1. GUARD anti-stampede V2 (2026-05-26 — segundo intento):
+  //
+  //   Lookback CORTO (8 seg). Si hay CUALQUIER run del cliente registrado
+  //   hace <8 seg, descartar nuevo dispatch silenciosamente.
+  //
+  //   Por qué 8 seg y no 60: con 60 seg se auto-bloqueaba en cron diario
+  //   legítimo. 8 seg solo bloquea stampedes (10 dispatches en 16 seg).
+  //
+  //   DEFENSIVE: try/catch con fail-OPEN. Si el query a BD falla, NO
+  //   bloqueamos — preferimos procesar duplicado a romper endpoint.
+  if (body.customerId && !body.skipDuplicateGuard) {
+    try {
+      const supaG = getServerClient();
+      const { data: cliG } = await supaG
+        .from("clientes")
+        .select("id")
+        .eq("slug", body.customerId)
+        .single();
+      if (cliG) {
+        const cutoff = new Date(Date.now() - 8_000).toISOString();
+        const { data: recG } = await supaG
+          .from("agent_runs")
+          .select("id")
+          .eq("cliente_id", (cliG as any).id)
+          .eq("agente_id", "facturacion")
+          .gte("started_at", cutoff)
+          .limit(1);
+        if (recG && recG.length > 0) {
+          console.log(JSON.stringify({
+            skipped: true,
+            reason: "stampede_protection_8s",
+            customerId: body.customerId,
+            existing_run: (recG[0] as any).id,
+          }));
+          return new Response(
+            JSON.stringify({ ok: true, skipped: true, reason: "stampede protection (<8s)" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+      }
+    } catch (e: any) {
+      // FAIL-OPEN: si guard falla, procesamos normal. Mejor duplicar que romper.
+      console.warn(`[stampede-guard] fail-open: ${e.message}`);
+    }
+  }
 
   // 3.0. GUARD anti-spam: si oauth_status NO está 'connected', skipear todo
   //   el run silenciosamente. Casos típicos:

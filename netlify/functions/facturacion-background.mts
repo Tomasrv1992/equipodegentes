@@ -238,11 +238,9 @@ export default async (req: Request) => {
           .gte("started_at", sinceCutoff)
           .order("started_at", { ascending: false })
           .limit(5);
-        // ANY recent run (running, ok, warn, fail) cuenta como duplicate dispatch.
-        // El run anterior pudo morir rápido en preflight (status='fail' en 40ms),
-        // y el siguiente dispatch en el mismo segundo TAMBIÉN es duplicado y no
-        // debe ejecutar. Anti-stampede total.
-        const reciente = (recientes ?? [])[0];
+        const reciente = (recientes ?? []).find(
+          (r: any) => r.status === "running" || r.status === "ok",
+        );
         if (reciente) {
           console.log(JSON.stringify({
             skipped: true,

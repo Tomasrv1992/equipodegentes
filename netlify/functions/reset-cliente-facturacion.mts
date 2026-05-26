@@ -62,7 +62,7 @@ export default async (req: Request) => {
       drive_folder_name: null,
       sheet_id: null,
       sheet_name: null,
-      google_refresh_token: null,
+      google_refresh_token_encrypted: null,
       updated_at: new Date().toISOString(),
     })
     .eq("cliente_id", clienteId)

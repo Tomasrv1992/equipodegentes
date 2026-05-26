@@ -52,6 +52,34 @@ export default async (req: Request) => {
     return new Response(JSON.stringify({ error: `delete events failed: ${delErr.message}` }), { status: 500 });
   }
 
+  // 1.5) Borrar consecutivo locks (resetea contador a 1 para próximo run)
+  //
+  //   Sin esto, el consecutivo asignado en Sheet/Drive arranca desde el
+  //   último número usado en runs anteriores (caso Dentilandia: empezó en
+  //   326 porque pruebas previas subieron el contador).
+  //
+  //   Tabla `invoice_consecutivo_locks` guarda { cliente_slug, tab_name,
+  //   next_consecutivo }. Al borrar las rows, RPC get_next_consecutivo
+  //   crea nueva entrada empezando en 1.
+  try {
+    await supa
+      .from("invoice_consecutivo_locks")
+      .delete()
+      .eq("cliente_slug", clienteSlug);
+  } catch (e: any) {
+    console.warn(`[reset] no se borraron consecutivo_locks (no-fatal): ${e.message}`);
+  }
+
+  // 1.6) Borrar dispatch_lock (liberar lock atómico si quedó tomado)
+  try {
+    await supa
+      .from("dispatch_locks")
+      .delete()
+      .eq("cliente_id", clienteId);
+  } catch (e: any) {
+    console.warn(`[reset] no se borró dispatch_lock (no-fatal): ${e.message}`);
+  }
+
   // 2) Resetear client_credentials
   const { error: updErr } = await supa
     .from("client_credentials")

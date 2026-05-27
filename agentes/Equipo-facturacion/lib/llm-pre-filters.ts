@@ -117,6 +117,15 @@ const NON_INVOICE_SUBJECT_KEYWORDS = [
   "reservation confirmed",
   "tu reserva",
   "booking confirmation",
+
+  // FIX 2026-05-27: bitácoras administrativas (caso Dentilandia)
+  // Las contadoras de las clínicas mandan "bitácoras" como Word/PDF — NO son
+  // facturas, son informes mensuales. Si el subject contiene "bitácora" en
+  // cualquier forma, skipear sin procesar.
+  "bitácora",
+  "bitacora",
+  "bitacora mes",
+  "bitácora mes",
 ];
 
 export function isLikelyNonInvoiceSubject(subject: string): boolean {

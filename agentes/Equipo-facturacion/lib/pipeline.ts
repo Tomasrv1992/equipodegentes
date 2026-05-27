@@ -2119,6 +2119,7 @@ async function processOne(
     return await processPlanilla(
       messageId, labelId, gmail, drive, sheets, g, planillas, subject, msg,
       loadSheetRows, pushToCache, getNextConsecutivo,
+      nitCliente, // FIX 2026-05-27: pasar nitCliente para filtrar planillas terceros
     );
   }
 
@@ -2390,6 +2391,7 @@ async function processPlanilla(
   loadSheetRows: (tabName: string) => Promise<any[][]>,
   pushToCache: (tabName: string, row: any[]) => void,
   getNextConsecutivo: (tabName: string) => Promise<number>,
+  nitCliente: string | null,
 ): Promise<ProcessOneResult> {
   const tmpPaths: string[] = [];
   try {
@@ -2400,6 +2402,37 @@ async function processPlanilla(
     const year = emailDate.getFullYear();
     const month = emailDate.getMonth() + 1;
     const fechaIso = `${year}-${String(month).padStart(2, "0")}-${String(emailDate.getDate()).padStart(2, "0")}`;
+
+    // 5. N° planilla del filename (típicamente "Autoliquidaciones_84333812_..." → 84333812)
+    //    MOVIDO ARRIBA porque ahora lo usamos para filtrar terceros ANTES de procesar.
+    const numeroPlanilla = (() => {
+      for (const p of planillas) {
+        const m = p.filename.match(/(\d{6,})/);
+        if (m) return m[1];
+      }
+      return "";
+    })();
+
+    // FIX 2026-05-27: SKIPEAR planillas SS de terceros (prestadores de servicios).
+    // Solo procesa si el número del titular (extraído del filename) coincide con
+    // el NIT del cliente. Caso típico Dentilandia (NIT 901117356) recibe:
+    //   - Planillas propias de empleados directos: numero=901117356 → PROCESA
+    //   - Planillas de freelancers (Tomás Ramirez 84333812): numero≠901117356 → SKIP
+    // Sin este filtro, las planillas de terceros se registran como gasto fantasma.
+    // Si nitCliente está null (cliente no configuró NIT), skip por defecto.
+    if (!nitCliente || numeroPlanilla !== nitCliente.replace(/\D+/g, "")) {
+      console.log(
+        `[processPlanilla] SKIP planilla SS de tercero: ` +
+        `numeroPlanilla=${numeroPlanilla}, nitCliente=${nitCliente ?? "null"}`,
+      );
+      // Marcar email como Procesado para no re-leerlo
+      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      return {
+        skip: true,
+        reason: `planilla-ss-tercero (titular ${numeroPlanilla} ≠ cliente ${nitCliente ?? "null"})`,
+        subject,
+      };
+    }
 
     // 2. Tab del mes + folder del mes
     const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
@@ -2416,15 +2449,6 @@ async function processPlanilla(
     //    Cuando hagamos OCR del PDF de planilla extraeremos el operador real
     //    (Aportes en Línea, SOI, etc).
     const proveedor = "Planilla Seguridad Social";
-
-    // 5. N° planilla del filename (típicamente "Autoliquidaciones_84333812_..." → 84333812)
-    const numeroPlanilla = (() => {
-      for (const p of planillas) {
-        const m = p.filename.match(/(\d{6,})/);
-        if (m) return m[1];
-      }
-      return "";
-    })();
 
     // 6. Subir PDFs al folder del mes con naming "{N}. {planilla#}. Planilla SS" + sub-índices
     // Bug C fix: usar numeroPlanilla como identificador único (mismo flow que facturas DIAN).

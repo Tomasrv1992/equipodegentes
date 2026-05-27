@@ -265,15 +265,23 @@ export default async (req: Request) => {
       }
     }
 
-    // 4. RENUMERAR Sheet del mes (consecutivos contiguos en col A)
-    // Re-leer Sheet después de borrar
-    const r2 = await sheets.spreadsheets.values.get({
-      spreadsheetId: fullCred.sheet_id,
-      range: `'${tabName}'!A2:A1000`,
-    });
-    const colA = r2.data.values || [];
-    const lastRow = colA.length;
-    if (lastRow > 0) {
+    // (renumeracion se hace abajo para TODOS los meses, no solo afectados)
+  }
+
+  // 4. RENUMERAR TODOS los meses con datos (consecutivos contiguos 1, 2, 3...)
+  // Aunque marzo no tenga events_borrados directamente, igual lo renumeramos
+  // por si el usuario borra filas manualmente del sheet despues, o si hay gaps
+  // pre-existentes.
+  for (const tabName of MES_TABS) {
+    try {
+      const r2 = await sheets.spreadsheets.values.get({
+        spreadsheetId: fullCred.sheet_id,
+        range: `'${tabName}'!A2:A1000`,
+      });
+      const colA = r2.data.values || [];
+      const lastRow = colA.length;
+      if (lastRow === 0) continue;
+
       const newValues: any[][] = [];
       for (let i = 0; i < lastRow; i++) {
         newValues.push([i + 1]);
@@ -293,6 +301,8 @@ export default async (req: Request) => {
           { cliente_slug: clienteSlug, tab_name: tabName, consecutivo: lastRow },
           { onConflict: "cliente_slug,tab_name" },
         );
+    } catch (e: any) {
+      reporte.errores.push(`renumerar ${tabName}: ${e.message}`);
     }
   }
 

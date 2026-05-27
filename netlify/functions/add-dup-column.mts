@@ -46,11 +46,40 @@ export default async (req: Request) => {
     ? monthsToProcess
     : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
+  // Primero, leer metadata de pestañas para identificar IDs y expandir a 16 cols
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: cred.sheet_id,
+    fields: "sheets(properties(sheetId,title,gridProperties))",
+  });
+  const sheetByTitle = new Map<string, any>();
+  for (const s of meta.data.sheets ?? []) {
+    if (s.properties?.title) sheetByTitle.set(s.properties.title, s.properties);
+  }
+
   const results: any[] = [];
   for (const m of monthsList) {
     if (m < 1 || m > 12) continue;
     const tab = MES_TABS[m - 1];
     try {
+      // Expandir grid a 16 columnas si está en 15
+      const props = sheetByTitle.get(tab);
+      if (props && (props.gridProperties?.columnCount ?? 0) < 16) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: cred.sheet_id,
+          requestBody: {
+            requests: [{
+              updateSheetProperties: {
+                properties: {
+                  sheetId: props.sheetId,
+                  gridProperties: { columnCount: 16 },
+                },
+                fields: "gridProperties.columnCount",
+              },
+            }],
+          },
+        });
+      }
+
       // Leer columna A para saber cuántas filas tienen datos
       const colA = await sheets.spreadsheets.values.get({
         spreadsheetId: cred.sheet_id,

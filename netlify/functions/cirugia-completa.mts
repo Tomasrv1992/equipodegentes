@@ -268,41 +268,148 @@ export default async (req: Request) => {
     // (renumeracion se hace abajo para TODOS los meses, no solo afectados)
   }
 
-  // 4. RENUMERAR TODOS los meses con datos (consecutivos contiguos 1, 2, 3...)
-  // Aunque marzo no tenga events_borrados directamente, igual lo renumeramos
-  // por si el usuario borra filas manualmente del sheet despues, o si hay gaps
-  // pre-existentes.
-  for (const tabName of MES_TABS) {
+  // 4. RENUMERAR + RENOMBRAR DRIVE + HUERFANOS por TODOS los meses
+  reporte.pdfs_huerfanos_movidos = 0;
+  reporte.pdfs_renombrados = 0;
+
+  for (let mIdx = 0; mIdx < 12; mIdx++) {
+    const tabName = MES_TABS[mIdx];
+    const mes = mIdx + 1;
+    const subfolderName = `2026-${String(mes).padStart(2, "0")}`;
+    const subfolderId = subfolderByName.get(subfolderName);
+
     try {
+      // Leer Sheet del mes
       const r2 = await sheets.spreadsheets.values.get({
         spreadsheetId: fullCred.sheet_id,
-        range: `'${tabName}'!A2:A1000`,
+        range: `'${tabName}'!A2:O1000`,
       });
-      const colA = r2.data.values || [];
-      const lastRow = colA.length;
-      if (lastRow === 0) continue;
+      const rowsSheet = r2.data.values || [];
+      // Filtrar solo filas con datos (numero en col E no vacío)
+      const filasConDatos = rowsSheet.filter((row) => row[4]);
+      if (filasConDatos.length === 0) continue;
 
-      const newValues: any[][] = [];
-      for (let i = 0; i < lastRow; i++) {
-        newValues.push([i + 1]);
-      }
+      // 4a. Renumerar col A
+      const newColA: any[][] = filasConDatos.map((_, i) => [i + 1]);
       await sheets.spreadsheets.values.update({
         spreadsheetId: fullCred.sheet_id,
-        range: `'${tabName}'!A2:A${lastRow + 1}`,
+        range: `'${tabName}'!A2:A${filasConDatos.length + 1}`,
         valueInputOption: "RAW",
-        requestBody: { values: newValues },
+        requestBody: { values: newColA },
       });
       reporte.meses_renumerados.push(tabName);
 
-      // Actualizar contador
+      // Actualizar counter
       await supa
         .from("invoice_consecutivo_locks")
         .upsert(
-          { cliente_slug: clienteSlug, tab_name: tabName, consecutivo: lastRow },
+          { cliente_slug: clienteSlug, tab_name: tabName, consecutivo: filasConDatos.length },
           { onConflict: "cliente_slug,tab_name" },
         );
+
+      // 4b. Renombrar PDFs Drive + mover huérfanos
+      if (subfolderId) {
+        // Listar todos los archivos en el subfolder
+        const filesInFolder = await drive.files.list({
+          q: `'${subfolderId}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'`,
+          fields: "files(id,name)",
+          pageSize: 1000,
+        });
+        const allFiles = filesInFolder.data.files ?? [];
+
+        // Mapear: numero → archivo Drive (PDF + XML por separado)
+        // El nombre típico: "{consec}. {numero}. {proveedor}.pdf" o "{consec}. {numero}.{idx}.{proveedor}.xml"
+        const numeroToFiles = new Map<string, Array<{ id: string; name: string }>>();
+        for (const f of allFiles) {
+          if (!f.id || !f.name) continue;
+          // Extraer el numero del nombre: "{consec}. {numero}..."
+          const match = f.name.match(/^\d+\.\s+([A-Z0-9-]+)\./i);
+          if (match) {
+            const numero = match[1];
+            if (!numeroToFiles.has(numero)) numeroToFiles.set(numero, []);
+            numeroToFiles.get(numero)!.push({ id: f.id, name: f.name });
+          }
+        }
+
+        // Identificar numeros que están en Sheet
+        const numerosEnSheet = new Set<string>();
+        for (const row of filasConDatos) {
+          const numero = String(row[4] ?? "");
+          if (numero) numerosEnSheet.add(numero);
+        }
+
+        // Crear/obtener subcarpeta _huerfanos
+        let huerfanosFolderId: string | null = null;
+        const huerfanosCheck = await drive.files.list({
+          q: `'${subfolderId}' in parents and name='_huerfanos' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+          fields: "files(id,name)",
+        });
+        if ((huerfanosCheck.data.files ?? []).length > 0) {
+          huerfanosFolderId = huerfanosCheck.data.files![0].id ?? null;
+        }
+
+        // Procesar cada archivo: si su numero NO está en Sheet → mover a huérfanos
+        for (const [numero, files] of numeroToFiles.entries()) {
+          if (!numerosEnSheet.has(numero)) {
+            // HUÉRFANO: mover a _huerfanos
+            if (!huerfanosFolderId) {
+              const newFolder = await drive.files.create({
+                requestBody: {
+                  name: "_huerfanos",
+                  mimeType: "application/vnd.google-apps.folder",
+                  parents: [subfolderId],
+                },
+                fields: "id",
+              });
+              huerfanosFolderId = newFolder.data.id ?? null;
+            }
+            for (const f of files) {
+              try {
+                await drive.files.update({
+                  fileId: f.id,
+                  addParents: huerfanosFolderId!,
+                  removeParents: subfolderId,
+                  fields: "id, parents",
+                });
+                reporte.pdfs_huerfanos_movidos++;
+              } catch (e: any) {
+                reporte.errores.push(`mover huerfano ${f.name}: ${e.message}`);
+              }
+            }
+          }
+        }
+
+        // Renombrar PDFs para que coincidan con nuevos consecutivos
+        // Mapear: numero (col E) → nuevo consecutivo
+        const numeroToConsec = new Map<string, number>();
+        for (let i = 0; i < filasConDatos.length; i++) {
+          const numero = String(filasConDatos[i][4] ?? "");
+          if (numero) numeroToConsec.set(numero, i + 1);
+        }
+
+        for (const [numero, files] of numeroToFiles.entries()) {
+          const nuevoConsec = numeroToConsec.get(numero);
+          if (!nuevoConsec) continue; // ya movido a huérfanos
+          for (const f of files) {
+            // Reemplazar consecutivo viejo (al inicio) por nuevo
+            const newName = f.name.replace(/^\d+\./, `${nuevoConsec}.`);
+            if (newName !== f.name) {
+              try {
+                await drive.files.update({
+                  fileId: f.id,
+                  requestBody: { name: newName },
+                  fields: "id",
+                });
+                reporte.pdfs_renombrados++;
+              } catch (e: any) {
+                reporte.errores.push(`renombrar ${f.name}: ${e.message}`);
+              }
+            }
+          }
+        }
+      }
     } catch (e: any) {
-      reporte.errores.push(`renumerar ${tabName}: ${e.message}`);
+      reporte.errores.push(`procesar ${tabName}: ${e.message}`);
     }
   }
 

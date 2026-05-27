@@ -229,12 +229,20 @@ export interface SkippedRow {
   messageId: string;
   motivo: string;
   asunto?: string;
+  /** From: header del email (para auditoría de descartes — pestaña "Descartes"). */
+  sender?: string | null;
+  /** Date: header del email parseado a ISO. Sirve para agrupar descartes por mes. */
+  fechaEmail?: string | null;
 }
 
 export interface ErrorRow {
   messageId: string;
   error: string;
   asunto?: string;
+  /** From: header del email — para reportar descartes con contexto. */
+  sender?: string | null;
+  /** Date: header del email parseado a ISO. */
+  fechaEmail?: string | null;
 }
 
 export interface PipelineResult {
@@ -567,9 +575,24 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
         if ("ok" in r && r.ok) {
           result.procesadas.push(r);
         } else if ("dup" in r && r.dup) {
-          result.repetidas.push({ messageId: e.id!, motivo: r.motivo, asunto: r.subject });
+          // Enriquecer con metadata (sender + fecha) para reporte de descartes.
+          const meta = await getMessageMetaLite(gmail, e.id!);
+          result.repetidas.push({
+            messageId: e.id!,
+            motivo: r.motivo,
+            asunto: r.subject,
+            sender: meta.sender,
+            fechaEmail: meta.fechaEmail,
+          });
         } else if ("skip" in r && r.skip) {
-          result.saltadas.push({ messageId: e.id!, motivo: r.reason, asunto: r.subject });
+          const meta = await getMessageMetaLite(gmail, e.id!);
+          result.saltadas.push({
+            messageId: e.id!,
+            motivo: r.reason,
+            asunto: r.subject,
+            sender: meta.sender,
+            fechaEmail: meta.fechaEmail,
+          });
         }
       } catch (err: any) {
         // CLASIFICACIÓN DE ERROR: muchos "errores" no son fallas del pipeline,
@@ -589,9 +612,23 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
           let motivo = "doc-no-procesable";
           if (msg.includes("password") || msg.includes("encrypted")) motivo = "pdf-encrypted";
           else if (msg.includes("sin texto")) motivo = "pdf-no-text";
-          result.saltadas.push({ messageId: e.id!, motivo, asunto: undefined });
+          const meta = await getMessageMetaLite(gmail, e.id!);
+          result.saltadas.push({
+            messageId: e.id!,
+            motivo,
+            asunto: meta.subject ?? undefined,
+            sender: meta.sender,
+            fechaEmail: meta.fechaEmail,
+          });
         } else {
-          result.errores.push({ messageId: e.id!, error: err.message });
+          const meta = await getMessageMetaLite(gmail, e.id!);
+          result.errores.push({
+            messageId: e.id!,
+            error: err.message,
+            asunto: meta.subject ?? undefined,
+            sender: meta.sender,
+            fechaEmail: meta.fechaEmail,
+          });
         }
       }
     }
@@ -1318,6 +1355,42 @@ async function findInvoiceEmails(gmail: any, query: string) {
 async function getMessageFull(gmail: any, messageId: string) {
   const res = await gmail.users.messages.get({ userId: "me", id: messageId, format: "full" });
   return res.data;
+}
+
+/**
+ * Light fetch: solo headers From, Subject, Date — sin bajar adjuntos.
+ * Usado por el worker cuando hay skip/dup, para enriquecer el reporte de
+ * descartes con sender/fecha del email (sino solo tenemos messageId).
+ * Cuesta 1 API call Gmail por descarte — aceptable (<5% del total típico).
+ */
+async function getMessageMetaLite(
+  gmail: any,
+  messageId: string,
+): Promise<{ sender: string | null; subject: string | null; fechaEmail: string | null }> {
+  try {
+    const res = await gmail.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "metadata",
+      metadataHeaders: ["From", "Subject", "Date"],
+    });
+    const headers: Array<{ name?: string; value?: string }> = res.data?.payload?.headers ?? [];
+    const get = (name: string) =>
+      headers.find((h) => (h.name ?? "").toLowerCase() === name.toLowerCase())?.value ?? null;
+    const dateHeader = get("Date");
+    let fechaIso: string | null = null;
+    if (dateHeader) {
+      const d = new Date(dateHeader);
+      if (!isNaN(d.getTime())) fechaIso = d.toISOString();
+    }
+    return {
+      sender: get("From"),
+      subject: get("Subject"),
+      fechaEmail: fechaIso,
+    };
+  } catch {
+    return { sender: null, subject: null, fechaEmail: null };
+  }
 }
 
 function getHeader(msg: any, name: string): string | null {

@@ -148,6 +148,101 @@ export async function emitFacturaEvents(input: EmitFacturaEventsInput): Promise<
 }
 
 /**
+ * Payload de un email descartado por el pipeline (no quedó en Sheet).
+ * Se inserta con tipo="email_descartado". Sirve para auditar la diferencia
+ * Gmail-label "Procesado" vs filas reales del Sheet.
+ *
+ * Motivos típicos: pre-filter-sender, pre-filter-subject, planilla-ss-tercero,
+ * docx-no-es-factura, pdf-no-es-factura, factura-invalida, no-es-factura-dian,
+ * dian-sin-numero, dup-en-sheet, guard-emergencia, pdf-encrypted, pdf-no-text.
+ */
+export interface EmailDescartadoPayload {
+  /** Gmail message ID — link directo: https://mail.google.com/mail/u/0/#all/{messageId} */
+  messageId: string;
+  /** Motivo del descarte. Texto libre pero estable (usado para agrupar). */
+  motivo: string;
+  /** From: header del email (limpio, sin chevrons). Puede ser null si no se pudo extraer. */
+  sender?: string | null;
+  /** Subject del email. */
+  subject?: string | null;
+  /** Fecha del email (header Date, ISO). Puede ser null si no se pudo parsear. */
+  fechaEmail?: string | null;
+  /** YYYY-MM derivado de fechaEmail (para agrupar por mes en endpoints). */
+  mes?: string | null;
+}
+
+export interface EmitEmailDescartadosInput {
+  runId: string;
+  clienteId: string;
+  agenteId: string;
+  descartes: EmailDescartadoPayload[];
+}
+
+/**
+ * Inserta agent_events con tipo="email_descartado" — uno por cada email que
+ * el pipeline rechazó. Idempotencia por (cliente_id, agente_id, messageId):
+ * si ya existe un descarte para ese messageId, lo ignora silencioso.
+ *
+ * No bloquea el run si falla: errores se loguean pero no se throw-ean.
+ */
+export async function emitEmailDescartadoEvents(input: EmitEmailDescartadosInput): Promise<void> {
+  if (input.descartes.length === 0) return;
+
+  const supa = getServerClient();
+  let okCount = 0;
+  let dupCount = 0;
+
+  for (const d of input.descartes) {
+    if (!d.messageId) continue;
+
+    // Derivar mes (YYYY-MM) desde fechaEmail si es parseable
+    let mes: string | null = d.mes ?? null;
+    if (!mes && d.fechaEmail) {
+      try {
+        const dt = new Date(d.fechaEmail);
+        if (!isNaN(dt.getTime())) {
+          mes = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}`;
+        }
+      } catch { /* mes queda null */ }
+    }
+
+    const payload = {
+      messageId: d.messageId,
+      motivo: String(d.motivo ?? "sin-motivo").slice(0, 200),
+      sender: d.sender ?? null,
+      subject: d.subject ?? null,
+      fechaEmail: d.fechaEmail ?? null,
+      mes,
+    };
+
+    const { error } = await supa.from("agent_events").insert({
+      run_id: input.runId,
+      cliente_id: input.clienteId,
+      agente_id: input.agenteId,
+      tipo: "email_descartado",
+      payload,
+    });
+
+    if (!error) {
+      okCount++;
+    } else if (
+      error.code === "23505" ||
+      /duplicate key|unique constraint/i.test(error.message)
+    ) {
+      dupCount++;
+    } else {
+      console.error(`emitEmailDescartado failed for ${d.messageId}: ${error.message}`);
+    }
+  }
+
+  if (okCount > 0 || dupCount > 0) {
+    console.log(
+      `[events:descartado] cliente=${input.clienteId}: ${okCount} inserted, ${dupCount} duplicates skipped`,
+    );
+  }
+}
+
+/**
  * Resuelve cliente_id desde slug (helper de conveniencia).
  * Devuelve null si no existe.
  */

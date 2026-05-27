@@ -19,8 +19,10 @@ import { markOAuthStatus } from "../../shared/agents-runtime/src/credentials";
 import { getServerClient } from "../../shared/agents-runtime/src/supabase-server";
 import {
   emitFacturaEvents,
+  emitEmailDescartadoEvents,
   clienteIdBySlug,
   type FacturaEventPayload,
+  type EmailDescartadoPayload,
 } from "../../shared/agents-runtime/src/agent-events";
 import {
   runPreflight,
@@ -719,6 +721,36 @@ export default async (req: Request) => {
             facturas,
           });
           console.log(`[events] cliente ${body.customerId}: ${facturas.length} facturas → agent_events`);
+        }
+
+        // 1b. Emit agent_events de descartes (saltadas + repetidas).
+        //     Permite auditoría completa: cada email del label Gmail tiene
+        //     resultado registrado (factura procesada o motivo de descarte).
+        //     Cuadra el gap Gmail-label vs Sheet con explicación por email.
+        const descartes: EmailDescartadoPayload[] = [
+          ...result.saltadas.map((s) => ({
+            messageId: s.messageId,
+            motivo: s.motivo,
+            sender: s.sender,
+            subject: s.asunto ?? null,
+            fechaEmail: s.fechaEmail,
+          })),
+          ...result.repetidas.map((s) => ({
+            messageId: s.messageId,
+            motivo: `dup: ${s.motivo}`,
+            sender: s.sender,
+            subject: s.asunto ?? null,
+            fechaEmail: s.fechaEmail,
+          })),
+        ];
+        if (descartes.length > 0) {
+          await emitEmailDescartadoEvents({
+            runId,
+            clienteId: clienteUuid,
+            agenteId: "facturacion",
+            descartes,
+          });
+          console.log(`[events] cliente ${body.customerId}: ${descartes.length} descartes → agent_events`);
         }
 
         // 2. Marcar first_run_done si terminó sin errores

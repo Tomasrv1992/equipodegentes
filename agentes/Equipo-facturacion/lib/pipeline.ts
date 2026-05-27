@@ -1144,10 +1144,15 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
 
   if (existing) {
     const existingCols = existing.properties?.gridProperties?.columnCount ?? 0;
-    if (existingCols === SHEET_HEADERS_COUNT) {
-      return tabName; // OK como está
+    // FIX 2026-05-27: tolerar columnas EXTRAS (>= SHEET_HEADERS_COUNT).
+    // Antes el código exigía == SHEET_HEADERS_COUNT y borraba la pestaña si
+    // tenía 16+ cols (caso real: usuario agregó columna "Veces Repetido"
+    // manualmente para detectar duplicados → borró 134 facturas de Abril).
+    // Ahora solo migra si tiene MENOS columnas que el esquema (legacy).
+    if (existingCols >= SHEET_HEADERS_COUNT) {
+      return tabName; // OK como está (puede tener cols extras del usuario)
     }
-    // Esquema viejo (12 o 16 cols) → DROP y recrear con esquema nuevo (15 cols).
+    // Esquema viejo (12 cols o menos) → DROP y recrear con esquema nuevo (15 cols).
     console.log(`[migrate-tab] ${tabName}: ${existingCols} cols → drop + recreate (${SHEET_HEADERS_COUNT} cols)`);
     try {
       await sheets.spreadsheets.batchUpdate({

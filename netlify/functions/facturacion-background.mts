@@ -834,6 +834,10 @@ export default async (req: Request) => {
             notifyMonthComplete: true,
             skipPreflight: true,
             chainNextMonths: resto,
+            // Lock del run anterior sigue activo hasta TTL 15min — el chain
+            // legítimo debe saltar el guard. Cualquier OTRO dispatch externo
+            // sigue bloqueado (porque NO lleva este flag).
+            skipDuplicateGuard: true,
           }),
         });
       } catch (e: any) {

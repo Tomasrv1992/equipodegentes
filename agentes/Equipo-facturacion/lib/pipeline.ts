@@ -287,7 +287,54 @@ interface LlmTracker {
   preFilteredOut: number;
 }
 
+/**
+ * Label viejo. Se mantiene para no re-procesar emails históricos que aún
+ * tienen este label (durante la ventana de migración a labels nuevos
+ * `Descartado/MOTIVO`). Después de migrar todo el histórico con el endpoint
+ * apply-labels-historico, se puede eliminar esta constante y la exclusión
+ * `-label:Procesado` del query Gmail.
+ */
 const PROCESSED_LABEL = "Procesado";
+
+/**
+ * Mapea un motivo (string libre que retorna el pipeline en skip/dup) a un
+ * nombre de label final tipo `Descartado/MOTIVO`. Categorización pensada para
+ * que Tomás pueda auditar visualmente desde Gmail por categoría.
+ */
+export function mapMotivoToLabel(motivo: string): string {
+  const m = motivo.toLowerCase();
+  if (m.startsWith("dup")) return "Descartado/Duplicado";
+  if (m.includes("planilla-ss-tercero")) return "Descartado/PlanillaSS-Tercero";
+  if (m === "no-es-factura-dian") return "Descartado/NotaCredito";
+  if (
+    m.includes("pdf-no-es-factura") ||
+    m.includes("docx-no-es-factura") ||
+    m.startsWith("pre-filter")
+  ) return "Descartado/NoFactura";
+  if (m.includes("self-emitted")) return "Descartado/AutoEmitida";
+  if (m.startsWith("fecha-año-anterior") || m.startsWith("fecha-ano-anterior")) {
+    return "Descartado/AnioAnterior";
+  }
+  if (
+    m.includes("encrypted") ||
+    m.includes("sin-texto") ||
+    m === "sin-zip" ||
+    m.startsWith("zip-sin-xml") ||
+    m.startsWith("zip-no-procesable") ||
+    m.includes("no-procesable")
+  ) return "Descartado/NoProcesable";
+  if (
+    m.startsWith("factura-invalida") ||
+    m.startsWith("docx-invalida") ||
+    m.includes("dian-sin-numero") ||
+    m.includes("pdf-invalido") ||
+    m.includes("confianza-baja") ||
+    m.startsWith("docx-confianza") ||
+    m.startsWith("pdf-confianza")
+  ) return "Descartado/Invalida";
+  // Fallback: cualquier motivo no mapeado va a Otro para revisar después
+  return "Descartado/Otro";
+}
 
 // ===== Entry point =====
 
@@ -332,7 +379,12 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     const isAbsoluteDate = /^\d{4}\/\d{2}\/\d{2}$/.test(window);
     dateFilter = isAbsoluteDate ? `after:${window}` : `newer_than:${window}`;
   }
-  const labelExclusion = force ? "" : "-label:Procesado ";
+  // Migración 2026-06: ahora cada email procesado lleva label `Facturas/YYYY-MM`
+  // (exitoso) o `Descartado/MOTIVO` (descartado). Excluimos los tres labels
+  // (Facturas, Descartado, Procesado-legacy) para no re-procesar emails ya tocados.
+  // El label `Procesado` se mantiene durante la ventana de migración hasta que
+  // el endpoint apply-labels-historico complete la re-etiquetación del histórico.
+  const labelExclusion = force ? "" : "-label:Procesado -label:Facturas -label:Descartado ";
   // Query: cubre todos los tipos de documentos que sub-pipelines pueden procesar
   // (DIAN ZIP, planillas SS, Word, PDFs). Filename incluye extensión sin punto.
   const searchQuery = `(filename:zip OR filename:pdf OR filename:docx OR filename:autoliquidaciones OR filename:comprobante) ${labelExclusion}${dateFilter}`;
@@ -1503,6 +1555,45 @@ async function markEmailProcessed(gmail: any, messageId: string, labelId: string
 }
 
 /**
+ * Aplica label `Descartado/MOTIVO` al email descartado + remueve INBOX (archiva).
+ * Reemplaza el viejo `markEmailProcessed` para emails que NO entraron al Sheet.
+ *
+ * Mantiene también el label `Procesado` (legacy) para no romper la query Gmail
+ * durante la ventana de migración. Después del cleanup endpoint, ese label se
+ * remueve.
+ */
+async function applyDescartadoLabel(
+  gmail: any,
+  messageId: string,
+  motivo: string,
+  processedLabelId: string,
+): Promise<void> {
+  const labelName = mapMotivoToLabel(motivo);
+  let descartadoLabelId: string;
+  try {
+    descartadoLabelId = await getOrCreateLabel(gmail, labelName);
+  } catch (e: any) {
+    // Si falla la creación del label, hacemos fallback al viejo markEmailProcessed
+    // (el email queda solo con "Procesado") — preferible a tirar el run.
+    console.warn(`[applyDescartadoLabel] no pude crear label ${labelName}: ${e.message}. Fallback a Procesado.`);
+    await markEmailProcessed(gmail, messageId, processedLabelId);
+    return;
+  }
+  try {
+    await gmail.users.messages.modify({
+      userId: "me",
+      id: messageId,
+      requestBody: {
+        addLabelIds: [descartadoLabelId, processedLabelId],
+        removeLabelIds: ["INBOX"],
+      },
+    });
+  } catch (e: any) {
+    console.warn(`[applyDescartadoLabel] modify falló para ${messageId} (${labelName}): ${e.message}`);
+  }
+}
+
+/**
  * Aplica un label "Facturas/YYYY-MM" al mensaje (lo crea si no existe) Y archiva
  * el correo (remueve INBOX). Gmail soporta labels anidados con `/` — quedan
  * agrupados visualmente bajo "Facturas/".
@@ -2202,7 +2293,7 @@ async function processOne(
     const { isLikelyNonInvoiceSender, isLikelyNonInvoiceSubject } = await import("./llm-pre-filters");
     if (isLikelyNonInvoiceSender(sender)) {
       llmTracker.preFilteredOut++;
-      await markEmailProcessed(gmail, messageId, labelId);
+      await applyDescartadoLabel(gmail, messageId, "pre-filter-sender", labelId);
       return {
         skip: true,
         reason: `pre-filter-sender (${sender.slice(0, 60)})`,
@@ -2211,7 +2302,7 @@ async function processOne(
     }
     if (isLikelyNonInvoiceSubject(subject)) {
       llmTracker.preFilteredOut++;
-      await markEmailProcessed(gmail, messageId, labelId);
+      await applyDescartadoLabel(gmail, messageId, "pre-filter-subject", labelId);
       return {
         skip: true,
         reason: `pre-filter-subject (${subject.slice(0, 60)})`,
@@ -2285,7 +2376,7 @@ async function processOne(
     // ZIP corrupto), marcamos el email como procesado y salimos. Sin numero
     // no podemos dedup → si re-procesamos el mismo email duplica fila.
     if (!data.numero || data.numero.trim() === "") {
-      await markEmailProcessed(gmail, messageId, labelId);
+      await applyDescartadoLabel(gmail, messageId, "dian-sin-numero", labelId);
       return {
         skip: true,
         reason: "dian-sin-numero (XML malformado o ZIP corrupto)",
@@ -2306,7 +2397,7 @@ async function processOne(
       proveedor: data.proveedor,
     });
     if (!validacion.esValida) {
-      await markEmailProcessed(gmail, messageId, labelId);
+      await applyDescartadoLabel(gmail, messageId, "factura-invalida", labelId);
       console.log(`[skip-validacion-dian] factura inválida: ${validacion.motivos.join("; ")}`);
       return {
         skip: true,
@@ -2325,7 +2416,7 @@ async function processOne(
     // Etiqueta el email para no re-procesarlo en runs futuros.
     const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
     if (year < minYear) {
-      await markEmailProcessed(gmail, messageId, labelId);
+      await applyDescartadoLabel(gmail, messageId, "fecha-año-anterior", labelId);
       return {
         skip: true,
         reason: `fecha-año-anterior (${data.fecha} < ${minYear})`,
@@ -2339,8 +2430,7 @@ async function processOne(
 
     const sheetRows = await loadSheetRows(tabName);
     if (isDuplicate(sheetRows, data.numero, data.nit, data.proveedor)) {
-      await markEmailProcessed(gmail, messageId, labelId);
-      await applyMonthLabel(gmail, messageId, year, month);
+      await applyDescartadoLabel(gmail, messageId, "dup-en-sheet", labelId);
       return { dup: true, motivo: `${data.proveedor} ${data.numero} (ya en ${tabName})`, subject };
     }
 
@@ -2420,9 +2510,8 @@ async function processOne(
     }
     const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, data.numero);
     if (!newRow) {
-      // Guard de emergencia detectó duplicado pre-append — marcar email y salir.
-      await markEmailProcessed(gmail, messageId, labelId);
-      await applyMonthLabel(gmail, messageId, year, month);
+      // Guard de emergencia detectó duplicado pre-append — marcar como dup y salir.
+      await applyDescartadoLabel(gmail, messageId, "dup-guard-emergencia", labelId);
       return { dup: true, motivo: `guard-emergencia: ${data.proveedor} ${data.numero}`, subject };
     }
     pushToCache(tabName, newRow);
@@ -2498,8 +2587,8 @@ async function processPlanilla(
         `[processPlanilla] SKIP planilla SS de tercero: ` +
         `numeroPlanilla=${numeroPlanilla}, nitCliente=${nitCliente ?? "null"}`,
       );
-      // Marcar email como Procesado para no re-leerlo
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      // Aplicar label Descartado/PlanillaSS-Tercero + archivar
+      await applyDescartadoLabel(gmail, messageId, "planilla-ss-tercero", labelProcesadoId);
       return {
         skip: true,
         reason: `planilla-ss-tercero (titular ${numeroPlanilla} ≠ cliente ${nitCliente ?? "null"})`,
@@ -2574,8 +2663,7 @@ async function processPlanilla(
     };
     const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, numeroPlanilla);
     if (!newRow) {
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
-      await applyMonthLabel(gmail, messageId, year, month);
+      await applyDescartadoLabel(gmail, messageId, "dup-guard-emergencia", labelProcesadoId);
       return { dup: true, motivo: `guard-emergencia: ${proveedor} ${numeroPlanilla}`, subject };
     }
     pushToCache(tabName, newRow);
@@ -2644,7 +2732,7 @@ async function processCuentaCobroDocx(
     const { hasInvoiceIndicators } = await import("./llm-pre-filters");
     if (!hasInvoiceIndicators(text)) {
       llmTracker.preFilteredOut++;
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyDescartadoLabel(gmail, messageId, "docx-no-es-factura", labelProcesadoId);
       return {
         skip: true,
         reason: "docx-sin-indicadores-factura",
@@ -2692,7 +2780,7 @@ async function processCuentaCobroDocx(
         proveedor: extracted.proveedor,
       });
       if (!v.esValida) {
-        await markEmailProcessed(gmail, messageId, labelProcesadoId);
+        await applyDescartadoLabel(gmail, messageId, "docx-invalida", labelProcesadoId);
         console.log(`[skip-validacion-docx] cuenta-cobro inválida: ${v.motivos.join("; ")}`);
         return {
           skip: true,
@@ -2708,7 +2796,7 @@ async function processCuentaCobroDocx(
     // El (b) es importante cuando el LLM no extrae el NIT pero sí el nombre.
     if (isSelfEmitted(extracted.proveedor, extracted.nit, nitCliente, nombreClienteNorm)) {
       console.log(`[skip-self-emitted-docx] proveedor="${extracted.proveedor}" nit="${extracted.nit}" → cliente=emisor`);
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyDescartadoLabel(gmail, messageId, "docx-self-emitted", labelProcesadoId);
       return { skip: true, reason: "docx-self-emitted (cliente es emisor)", subject };
     }
 
@@ -2720,7 +2808,7 @@ async function processCuentaCobroDocx(
     // Skip pre-año-actual (mismo guard que facturas DIAN)
     const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
     if (year < minYear) {
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyDescartadoLabel(gmail, messageId, "fecha-año-anterior", labelProcesadoId);
       return {
         skip: true,
         reason: `docx-fecha-año-anterior (${extracted.fecha} < ${minYear})`,
@@ -2736,8 +2824,7 @@ async function processCuentaCobroDocx(
     // 6. Dedup por NIT+número en el Sheet
     const sheetRows = await loadSheetRows(tabName);
     if (extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit, extracted.proveedor)) {
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
-      await applyMonthLabel(gmail, messageId, year, month);
+      await applyDescartadoLabel(gmail, messageId, "dup-en-sheet", labelProcesadoId);
       return {
         dup: true,
         motivo: `${extracted.proveedor} ${extracted.numero} (ya en ${tabName})`,
@@ -2782,8 +2869,7 @@ async function processCuentaCobroDocx(
     };
     const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, extracted.numero);
     if (!newRow) {
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
-      await applyMonthLabel(gmail, messageId, year, month);
+      await applyDescartadoLabel(gmail, messageId, "dup-guard-emergencia", labelProcesadoId);
       return { dup: true, motivo: `guard-emergencia: ${extracted.proveedor} ${extracted.numero}`, subject };
     }
     pushToCache(tabName, newRow);
@@ -2859,7 +2945,7 @@ async function processGenericPdf(
     const { hasInvoiceIndicators } = await import("./llm-pre-filters");
     if (!hasInvoiceIndicators(text)) {
       llmTracker.preFilteredOut++;
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyDescartadoLabel(gmail, messageId, "pdf-no-es-factura", labelProcesadoId);
       return {
         skip: true,
         reason: "pdf-sin-indicadores-factura",
@@ -2907,7 +2993,7 @@ async function processGenericPdf(
         proveedor: extracted.proveedor,
       });
       if (!v.esValida) {
-        await markEmailProcessed(gmail, messageId, labelProcesadoId);
+        await applyDescartadoLabel(gmail, messageId, "pdf-invalido", labelProcesadoId);
         console.log(`[skip-validacion-pdf] pdf inválido: ${v.motivos.join("; ")}`);
         return {
           skip: true,
@@ -2921,7 +3007,7 @@ async function processGenericPdf(
     // Doble check: NIT extraído O nombre del proveedor coinciden con el cliente.
     if (isSelfEmitted(extracted.proveedor, extracted.nit, nitCliente, nombreClienteNorm)) {
       console.log(`[skip-self-emitted-pdf] proveedor="${extracted.proveedor}" nit="${extracted.nit}" → cliente=emisor`);
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyDescartadoLabel(gmail, messageId, "pdf-self-emitted", labelProcesadoId);
       return { skip: true, reason: "pdf-self-emitted (cliente es emisor)", subject };
     }
 
@@ -2931,7 +3017,7 @@ async function processGenericPdf(
     const month = issue.getMonth() + 1;
     const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
     if (year < minYear) {
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
+      await applyDescartadoLabel(gmail, messageId, "fecha-año-anterior", labelProcesadoId);
       return {
         skip: true,
         reason: `pdf-fecha-año-anterior (${extracted.fecha} < ${minYear})`,
@@ -2947,8 +3033,7 @@ async function processGenericPdf(
     // 7. Dedup
     const sheetRows = await loadSheetRows(tabName);
     if (extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit, extracted.proveedor)) {
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
-      await applyMonthLabel(gmail, messageId, year, month);
+      await applyDescartadoLabel(gmail, messageId, "dup-en-sheet", labelProcesadoId);
       return {
         dup: true,
         motivo: `${extracted.proveedor} ${extracted.numero} (ya en ${tabName})`,
@@ -2995,8 +3080,7 @@ async function processGenericPdf(
     };
     const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, extracted.numero);
     if (!newRow) {
-      await markEmailProcessed(gmail, messageId, labelProcesadoId);
-      await applyMonthLabel(gmail, messageId, year, month);
+      await applyDescartadoLabel(gmail, messageId, "dup-guard-emergencia", labelProcesadoId);
       return { dup: true, motivo: `guard-emergencia: ${extracted.proveedor} ${extracted.numero}`, subject };
     }
     pushToCache(tabName, newRow);

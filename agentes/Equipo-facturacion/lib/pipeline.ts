@@ -356,12 +356,17 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     const isAbsoluteDate = /^\d{4}\/\d{2}\/\d{2}$/.test(window);
     dateFilter = isAbsoluteDate ? `after:${window}` : `newer_than:${window}`;
   }
-  // Migración 2026-06: ahora cada email procesado lleva label `Facturas/YYYY-MM`
-  // (exitoso) o `Descartado/MOTIVO` (descartado). Excluimos los tres labels
-  // (Facturas, Descartado, Procesado-legacy) para no re-procesar emails ya tocados.
-  // El label `Procesado` se mantiene durante la ventana de migración hasta que
-  // el endpoint apply-labels-historico complete la re-etiquetación del histórico.
-  const labelExclusion = force ? "" : "-label:Procesado -label:Facturas -label:Descartado ";
+  // Migración 2026-06-03: 2 labels por año (Facturas/YYYY + Descartado/YYYY).
+  //
+  // IMPORTANTE: Gmail `-label:Facturas` NO excluye sub-labels con `/`. Hay que
+  // referenciar el sub-label exacto: `-label:Facturas/2026`. Bug detectado
+  // 2026-06-03 — emails con Facturas/2026 fueron re-procesados (137 repetidas).
+  // Por compat también excluimos `Procesado` (label legacy aún presente en histórico
+  // de algunos clientes no migrados).
+  const currentYear = new Date().getFullYear();
+  const labelExclusion = force
+    ? ""
+    : `-label:Procesado -label:Facturas/${currentYear} -label:Descartado/${currentYear} -label:Facturas/${currentYear - 1} -label:Descartado/${currentYear - 1} `;
   // Query: cubre todos los tipos de documentos que sub-pipelines pueden procesar
   // (DIAN ZIP, planillas SS, Word, PDFs). Filename incluye extensión sin punto.
   const searchQuery = `(filename:zip OR filename:pdf OR filename:docx OR filename:autoliquidaciones OR filename:comprobante) ${labelExclusion}${dateFilter}`;

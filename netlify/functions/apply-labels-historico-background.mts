@@ -23,38 +23,17 @@ import { loadCredentials } from "../../shared/agents-runtime/src/credentials";
 // Mismo mapeo que pipeline.ts → mapMotivoToLabel.
 // (Duplicado intencional: el endpoint no debe depender del bundle del pipeline
 // para no arrastrar googleapis-heavy imports innecesarios.)
+// Solo 3 sub-labels (decisión 2026-06-03):
+//   Descartado/Duplicado / Descartado/NoFactura / Descartado/Revisar
 function mapMotivoToLabel(motivo: string): string {
   const m = String(motivo ?? "").toLowerCase();
   if (m.startsWith("dup")) return "Descartado/Duplicado";
-  if (m.includes("planilla-ss-tercero")) return "Descartado/PlanillaSS-Tercero";
-  if (m === "no-es-factura-dian") return "Descartado/NotaCredito";
   if (
     m.includes("pdf-no-es-factura") ||
     m.includes("docx-no-es-factura") ||
     m.startsWith("pre-filter")
   ) return "Descartado/NoFactura";
-  if (m.includes("self-emitted")) return "Descartado/AutoEmitida";
-  if (m.startsWith("fecha-año-anterior") || m.startsWith("fecha-ano-anterior")) {
-    return "Descartado/AnioAnterior";
-  }
-  if (
-    m.includes("encrypted") ||
-    m.includes("sin-texto") ||
-    m === "sin-zip" ||
-    m.startsWith("zip-sin-xml") ||
-    m.startsWith("zip-no-procesable") ||
-    m.includes("no-procesable")
-  ) return "Descartado/NoProcesable";
-  if (
-    m.startsWith("factura-invalida") ||
-    m.startsWith("docx-invalida") ||
-    m.includes("dian-sin-numero") ||
-    m.includes("pdf-invalido") ||
-    m.includes("confianza-baja") ||
-    m.startsWith("docx-confianza") ||
-    m.startsWith("pdf-confianza")
-  ) return "Descartado/Invalida";
-  return "Descartado/Otro";
+  return "Descartado/Revisar";
 }
 
 async function getOrCreateLabelCached(

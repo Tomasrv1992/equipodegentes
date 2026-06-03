@@ -298,42 +298,28 @@ const PROCESSED_LABEL = "Procesado";
 
 /**
  * Mapea un motivo (string libre que retorna el pipeline en skip/dup) a un
- * nombre de label final tipo `Descartado/MOTIVO`. Categorización pensada para
- * que Tomás pueda auditar visualmente desde Gmail por categoría.
+ * label final tipo `Descartado/MOTIVO`.
+ *
+ * Solo 3 sub-labels (decisión 2026-06-03):
+ *   - Duplicado  → ya estaba en Sheet (ruido normal del sistema, ~70% del volumen)
+ *   - NoFactura  → LLM rechazó como no-factura (acá pueden estar falsos positivos
+ *                  que el LLM se equivocó — revisar mensualmente)
+ *   - Revisar    → resto de descartes (planillas SS terceros, notas crédito,
+ *                  inválidas, no-procesables, año anterior, etc) — revisar
+ *                  mensualmente para detectar reglas mal aplicadas
+ *
+ * El motivo ESPECÍFICO de cada email vive en la pestaña "Descartes" del Sheet
+ * (campo payload.motivo en agent_events.email_descartado).
  */
 export function mapMotivoToLabel(motivo: string): string {
   const m = motivo.toLowerCase();
   if (m.startsWith("dup")) return "Descartado/Duplicado";
-  if (m.includes("planilla-ss-tercero")) return "Descartado/PlanillaSS-Tercero";
-  if (m === "no-es-factura-dian") return "Descartado/NotaCredito";
   if (
     m.includes("pdf-no-es-factura") ||
     m.includes("docx-no-es-factura") ||
     m.startsWith("pre-filter")
   ) return "Descartado/NoFactura";
-  if (m.includes("self-emitted")) return "Descartado/AutoEmitida";
-  if (m.startsWith("fecha-año-anterior") || m.startsWith("fecha-ano-anterior")) {
-    return "Descartado/AnioAnterior";
-  }
-  if (
-    m.includes("encrypted") ||
-    m.includes("sin-texto") ||
-    m === "sin-zip" ||
-    m.startsWith("zip-sin-xml") ||
-    m.startsWith("zip-no-procesable") ||
-    m.includes("no-procesable")
-  ) return "Descartado/NoProcesable";
-  if (
-    m.startsWith("factura-invalida") ||
-    m.startsWith("docx-invalida") ||
-    m.includes("dian-sin-numero") ||
-    m.includes("pdf-invalido") ||
-    m.includes("confianza-baja") ||
-    m.startsWith("docx-confianza") ||
-    m.startsWith("pdf-confianza")
-  ) return "Descartado/Invalida";
-  // Fallback: cualquier motivo no mapeado va a Otro para revisar después
-  return "Descartado/Otro";
+  return "Descartado/Revisar";
 }
 
 // ===== Entry point =====

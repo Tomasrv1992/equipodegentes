@@ -297,29 +297,20 @@ interface LlmTracker {
 const PROCESSED_LABEL = "Procesado";
 
 /**
- * Mapea un motivo (string libre que retorna el pipeline en skip/dup) a un
- * label final tipo `Descartado/MOTIVO`.
+ * Devuelve el label final de un email descartado: `Descartado/YYYY`.
  *
- * Solo 3 sub-labels (decisión 2026-06-03):
- *   - Duplicado  → ya estaba en Sheet (ruido normal del sistema, ~70% del volumen)
- *   - NoFactura  → LLM rechazó como no-factura (acá pueden estar falsos positivos
- *                  que el LLM se equivocó — revisar mensualmente)
- *   - Revisar    → resto de descartes (planillas SS terceros, notas crédito,
- *                  inválidas, no-procesables, año anterior, etc) — revisar
- *                  mensualmente para detectar reglas mal aplicadas
+ * Decisión 2026-06-03 (refinada): UN solo label por año, sin sub-categorías.
+ * Gmail queda con 2 labels finales (Facturas/YYYY + Descartado/YYYY).
  *
- * El motivo ESPECÍFICO de cada email vive en la pestaña "Descartes" del Sheet
- * (campo payload.motivo en agent_events.email_descartado).
+ * El motivo ESPECÍFICO del descarte (planilla-ss-tercero, pdf-no-es-factura,
+ * etc) vive en la pestaña "Descartes" del Sheet — Gmail es solo el archivo.
+ *
+ * Mantenemos firma con `motivo` para compat con código existente, pero hoy no
+ * se usa para diferenciar — solo logging.
  */
-export function mapMotivoToLabel(motivo: string): string {
-  const m = motivo.toLowerCase();
-  if (m.startsWith("dup")) return "Descartado/Duplicado";
-  if (
-    m.includes("pdf-no-es-factura") ||
-    m.includes("docx-no-es-factura") ||
-    m.startsWith("pre-filter")
-  ) return "Descartado/NoFactura";
-  return "Descartado/Revisar";
+export function mapMotivoToLabel(motivo: string, year?: number): string {
+  const y = year ?? new Date().getFullYear();
+  return `Descartado/${y}`;
 }
 
 // ===== Entry point =====
@@ -485,69 +476,19 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     }
   };
 
-  // ATOMIC COUNTER del consecutivo POR pestaña-mes.
+  // CONSECUTIVO ELIMINADO 2026-06-03.
   //
-  // Bug detectado 2026-05-15 (Freshco enero, ~50 filas duplicadas con mismo
-  // consecutivo): cuando 5 workers procesaban facturas del mismo proveedor en
-  // paralelo, todos leían el cache de sheetRows al mismo tiempo, calculaban
-  // maxN+1 igual, y todos asignaban el MISMO consecutivo a facturas distintas.
-  // Resultado: 5 filas en Sheet con #101 (números FEL distintos) y 5 PDFs en
-  // Drive llamados "1. Comercializadora...pdf" (mismo nombre, contenido distinto).
+  // Antes: contador atómico per-pestaña vía RPC Supabase get_next_consecutivo.
+  // Generó múltiples bugs en producción (race conditions, slugs con espacios,
+  // renumeración después de borrar filas, gaps en numeración). Cirugías recurrentes.
   //
-  // Fix: counter atómico en memoria. Cada worker que necesita un consecutivo
-  // llama getNextConsecutivo() — la operación read+increment es ATOMIC en JS
-  // single-thread entre awaits. Garantiza que cada worker recibe un valor único.
-  const mesConsecutivoCounter = new Map<string, number>();
-  const getNextConsecutivo = async (tabName: string): Promise<number> => {
-    // FIX 2026-05-26: usar cfg.clienteSlug (el slug real lowercase, sin espacios)
-    // en vez de cfg.nombreCliente (nombre con mayúsculas y espacios). El RPC
-    // get_next_consecutivo guarda rows por (cliente_slug, tab_name), y si el
-    // slug es "Dentilandia " (capital + espacio), un reset que busca
-    // "dentilandia" NO encuentra esos rows y el contador queda alto eternamente.
-    // Bug detectado en Dentilandia: consecutivos quedaron en 433-1630 incluso
-    // tras resets sucesivos porque el slug guardado tenía espacio al final.
-    const clienteSlug = (cfg.clienteSlug ?? cfg.nombreCliente ?? "unknown")
-      .toString()
-      .trim()
-      .toLowerCase();
-
-    // Intento 1: lock distribuido en Supabase (fuente de verdad entre chunks paralelos)
-    try {
-      const { getServerClient } = await import(
-        "../../../shared/agents-runtime/src/supabase-server"
-      );
-      const supa = getServerClient();
-
-      // Upsert atómico: si no existe la fila, la crea con el maxN del Sheet.
-      // Si existe, incrementa. El RPC garantiza atomicidad (no hay race condition).
-      const { data, error } = await supa.rpc("get_next_consecutivo", {
-        p_cliente_slug: clienteSlug,
-        p_tab_name: tabName,
-      });
-
-      if (!error && data != null) {
-        return data as number;
-      }
-      // Si falla el RPC, fallback al counter en memoria
-      console.warn(`[consecutivo] RPC falló (${error?.message}), usando counter en memoria`);
-    } catch (e: any) {
-      console.warn(`[consecutivo] Supabase no disponible (${e.message}), usando counter en memoria`);
-    }
-
-    // Fallback: counter en memoria (funciona dentro de un solo run)
-    if (!mesConsecutivoCounter.has(tabName)) {
-      const rows = await loadSheetRows(tabName);
-      let maxN = 0;
-      for (let i = 1; i < rows.length; i++) {
-        const v = parseInt(String(rows[i][0] ?? ""), 10);
-        if (!isNaN(v) && v > maxN) maxN = v;
-      }
-      mesConsecutivoCounter.set(tabName, maxN);
-    }
-    const next = (mesConsecutivoCounter.get(tabName) ?? 0) + 1;
-    mesConsecutivoCounter.set(tabName, next);
-    return next;
-  };
+  // Decisión: ya no usamos consecutivos. Cada fila del Sheet se identifica por
+  // (proveedor, numero, nit). El filename en Drive incluye numero DIAN — único.
+  // La col A del Sheet queda vacía en filas nuevas.
+  //
+  // getNextConsecutivo se mantiene como stub que devuelve 0 — el código que lo
+  // llama sigue funcionando pero el valor 0 no se usa en filename ni Sheet append.
+  const getNextConsecutivo = async (_tabName: string): Promise<number> => 0;
 
   const result: PipelineResult = { procesadas: [], errores: [], saltadas: [], repetidas: [] };
   const llmTracker: LlmTracker = { calls: 0, preFilteredOut: 0 };
@@ -708,16 +649,19 @@ const MES_TABS = [
  * garantiza unicidad sin importar cuántas veces se re-corra. Mantiene el
  * consecutivo al inicio para preservar orden visual en Drive.
  *
+ * Decisión 2026-06-03: SIN prefijo consec — el filename ya no depende del
+ * orden de procesamiento. El parámetro `n` se mantiene por compat pero se ignora.
+ *
  * Ejemplos:
- *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", "FEL428843")
- *     → "1. FEL428843. Seguros De Vida Suramericana"
- *   buildFileBaseName(1, "SEGUROS DE VIDA SURAMERICANA", "FEL428843", 1)
- *     → "1. FEL428843.1. Seguros De Vida Suramericana"  (XML idx 1)
- *   buildFileBaseName(1, "Sin Proveedor", null)        // sin numero DIAN
- *     → "1. Sin Proveedor"                              // fallback al viejo formato
+ *   buildFileBaseName(_, "SEGUROS DE VIDA SURAMERICANA", "FEL428843")
+ *     → "FEL428843. Seguros De Vida Suramericana"
+ *   buildFileBaseName(_, "SEGUROS DE VIDA SURAMERICANA", "FEL428843", 1)
+ *     → "FEL428843.1. Seguros De Vida Suramericana"  (XML idx 1)
+ *   buildFileBaseName(_, "Sin Proveedor", null)        // sin numero DIAN
+ *     → "Sin Proveedor"                                // proveedor sólo (raro)
  */
 function buildFileBaseName(
-  n: number,
+  _n: number,
   proveedor: string,
   numeroDIAN?: string | null,
   subIdx?: number,
@@ -736,15 +680,13 @@ function buildFileBaseName(
     : "";
 
   if (!numClean) {
-    // Fallback al formato viejo (cuando no hay numero DIAN — raro, casos
-    // donde el LLM no extrajo numero o son docs no-DIAN sin identificador).
-    const N = subIdx != null ? `${n}.${subIdx}` : `${n}`;
-    return `${N}. ${provClean}`;
+    // Sin numero DIAN: solo proveedor (raro — typically docs sin identificador único)
+    return subIdx != null ? `${provClean} (${subIdx})` : provClean;
   }
 
-  // Formato nuevo: {consecutivo}. {numeroDIAN}[.{subIdx}]. {Proveedor}
+  // Formato nuevo: {numeroDIAN}[.{subIdx}]. {Proveedor}
   const numPart = subIdx != null ? `${numClean}.${subIdx}` : numClean;
-  return `${n}. ${numPart}. ${provClean}`;
+  return `${numPart}. ${provClean}`;
 }
 
 // Headers: 15 columnas. Retenciones AHORA entre IVA y Total a Pagar (no al final).
@@ -1541,25 +1483,25 @@ async function markEmailProcessed(gmail: any, messageId: string, labelId: string
 }
 
 /**
- * Aplica label `Descartado/MOTIVO` al email descartado + remueve INBOX (archiva).
+ * Aplica label `Descartado/YYYY` al email descartado + remueve INBOX (archiva).
  * Reemplaza el viejo `markEmailProcessed` para emails que NO entraron al Sheet.
  *
- * Mantiene también el label `Procesado` (legacy) para no romper la query Gmail
- * durante la ventana de migración. Después del cleanup endpoint, ese label se
- * remueve.
+ * El label `Procesado` legacy se sigue aplicando durante la ventana de migración
+ * para no re-procesar emails históricos aún sin migrar.
  */
 async function applyDescartadoLabel(
   gmail: any,
   messageId: string,
   motivo: string,
   processedLabelId: string,
+  year?: number,
 ): Promise<void> {
-  const labelName = mapMotivoToLabel(motivo);
+  const labelName = mapMotivoToLabel(motivo, year);
   let descartadoLabelId: string;
   try {
     descartadoLabelId = await getOrCreateLabel(gmail, labelName);
   } catch (e: any) {
-    // Si falla la creación del label, hacemos fallback al viejo markEmailProcessed
+    // Si falla la creación del label, fallback al viejo markEmailProcessed
     // (el email queda solo con "Procesado") — preferible a tirar el run.
     console.warn(`[applyDescartadoLabel] no pude crear label ${labelName}: ${e.message}. Fallback a Procesado.`);
     await markEmailProcessed(gmail, messageId, processedLabelId);
@@ -1580,16 +1522,17 @@ async function applyDescartadoLabel(
 }
 
 /**
- * Aplica un label "Facturas/YYYY-MM" al mensaje (lo crea si no existe) Y archiva
+ * Aplica un label "Facturas/YYYY" al mensaje (lo crea si no existe) Y archiva
  * el correo (remueve INBOX). Gmail soporta labels anidados con `/` — quedan
  * agrupados visualmente bajo "Facturas/".
  *
- * Razón del archive: si la factura ya está organizada en su carpeta de mes,
- * no tiene sentido que siga ocupando espacio en la bandeja principal. Sigue
- * accesible vía el label.
+ * Decisión 2026-06-03: UN solo label por año (sin mes). Sheet tiene la pestaña
+ * mensual con todas las facturas — Gmail es solo el archivo del email.
+ *
+ * Mantiene firma con `month` para compat — no se usa.
  */
-async function applyMonthLabel(gmail: any, messageId: string, year: number, month: number) {
-  const labelName = `Facturas/${year}-${String(month).padStart(2, "0")}`;
+async function applyMonthLabel(gmail: any, messageId: string, year: number, _month?: number) {
+  const labelName = `Facturas/${year}`;
   const labelId = await getOrCreateLabel(gmail, labelName);
   await gmail.users.messages.modify({
     userId: "me",
@@ -2124,19 +2067,22 @@ async function appendToSheet(
   sheets: any,
   sheetId: string,
   tabRange: string,
-  consecutivo: number,
+  _consecutivo: number,
   d: ProcessedRow
 ): Promise<any[]> {
   // 15 cols: A=#, B=Fecha, C=Proveedor, D=NIT, E=#Documento, F=Subtotal,
   //          G=IVA, H=ReteFuente, I=ReteIVA, J=ReteICA, K=Total a Pagar,
   //          L=Concepto, M=Categoría, N=Cuenta PYG, O=Link PDF.
   // Total a Pagar = Subtotal + IVA - retenciones (lo que se paga REAL al proveedor).
+  //
+  // 2026-06-03: col A queda VACÍA (consecutivos eliminados — el filename Drive
+  // tiene numero DIAN único, el Sheet identifica filas por (proveedor, numero, nit)).
   const rtf = d.reteFuente ?? 0;
   const riva = d.reteIva ?? 0;
   const rica = d.reteIca ?? 0;
   const totalAPagar = (d.subtotal || 0) + (d.iva || 0) - rtf - riva - rica;
   const row = [
-    consecutivo, d.fecha, d.proveedor, d.nit, d.numero,           // A-E
+    "", d.fecha, d.proveedor, d.nit, d.numero,                      // A (vacío) - E
     d.subtotal, d.iva,                                              // F-G
     rtf, riva, rica,                                                // H-I-J
     totalAPagar,                                                    // K

@@ -24,7 +24,6 @@ Gmail API + Drive API + Sheets API
 | `scripts/procesar-facturas.ts` | CLI wrapper para corridas manuales. |
 | `scripts/setup-oauth.mjs` | One-time bootstrap del refresh token Google. |
 | `scripts/diagnostico-facturas.ts` | Snapshot del estado (filas Sheet, archivos Drive, labels Gmail). |
-| `scripts/crear-dashboard.ts` | One-time: crea pestaña "Dashboard" con métricas vivas en el Sheets. |
 | `.env.local.example` | Template de variables de entorno. |
 
 Las functions de Netlify viven en `../../netlify/functions/`:

@@ -52,6 +52,14 @@ interface ExtractionContext {
   nitCliente?: string | null;
   /** Nombre del cliente (para reforzar el filtro self-emitted). */
   nombreCliente?: string | null;
+  /**
+   * FIX 2026-06-09: si true, NO retornar null aunque LLM diga `es_factura:false`.
+   * Activado por el caller cuando el subject matchea pattern de cuenta de cobro
+   * conocido (CC Mayo 2026, documentación cuenta de cobro, SMB) — recupera
+   * falsos negativos del LLM. El extracted retorna con flag `_forced=true`
+   * para que el caller decida umbrales más laxos.
+   */
+  forceProcess?: boolean;
 }
 
 /**
@@ -111,10 +119,18 @@ export async function extractInvoiceFromText(
     const textBlock = resp.content.find((b: any) => b.type === "text");
     if (!textBlock || textBlock.type !== "text") return null;
 
-    const json = parseLlmJson(textBlock.text);
+    // FIX 2026-06-09: parseLlmJsonRaw NO descarta es_factura:false. La decisión
+    // de descartar la toma este caller según ctx.forceProcess.
+    const json = parseLlmJsonRaw(textBlock.text);
     if (!json) return null;
 
-    // Skip certificados de retención (no son facturas de compra)
+    // Si LLM dijo es_factura:false:
+    //   - forceProcess=false (default) → descartar (comportamiento original)
+    //   - forceProcess=true → continuar, marcar _forced para umbrales laxos
+    const llmSaidNo = json.es_factura === false;
+    if (llmSaidNo && !ctx.forceProcess) return null;
+
+    // Skip certificados de retención INCLUSO con forceProcess (riesgo demasiado alto).
     if (json.es_certificado_retencion === true) {
       console.log("[llm-extractor] skip: es certificado de retención");
       return null;
@@ -138,7 +154,7 @@ export async function extractInvoiceFromText(
       return null;
     }
 
-    return {
+    const result: ExtractedInvoice = {
       fecha: normalizeFecha(json.fecha, ctx.emailDate),
       proveedor: String(json.proveedor || "Sin nombre").trim(),
       nit: nitExtraido,
@@ -154,6 +170,13 @@ export async function extractInvoiceFromText(
       confianza: Math.min(1, Math.max(0, Number(json.confianza) || 0.7)),
       notas: json.notas ? String(json.notas).trim() : undefined,
     };
+    // FIX 2026-06-09: flag _forced cuando forceProcess rescató una extracción
+    // que LLM había marcado como no-factura. El caller usa esto para umbrales
+    // de confianza condicionales (0.2 si _forced, 0.4 default).
+    if (llmSaidNo && ctx.forceProcess) {
+      (result as any)._forced = true;
+    }
+    return result;
   } catch (err: any) {
     console.error("LLM extraction failed:", err.message);
     return null;
@@ -252,25 +275,25 @@ ${ctx.nitCliente ? `- Si el "nit" extraído coincide con el NIT del cliente (${c
 JSON:`;
 }
 
-/** Parsea JSON tolerante a wrappers de markdown (\`\`\`json ... \`\`\`). */
-function parseLlmJson(text: string): any | null {
+/**
+ * Parsea JSON tolerante a wrappers de markdown (\`\`\`json ... \`\`\`).
+ * FIX 2026-06-09: NO descarta `es_factura:false` — esa decisión la toma el
+ * caller `extractInvoiceFromText` según `ctx.forceProcess`.
+ */
+function parseLlmJsonRaw(text: string): any | null {
   // Quitar markdown fences si los hay
   let clean = text.trim();
   const fenceMatch = clean.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenceMatch) clean = fenceMatch[1].trim();
 
   try {
-    const parsed = JSON.parse(clean);
-    if (parsed.es_factura === false) return null;
-    return parsed;
+    return JSON.parse(clean);
   } catch {
     // Intentar extraer el primer bloque que parezca JSON
     const objMatch = clean.match(/\{[\s\S]*\}/);
     if (!objMatch) return null;
     try {
-      const parsed = JSON.parse(objMatch[0]);
-      if (parsed.es_factura === false) return null;
-      return parsed;
+      return JSON.parse(objMatch[0]);
     } catch {
       return null;
     }

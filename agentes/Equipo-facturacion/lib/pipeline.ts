@@ -862,8 +862,9 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["MES ACTUAL", "", "", "", "", ""],
     // Row 4: Mes
     ["Mes", `=PROPER(TEXT(TODAY();"mmmm yyyy"))`, "", "", "", ""],
-    // Row 5: Facturas
-    ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!A2:A1000"))`, "", "", "", ""],
+    // Row 5: Facturas (FIX 2026-06-09: col E = # Documento, no col A que quedó vacía
+    // al eliminar consecutivos. Col E está siempre llena en facturas exitosas.)
+    ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!E2:E1000"))`, "", "", "", ""],
     // Row 6: Monto (Total a Pagar = col K)
     ["Total a Pagar (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!K2:K1000"))`, "", "", "", ""],
     // Row 7: Tiempo
@@ -875,9 +876,11 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     // Row 10: headers
     ["Mes", "Facturas", "Total a Pagar (COP)", "", "", ""],
     // Row 11-22: 12 meses (Total a Pagar = col K)
+    // FIX 2026-06-09: col E (# Documento) en vez de A — col A queda vacía
+    // en filas nuevas desde 2026-06-03 (eliminamos consecutivos).
     ...MES_TABS.map((m) => [
       m,
-      `=COUNTA('${m}'!A2:A1000)`,
+      `=COUNTA('${m}'!E2:E1000)`,
       `=SUM('${m}'!K2:K1000)`,
       "", "", "",
     ]),
@@ -2400,11 +2403,9 @@ async function processOne(
       const uploaded = await uploadFile(drive, pdfPath, folderId, `${baseName}.pdf`, dianUniqueKey);
       driveLink = uploaded.webViewLink || "";
     }
-    for (let j = 0; j < xmlPaths.length; j++) {
-      const xmlName = buildFileBaseName(consecutivo, data.proveedor, identificadorUnico, j + 1);
-      const xmlUniqueKey = `${dianUniqueKey}:xml${j + 1}`;
-      await uploadFile(drive, xmlPaths[j], folderId, `${xmlName}.xml`, xmlUniqueKey);
-    }
+    // 2026-06-09: NO subir XMLs al Drive (causaban filenames "7764.1, 7764.2"
+    // que parecían consecutivos rotos). Los XMLs siguen disponibles en el ZIP
+    // del email Gmail original — si auditor los pide, se descargan de ahí.
 
     const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
     // Stub categoria en `data` para que el engine de retenciones pueda leerla
@@ -2685,7 +2686,7 @@ async function processCuentaCobroDocx(
     const sender = getHeader(msg, "From") || "";
     const dateHeader = getHeader(msg, "Date") || "";
     llmTracker.calls++;
-    const extracted = await extractInvoiceFromText({
+    let extracted = await extractInvoiceFromText({
       text,
       presumedType: "cuenta_cobro",
       filename: d.filename,
@@ -2695,10 +2696,36 @@ async function processCuentaCobroDocx(
       nitCliente,
       nombreCliente: nombreClienteNorm,
     });
+
+    // FIX 2026-06-09: fallback por subject — si LLM dijo "no es factura" pero
+    // el subject claramente indica cuenta de cobro real, reintentar con forceProcess.
+    // Recupera falsos negativos del LLM (CC Mayo 2026, Tatiana, SMB, etc).
+    if (!extracted) {
+      const subjLow = subject.toLowerCase();
+      const isCCSubject =
+        /cuenta\s*de\s*cobro/i.test(subjLow) ||
+        /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{4}/i.test(subjLow) ||
+        /documentaci[oó]n\s+cuenta\s*de\s*cobro/i.test(subjLow) ||
+        /^fwd:\s*documentaci[oó]n\s+smb/i.test(subjLow);
+      if (isCCSubject) {
+        console.log(`[cc-fallback] subject matchea CC pattern, reintentando con forceProcess: ${subject.slice(0, 60)}`);
+        llmTracker.calls++;
+        extracted = await extractInvoiceFromText({
+          text, presumedType: "cuenta_cobro", filename: d.filename,
+          sender, subject, emailDate: dateHeader, nitCliente,
+          nombreCliente: nombreClienteNorm, forceProcess: true,
+        });
+      }
+    }
+
     if (!extracted) {
       return { skip: true, reason: "docx-no-es-factura (LLM)", subject };
     }
-    if (extracted.confianza < 0.4) {
+
+    // Umbral CONDICIONAL (2026-06-09): 0.2 SOLO si _forced (fallback subject),
+    // 0.4 default. Falsos positivos requieren documento Y subject ambos engañosos.
+    const minConf = (extracted as any)._forced ? 0.2 : 0.4;
+    if (extracted.confianza < minConf) {
       return {
         skip: true,
         reason: `docx-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
@@ -2898,7 +2925,7 @@ async function processGenericPdf(
     // 4. LLM (con contexto del cliente para evitar self-emitted)
     const { extractInvoiceFromText } = await import("./llm-extractor");
     llmTracker.calls++;
-    const extracted = await extractInvoiceFromText({
+    let extracted = await extractInvoiceFromText({
       text,
       presumedType,
       filename: p.filename,
@@ -2908,10 +2935,31 @@ async function processGenericPdf(
       nitCliente,
       nombreCliente: nombreClienteNorm,
     });
+
+    // FIX 2026-06-09: fallback subject CC (mismo pattern que processCuentaCobroDocx).
+    if (!extracted) {
+      const subjLow = subject.toLowerCase();
+      const isCCSubject =
+        /cuenta\s*de\s*cobro/i.test(subjLow) ||
+        /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{4}/i.test(subjLow) ||
+        /documentaci[oó]n\s+cuenta\s*de\s*cobro/i.test(subjLow);
+      if (isCCSubject) {
+        console.log(`[pdf-cc-fallback] subject matchea CC, reintentando con forceProcess: ${subject.slice(0, 60)}`);
+        llmTracker.calls++;
+        extracted = await extractInvoiceFromText({
+          text, presumedType: "cuenta_cobro", filename: p.filename,
+          sender, subject, emailDate: dateHeader, nitCliente,
+          nombreCliente: nombreClienteNorm, forceProcess: true,
+        });
+      }
+    }
+
     if (!extracted) {
       return { skip: true, reason: `pdf-no-es-factura (LLM: ${presumedType})`, subject };
     }
-    if (extracted.confianza < 0.4) {
+    // Umbral condicional 0.2/0.4 según _forced
+    const minConfPdf = (extracted as any)._forced ? 0.2 : 0.4;
+    if (extracted.confianza < minConfPdf) {
       return {
         skip: true,
         reason: `pdf-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,

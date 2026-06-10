@@ -156,6 +156,50 @@ export async function emitFacturaEvents(input: EmitFacturaEventsInput): Promise<
 }
 
 /**
+ * Helper paginado para leer TODOS los events de un cliente / año / tipo.
+ *
+ * CRÍTICO 2026-06-09: NO usar LIMIT global. Para reconcile-labels y
+ * backfill-messageid necesitamos TODOS los events del año, no los primeros
+ * 1000. Esto recorre todas las páginas de 1000 hasta agotar resultados.
+ *
+ * Filtro temporal: por `created_at` (cuándo se procesó el email), no por
+ * `payload->>fecha` (fecha de emisión de la factura).
+ */
+export async function getAllEventsByYear(
+  clienteId: string,
+  tipo: "factura_procesada" | "email_descartado",
+  year: number,
+): Promise<Array<{ id: string; run_id: string | null; payload: any; created_at: string }>> {
+  const supa = getServerClient();
+  const yearStart = `${year}-01-01T00:00:00Z`;
+  const yearEnd = `${year + 1}-01-01T00:00:00Z`;
+  const PAGE = 1000;
+  const out: any[] = [];
+  let from = 0;
+  while (from < 200_000) {  // cap defensivo, ~200 páginas
+    const { data, error } = await supa
+      .from("agent_events")
+      .select("id, run_id, payload, created_at")
+      .eq("cliente_id", clienteId)
+      .eq("agente_id", "facturacion")
+      .eq("tipo", tipo)
+      .gte("created_at", yearStart)
+      .lt("created_at", yearEnd)
+      .order("created_at", { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error(`[getAllEventsByYear] error: ${error.message}`);
+      break;
+    }
+    const batch = (data ?? []) as any[];
+    out.push(...batch);
+    if (batch.length < PAGE) break;
+    from += PAGE;
+  }
+  return out;
+}
+
+/**
  * Payload de un email descartado por el pipeline (no quedó en Sheet).
  * Se inserta con tipo="email_descartado". Sirve para auditar la diferencia
  * Gmail-label "Procesado" vs filas reales del Sheet.

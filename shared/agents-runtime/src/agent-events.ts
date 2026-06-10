@@ -7,6 +7,14 @@ import { getServerClient } from "./supabase-server";
  */
 
 export interface FacturaEventPayload {
+  /**
+   * Gmail message ID que originó la factura. CRÍTICO para reconcile-labels
+   * determinístico (2026-06-09): sin esto los migradores de labels usaban
+   * heurísticas (numero/proveedor) que producían overlap. Cuentas históricas
+   * sin messageId existen — el reconciler tiene guarda de precedencia que
+   * NO toca emails sin messageId (no asume su estado).
+   */
+  messageId?: string;
   fecha: string;            // ISO YYYY-MM-DD (fecha de emisión de la factura, NO del run)
   proveedor: string;
   nit: string;

@@ -690,6 +690,8 @@ export default async (req: Request) => {
         // 1. Emit agent_events granulares (1 por factura procesada con su fecha REAL)
         if (result.procesadas.length > 0) {
           const facturas: FacturaEventPayload[] = result.procesadas.map((p) => ({
+            // FIX 2026-06-09: Gmail messageId para reconcile determinístico.
+            messageId: (p as any).messageId ?? undefined,
             fecha: p.fecha,           // YYYY-MM-DD de la factura, NO del run
             proveedor: p.proveedor,
             nit: p.nit,

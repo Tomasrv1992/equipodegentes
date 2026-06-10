@@ -157,6 +157,11 @@ export interface InvoiceData {
 }
 
 export interface ProcessedRow extends InvoiceData {
+  /**
+   * Gmail message ID que originó la factura. Necesario para reconcile-labels
+   * determinístico (2026-06-09). Se propaga al payload de agent_event.
+   */
+  messageId?: string;
   driveLink: string;
   subject: string;
   categoria: string;
@@ -2456,7 +2461,7 @@ async function processOne(
     await markEmailProcessed(gmail, messageId, labelId);
     await applyMonthLabel(gmail, messageId, year, month);
 
-    return { ok: true, ...row };
+    return { ok: true, ...row, messageId };
   } finally {
     // Cleanup garantizado de tmp paths (FIX: leak de /tmp en Netlify functions)
     cleanupTmp(tmpPaths);
@@ -2610,7 +2615,7 @@ async function processPlanilla(
     await markEmailProcessed(gmail, messageId, labelProcesadoId);
     await applyMonthLabel(gmail, messageId, year, month);
 
-    return { ok: true, ...row };
+    return { ok: true, ...row, messageId };
   } finally {
     cleanupTmp(tmpPaths);
   }
@@ -2844,7 +2849,7 @@ async function processCuentaCobroDocx(
 
     console.log(`[cuenta-cobro] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} (${extracted.moneda}) confianza=${extracted.confianza.toFixed(2)}`);
 
-    return { ok: true, ...row };
+    return { ok: true, ...row, messageId };
   } finally {
     cleanupTmp(tmpPaths);
   }
@@ -3076,7 +3081,7 @@ async function processGenericPdf(
 
     console.log(`[${presumedType}] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} ${extracted.moneda} confianza=${extracted.confianza.toFixed(2)}`);
 
-    return { ok: true, ...row };
+    return { ok: true, ...row, messageId };
   } finally {
     cleanupTmp(tmpPaths);
   }

@@ -12,15 +12,19 @@ export default async (req: Request) => {
   const body = await req.json();
   const clienteSlug = body.clienteSlug?.trim();
   const limit = Math.min(20, Number(body.limit) || 10);
+  const year = Number(body.year) || new Date().getFullYear();
 
   const supa = getServerClient();
   const { data: cli } = await supa.from("clientes").select("id").eq("slug", clienteSlug).single();
   if (!cli) return new Response("cliente not found", { status: 404 });
 
+  // Filtro año + LIMIT para evitar 504 cuando agent_runs creció (fix 2026-06-09).
   const { data, error } = await supa
     .from("agent_runs")
     .select("id, status, started_at, finished_at, duration_ms, summary, error_message, payload->procesadas, payload->errores, payload->saltadas, payload->repetidas, payload->preflight, triggered_by")
     .eq("cliente_id", (cli as any).id)
+    .gte("started_at", `${year}-01-01`)
+    .lt("started_at", `${year + 1}-01-01`)
     .order("started_at", { ascending: false })
     .limit(limit);
 

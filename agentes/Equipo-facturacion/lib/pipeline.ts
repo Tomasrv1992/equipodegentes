@@ -2423,6 +2423,13 @@ async function processOne(
     // 12 chars del messageId. Garantiza filename único + idempotencia.
     const identificadorUnico =
       data.numero || data.cufe || `m${messageId.slice(0, 12)}`;
+
+    // FIX 2026-06-11 (orden): aplicar override de nombre comercial ANTES de
+    // generar el filename Drive. Sino el filename queda con el nombre del XML
+    // (persona natural "Ruby Sulay") y el Sheet con el comercial — inconsistente.
+    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({ nit: data.nit, concepto: data.concepto });
+    if (proveedorDisplay) data.proveedor = proveedorDisplay;
+
     const baseName = buildFileBaseName(consecutivo, data.proveedor, identificadorUnico);
     // uniqueKey en Drive: CUFE > messageId. Garantiza dedupe de re-uploads.
     const dianUniqueKey = data.cufe ? `dian:${data.cufe}` : `gmail:${messageId}`;
@@ -2434,10 +2441,6 @@ async function processOne(
     // que parecían consecutivos rotos). Los XMLs siguen disponibles en el ZIP
     // del email Gmail original — si auditor los pide, se descargan de ahí.
 
-    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({ nit: data.nit, concepto: data.concepto });
-    // FIX 2026-06-11: si hay nombre comercial override (régimen simplificado),
-    // sobrescribir el nombre del XML con el comercial.
-    if (proveedorDisplay) data.proveedor = proveedorDisplay;
     // Stub categoria en `data` para que el engine de retenciones pueda leerla
     // cuando decide la tarifa RTF de oficio. ProcessedRow las setea explícitas abajo.
     data.categoria = categoria;
@@ -2831,6 +2834,14 @@ async function processCuentaCobroDocx(
     // 7. Consecutivo (counter atómico anti race condition)
     const consecutivo = await getNextConsecutivo(tabName);
 
+    // FIX 2026-06-11: aplicar override de nombre comercial ANTES del filename
+    // (sino Drive queda con persona natural y Sheet con comercial — inconsistente).
+    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({
+      nit: extracted.nit,
+      concepto: extracted.concepto,
+    });
+    if (proveedorDisplay) extracted.proveedor = proveedorDisplay;
+
     // 8. Subir el .docx al folder del mes
     // Bug C fix: incluir numero (extracted.numero) en filename para evitar
     // colisiones cuando un proveedor envía múltiples cuentas de cobro.
@@ -2842,12 +2853,6 @@ async function processCuentaCobroDocx(
     const driveLink = uploaded.webViewLink || "";
 
     // 9. Append al Sheet
-    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({
-      nit: extracted.nit,
-      concepto: extracted.concepto,
-    });
-    // FIX 2026-06-11: nombre comercial override (régimen simplificado)
-    if (proveedorDisplay) extracted.proveedor = proveedorDisplay;
     const row: ProcessedRow = {
       fecha: extracted.fecha,
       proveedor: extracted.proveedor,
@@ -3062,6 +3067,14 @@ async function processGenericPdf(
     // 8. Consecutivo (counter atómico anti race condition)
     const consecutivo = await getNextConsecutivo(tabName);
 
+    // FIX 2026-06-11: aplicar override de nombre comercial ANTES del filename
+    // (sino Drive queda con persona natural y Sheet con comercial — inconsistente).
+    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({
+      nit: extracted.nit,
+      concepto: extracted.concepto,
+    });
+    if (proveedorDisplay) extracted.proveedor = proveedorDisplay;
+
     // 9. Subir PDF a Drive
     // Bug C fix: incluir numero (extracted.numero) en filename para evitar
     // colisiones cuando un proveedor envía múltiples recibos en un mes.
@@ -3072,12 +3085,6 @@ async function processGenericPdf(
     const driveLink = uploaded.webViewLink || "";
 
     // 10. Append al Sheet — anota moneda en concepto si != COP
-    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({
-      nit: extracted.nit,
-      concepto: extracted.concepto,
-    });
-    // FIX 2026-06-11: nombre comercial override (régimen simplificado)
-    if (proveedorDisplay) extracted.proveedor = proveedorDisplay;
     const conceptoFinal = extracted.moneda !== "COP"
       ? `${extracted.concepto} [${extracted.moneda} ${extracted.total.toLocaleString("en-US")}]`
       : extracted.concepto;

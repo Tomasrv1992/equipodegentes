@@ -14,6 +14,13 @@ import path from "node:path";
 import { google } from "googleapis";
 import AdmZip from "adm-zip";
 import { XMLParser } from "fast-xml-parser";
+// Guarda de deduplicación a nivel BD (migración 0018). Primera línea de defensa
+// contra duplicación; degrada elegantemente si la tabla no existe o falla.
+import {
+  registrarFacturaUnica,
+  calcularDedupeKey,
+} from "../../../shared/agents-runtime/src/facturas-registro";
+import { clienteIdBySlug } from "../../../shared/agents-runtime/src/agent-events";
 
 // ===== Tipos =====
 
@@ -279,6 +286,13 @@ export interface PipelineResult {
   /** Repetidas: factura válida pero YA estaba en el Sheet (dedup contra cache). */
   repetidas: SkippedRow[];
   /**
+   * Bloqueadas por la guarda de BD (constraint UNIQUE en facturas_registro,
+   * migración 0018): facturas que un reproceso/bug/deploy zombie intentó duplicar
+   * y la BD frenó ANTES de escribir al Sheet/Drive. El background fn las emite
+   * como agent_event tipo 'duplicado_bloqueado_bd' (auditoría del incidente).
+   */
+  bloqueadasBd?: Array<{ messageId: string; dedupeKey: string }>;
+  /**
    * Estadísticas de uso del LLM en este run.
    * Permite trackear el costo por cliente desde el panel admin.
    */
@@ -523,8 +537,29 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // llama sigue funcionando pero el valor 0 no se usa en filename ni Sheet append.
   const getNextConsecutivo = async (_tabName: string): Promise<number> => 0;
 
-  const result: PipelineResult = { procesadas: [], errores: [], saltadas: [], repetidas: [] };
+  const result: PipelineResult = { procesadas: [], errores: [], saltadas: [], repetidas: [], bloqueadasBd: [] };
   const llmTracker: LlmTracker = { calls: 0, preFilteredOut: 0 };
+
+  // GUARDA DE BD (migración 0018): resolvemos el UUID del cliente UNA sola vez por
+  // run y se lo pasamos a processOne para el registro atómico anti-duplicación.
+  // Defensivo: si falla (owner legacy sin slug, o sin env vars de Supabase en CLI
+  // local) queda null → la guarda BD se desactiva y el run sigue como hoy.
+  let clienteUuid: string | null = null;
+  if (cfg.clienteSlug) {
+    try {
+      clienteUuid = await clienteIdBySlug(cfg.clienteSlug);
+      if (!clienteUuid) {
+        console.warn(
+          `[facturas_registro] slug "${cfg.clienteSlug}" sin UUID en clientes — guarda BD inactiva este run`,
+        );
+      }
+    } catch (e: any) {
+      console.warn(
+        `[facturas_registro] no pude resolver clienteUuid (${cfg.clienteSlug}): ${e?.message}. Guarda BD inactiva este run.`,
+      );
+      clienteUuid = null;
+    }
+  }
 
   // Contexto de retenciones para pasar a processOne (puede ser null si cliente
   // legacy sin reglas configuradas).
@@ -583,19 +618,30 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
           nitCliente,
           nombreClienteNorm,
           getNextConsecutivo,  // ← NUEVO: counter atómico per-mes
+          clienteUuid,         // ← guarda BD anti-duplicación (migración 0018)
         );
         if ("ok" in r && r.ok) {
           result.procesadas.push(r);
         } else if ("dup" in r && r.dup) {
-          // Enriquecer con metadata (sender + fecha) para reporte de descartes.
-          const meta = await getMessageMetaLite(gmail, e.id!);
-          result.repetidas.push({
-            messageId: e.id!,
-            motivo: r.motivo,
-            asunto: r.subject,
-            sender: meta.sender,
-            fechaEmail: meta.fechaEmail,
-          });
+          if (r.bloqueadaBd) {
+            // Duplicado FRENADO por la guarda de BD (constraint UNIQUE 0018).
+            // No va a `repetidas` (descarte normal): se emite como evento
+            // 'duplicado_bloqueado_bd' en el background fn para auditoría.
+            result.bloqueadasBd!.push({
+              messageId: e.id!,
+              dedupeKey: r.dedupeKey ?? "",
+            });
+          } else {
+            // Enriquecer con metadata (sender + fecha) para reporte de descartes.
+            const meta = await getMessageMetaLite(gmail, e.id!);
+            result.repetidas.push({
+              messageId: e.id!,
+              motivo: r.motivo,
+              asunto: r.subject,
+              sender: meta.sender,
+              fechaEmail: meta.fechaEmail,
+            });
+          }
         } else if ("skip" in r && r.skip) {
           const meta = await getMessageMetaLite(gmail, e.id!);
           result.saltadas.push({
@@ -2212,11 +2258,67 @@ async function safeAppendToSheet(
   return appendToSheet(sheets, sheetId, tabRange, consecutivo, d);
 }
 
+/**
+ * GUARDA DE BD (migración 0018) — primera línea de defensa contra duplicación.
+ *
+ * Intenta reclamar la factura en `facturas_registro` de forma atómica (constraint
+ * UNIQUE cliente_id+dedupe_key). Se llama en cada sub-pipeline ANTES de subir a
+ * Drive y de escribir al Sheet, de modo que un duplicado se frena sin efectos
+ * colaterales (ni Drive ni Sheet).
+ *
+ * Retorna:
+ *   - { bloqueada: false }            → seguir flujo normal (insertada, tabla no
+ *                                        existe, o cliente no resoluble).
+ *   - { bloqueada: true, dedupeKey }  → la BD YA tenía la factura: el caller no
+ *                                        escribe Sheet/Drive, aplica el label de
+ *                                        Gmail y marca el evento duplicado_bloqueado_bd.
+ *
+ * Si clienteUuid es null (owner legacy o slug no resuelto) la guarda queda
+ * inactiva y se sigue como antes (degradación elegante). registrarFacturaUnica
+ * nunca lanza, así que esta función tampoco rompe el pipeline.
+ */
+async function intentarRegistroBD(
+  clienteUuid: string | null,
+  messageId: string,
+  campos: {
+    cufe?: string | null;
+    numero?: string | null;
+    fecha?: string | null;
+    nit?: string | null;
+    total?: number | null;
+  },
+): Promise<{ bloqueada: false } | { bloqueada: true; dedupeKey: string }> {
+  if (!clienteUuid) return { bloqueada: false };
+  const dedupeKey = calcularDedupeKey({ cufe: campos.cufe, gmailMessageId: messageId });
+  const reg = await registrarFacturaUnica({
+    clienteId: clienteUuid,
+    dedupeKey,
+    cufe: campos.cufe ?? null,
+    gmailMessageId: messageId,
+    numeroDocumento: campos.numero ?? null,
+    fechaFactura: campos.fecha ?? null,
+    proveedorNit: campos.nit ?? null,
+    total: campos.total ?? null,
+    origen: "pipeline",
+  });
+  return reg === "duplicada" ? { bloqueada: true, dedupeKey } : { bloqueada: false };
+}
+
 // ===== Pipeline per email =====
 
 type ProcessOneResult =
   | (ProcessedRow & { ok: true })
-  | { dup: true; motivo: string; subject: string }
+  | {
+      dup: true;
+      motivo: string;
+      subject: string;
+      /** True si el duplicado lo frenó la guarda de BD (constraint UNIQUE 0018). */
+      bloqueadaBd?: boolean;
+      /** Clave que chocó con el constraint (presente solo si bloqueadaBd). */
+      dedupeKey?: string;
+      /** Gmail message id (presente solo si bloqueadaBd) — para el evento de auditoría. */
+      messageId?: string;
+    }
   | { skip: true; reason: string; subject: string };
 
 async function processOne(
@@ -2234,6 +2336,7 @@ async function processOne(
   nitCliente: string | null,
   nombreClienteNorm: string | null,
   getNextConsecutivo: (tabName: string) => Promise<number>,
+  clienteUuid: string | null,
 ): Promise<ProcessOneResult> {
   const msg = await getMessageFull(gmail, messageId);
   const subject = getHeader(msg, "Subject") || "(sin asunto)";
@@ -2251,6 +2354,7 @@ async function processOne(
       messageId, labelId, gmail, drive, sheets, g, planillas, subject, msg,
       loadSheetRows, pushToCache, getNextConsecutivo,
       nitCliente, // FIX 2026-05-27: pasar nitCliente para filtrar planillas terceros
+      clienteUuid, // guarda BD (migración 0018)
     );
   }
 
@@ -2285,6 +2389,7 @@ async function processOne(
       messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
       loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
       getNextConsecutivo,
+      clienteUuid, // guarda BD (migración 0018)
     );
   }
 
@@ -2298,6 +2403,7 @@ async function processOne(
         messageId, labelId, gmail, drive, sheets, g, genericPdfs, subject, msg,
         loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
         getNextConsecutivo,
+        clienteUuid, // guarda BD (migración 0018)
       );
     }
   }
@@ -2399,6 +2505,28 @@ async function processOne(
     if (isDuplicate(sheetRows, data.numero, data.nit, data.proveedor)) {
       await applyDescartadoLabel(gmail, messageId, "dup-en-sheet", labelId);
       return { dup: true, motivo: `${data.proveedor} ${data.numero} (ya en ${tabName})`, subject };
+    }
+
+    // GUARDA DE BD (migración 0018) — ANTES de subir a Drive y escribir al Sheet.
+    // dedupeKey DIAN = CUFE (o messageId si el XML no trae CUFE). Si la BD ya tenía
+    // la factura, la frenamos acá sin tocar Drive ni Sheet (segunda línea: safeAppend).
+    const regBD = await intentarRegistroBD(clienteUuid, messageId, {
+      cufe: data.cufe,
+      numero: data.numero,
+      fecha: data.fecha,
+      nit: data.nit,
+      total: data.total,
+    });
+    if (regBD.bloqueada) {
+      await applyDescartadoLabel(gmail, messageId, "dup-constraint-bd", labelId);
+      return {
+        dup: true,
+        motivo: "constraint_unique_bd",
+        subject,
+        bloqueadaBd: true,
+        dedupeKey: regBD.dedupeKey,
+        messageId,
+      };
     }
 
     // Consecutivo: counter atómico per-mes (anti race condition workers paralelos).
@@ -2525,6 +2653,7 @@ async function processPlanilla(
   pushToCache: (tabName: string, row: any[]) => void,
   getNextConsecutivo: (tabName: string) => Promise<number>,
   nitCliente: string | null,
+  clienteUuid: string | null,
 ): Promise<ProcessOneResult> {
   const tmpPaths: string[] = [];
   try {
@@ -2582,6 +2711,27 @@ async function processPlanilla(
     //    Cuando hagamos OCR del PDF de planilla extraeremos el operador real
     //    (Aportes en Línea, SOI, etc).
     const proveedor = "Planilla Seguridad Social";
+
+    // GUARDA DE BD (migración 0018) — antes de subir a Drive / escribir al Sheet.
+    // Planilla SS no tiene CUFE → dedupeKey = gmail messageId.
+    const regBD = await intentarRegistroBD(clienteUuid, messageId, {
+      cufe: null,
+      numero: numeroPlanilla,
+      fecha: fechaIso,
+      nit: null,
+      total: 0,
+    });
+    if (regBD.bloqueada) {
+      await applyDescartadoLabel(gmail, messageId, "dup-constraint-bd", labelProcesadoId);
+      return {
+        dup: true,
+        motivo: "constraint_unique_bd",
+        subject,
+        bloqueadaBd: true,
+        dedupeKey: regBD.dedupeKey,
+        messageId,
+      };
+    }
 
     // 6. Subir PDFs al folder del mes con naming "{N}. {planilla#}. Planilla SS" + sub-índices
     // Bug C fix: usar numeroPlanilla como identificador único (mismo flow que facturas DIAN).
@@ -2674,6 +2824,7 @@ async function processCuentaCobroDocx(
   nitCliente: string | null,
   nombreClienteNorm: string | null,
   getNextConsecutivo: (tabName: string) => Promise<number>,
+  clienteUuid: string | null,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -2831,6 +2982,27 @@ async function processCuentaCobroDocx(
       };
     }
 
+    // GUARDA DE BD (migración 0018) — antes de subir a Drive / escribir al Sheet.
+    // Cuenta de cobro no tiene CUFE → dedupeKey = gmail messageId.
+    const regBD = await intentarRegistroBD(clienteUuid, messageId, {
+      cufe: null,
+      numero: extracted.numero,
+      fecha: extracted.fecha,
+      nit: extracted.nit,
+      total: extracted.totalCop,
+    });
+    if (regBD.bloqueada) {
+      await applyDescartadoLabel(gmail, messageId, "dup-constraint-bd", labelProcesadoId);
+      return {
+        dup: true,
+        motivo: "constraint_unique_bd",
+        subject,
+        bloqueadaBd: true,
+        dedupeKey: regBD.dedupeKey,
+        messageId,
+      };
+    }
+
     // 7. Consecutivo (counter atómico anti race condition)
     const consecutivo = await getNextConsecutivo(tabName);
 
@@ -2917,6 +3089,7 @@ async function processGenericPdf(
   nitCliente: string | null,
   nombreClienteNorm: string | null,
   getNextConsecutivo: (tabName: string) => Promise<number>,
+  clienteUuid: string | null,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -3061,6 +3234,27 @@ async function processGenericPdf(
         dup: true,
         motivo: `${extracted.proveedor} ${extracted.numero} (ya en ${tabName})`,
         subject,
+      };
+    }
+
+    // GUARDA DE BD (migración 0018) — antes de subir a Drive / escribir al Sheet.
+    // Recibo PDF no-DIAN no tiene CUFE → dedupeKey = gmail messageId.
+    const regBD = await intentarRegistroBD(clienteUuid, messageId, {
+      cufe: null,
+      numero: extracted.numero,
+      fecha: extracted.fecha,
+      nit: extracted.nit,
+      total: extracted.totalCop,
+    });
+    if (regBD.bloqueada) {
+      await applyDescartadoLabel(gmail, messageId, "dup-constraint-bd", labelProcesadoId);
+      return {
+        dup: true,
+        motivo: "constraint_unique_bd",
+        subject,
+        bloqueadaBd: true,
+        dedupeKey: regBD.dedupeKey,
+        messageId,
       };
     }
 

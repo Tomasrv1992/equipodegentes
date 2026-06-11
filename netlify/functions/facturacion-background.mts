@@ -20,6 +20,7 @@ import { getServerClient } from "../../shared/agents-runtime/src/supabase-server
 import {
   emitFacturaEvents,
   emitEmailDescartadoEvents,
+  emitDuplicadoBloqueadoEvents,
   clienteIdBySlug,
   type FacturaEventPayload,
   type EmailDescartadoPayload,
@@ -636,6 +637,9 @@ export default async (req: Request) => {
           errores: result.errores.length,
           saltadas: result.saltadas.length,
           repetidas: result.repetidas.length,
+          // Duplicados frenados por la guarda de BD (constraint UNIQUE 0018).
+          // > 0 es señal de reproceso/deploy zombie intentando duplicar.
+          bloqueadas_bd: result.bloqueadasBd?.length ?? 0,
           // Tracking de uso LLM para visibilidad de costo por cliente/run
           llm_calls: result.llmStats?.calls ?? 0,
           llm_cost_usd: result.llmStats?.estimatedCostUsd ?? 0,
@@ -753,6 +757,26 @@ export default async (req: Request) => {
             descartes,
           });
           console.log(`[events] cliente ${body.customerId}: ${descartes.length} descartes → agent_events`);
+        }
+
+        // 1c. Emit agent_events de duplicados BLOQUEADOS por la guarda de BD
+        //     (constraint UNIQUE facturas_registro, migración 0018). Es la señal
+        //     de auditoría de que un reproceso/deploy zombie intentó duplicar una
+        //     factura ya procesada — el patrón exacto del incidente de mayo 2026.
+        if (result.bloqueadasBd && result.bloqueadasBd.length > 0) {
+          await emitDuplicadoBloqueadoEvents({
+            runId,
+            clienteId: clienteUuid,
+            agenteId: "facturacion",
+            bloqueadas: result.bloqueadasBd.map((b) => ({
+              messageId: b.messageId,
+              dedupeKey: b.dedupeKey,
+              motivo: "constraint_unique_bd",
+            })),
+          });
+          console.log(
+            `[events] cliente ${body.customerId}: ${result.bloqueadasBd.length} duplicados bloqueados por guarda BD → agent_events`,
+          );
         }
 
         // 2. Marcar first_run_done si terminó sin errores

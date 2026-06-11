@@ -80,6 +80,34 @@ export default async (req: Request) => {
     console.warn(`[reset] no se borró dispatch_lock (no-fatal): ${e.message}`);
   }
 
+  // 1.7) Borrar facturas_registro (guarda BD anti-duplicación, migración 0018).
+  //
+  //   CRÍTICO para reprocesar: si NO se borra, el reproceso post-reset vería
+  //   todas las facturas como 'duplicada' (constraint UNIQUE cliente_id+dedupe_key)
+  //   y la guarda bloquearía la reescritura del Sheet → el cliente quedaría con el
+  //   Sheet vacío. Al limpiar la tabla, el reproceso vuelve a registrarlas desde cero.
+  //
+  //   No-fatal: si la tabla aún no existe (migración 0018 sin aplicar en este
+  //   entorno), se ignora y el reset sigue normal (retrocompatible).
+  let facturasRegistroBorradas = 0;
+  try {
+    const { count: frBefore } = await supa
+      .from("facturas_registro")
+      .select("*", { count: "exact", head: true })
+      .eq("cliente_id", clienteId);
+    const { error: frErr } = await supa
+      .from("facturas_registro")
+      .delete()
+      .eq("cliente_id", clienteId);
+    if (frErr) {
+      console.warn(`[reset] no se borró facturas_registro (no-fatal): ${frErr.message}`);
+    } else {
+      facturasRegistroBorradas = frBefore ?? 0;
+    }
+  } catch (e: any) {
+    console.warn(`[reset] no se borró facturas_registro (no-fatal): ${e.message}`);
+  }
+
   // 2) Resetear client_credentials
   const { error: updErr } = await supa
     .from("client_credentials")
@@ -107,6 +135,7 @@ export default async (req: Request) => {
         cliente: (cli as any).slug,
         nombre: (cli as any).nombre,
         events_borrados: eventsBefore ?? 0,
+        facturas_registro_borradas: facturasRegistroBorradas,
         credenciales_reseteadas: true,
         siguiente_paso:
           "1) Borra Drive folder + Sheet en Google. 2) Borra label 'Procesado' en Gmail. 3) Crea link onboarding nuevo en /admin. 4) Cliente sigue el flow.",

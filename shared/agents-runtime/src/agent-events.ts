@@ -295,6 +295,70 @@ export async function emitEmailDescartadoEvents(input: EmitEmailDescartadosInput
 }
 
 /**
+ * Payload de un duplicado que la guarda de BD (constraint UNIQUE en
+ * facturas_registro, migración 0018) bloqueó ANTES de escribir al Sheet/Drive.
+ *
+ * Es una señal de auditoría: indica que un deploy zombie, un reproceso o un bug
+ * intentó registrar dos veces una factura ya procesada — exactamente el patrón
+ * del incidente de duplicación masiva de mayo 2026.
+ */
+export interface DuplicadoBloqueadoPayload {
+  /** Gmail message id del email cuyo documento fue bloqueado. */
+  messageId: string;
+  /** Clave de deduplicación que chocó con el constraint (CUFE o gmail message id). */
+  dedupeKey: string;
+  /** Motivo estable. Default 'constraint_unique_bd'. */
+  motivo?: string;
+}
+
+export interface EmitDuplicadoBloqueadoInput {
+  runId: string;
+  clienteId: string;
+  agenteId: string;
+  bloqueadas: DuplicadoBloqueadoPayload[];
+}
+
+/**
+ * Inserta un agent_event tipo "duplicado_bloqueado_bd" por cada factura que la
+ * guarda de BD bloqueó. No bloquea el run si falla: errores se loguean.
+ */
+export async function emitDuplicadoBloqueadoEvents(
+  input: EmitDuplicadoBloqueadoInput,
+): Promise<void> {
+  if (input.bloqueadas.length === 0) return;
+
+  const supa = getServerClient();
+  let okCount = 0;
+
+  for (const b of input.bloqueadas) {
+    if (!b.messageId) continue;
+    const payload = {
+      messageId: b.messageId,
+      dedupeKey: b.dedupeKey,
+      motivo: b.motivo ?? "constraint_unique_bd",
+    };
+    const { error } = await supa.from("agent_events").insert({
+      run_id: input.runId,
+      cliente_id: input.clienteId,
+      agente_id: input.agenteId,
+      tipo: "duplicado_bloqueado_bd",
+      payload,
+    });
+    if (!error) {
+      okCount++;
+    } else {
+      console.error(`emitDuplicadoBloqueado failed for ${b.messageId}: ${error.message}`);
+    }
+  }
+
+  if (okCount > 0) {
+    console.log(
+      `[events:bloqueado_bd] cliente=${input.clienteId}: ${okCount} duplicados bloqueados por guarda BD`,
+    );
+  }
+}
+
+/**
  * Resuelve cliente_id desde slug (helper de conveniencia).
  * Devuelve null si no existe.
  */

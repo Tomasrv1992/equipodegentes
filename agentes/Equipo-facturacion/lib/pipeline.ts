@@ -189,6 +189,14 @@ import reglasCategoria from "./categorizacion-reglas.json" with { type: "json" }
 
 interface ReglaCategoria {
   proveedor?: string;
+  /**
+   * Nombre comercial preferido (override del nombre del XML).
+   * Útil para proveedores en régimen simplificado donde el XML trae
+   * el nombre de la persona natural pero el comercio usa nombre fantasía.
+   * Ej: NIT 1040182652 — XML dice "Ruby Sulay Ramirez Lopez", display es
+   * "Laboratorio Dental Ramírez Ruby".
+   */
+  proveedor_display?: string;
   categoria: string;
   cuenta_pyg: string;
 }
@@ -199,15 +207,28 @@ interface ReglaKeyword {
 }
 
 /**
- * Asigna categoría + cuenta PYG a una factura.
+ * Asigna categoría + cuenta PYG + nombre commercial preferido (si existe).
  * Lookup: 1) por NIT exacto → 2) por keyword en concepto → 3) default.
+ *
+ * `proveedorDisplay` viene de `proveedor_display` de la regla por NIT. Si está
+ * presente, el caller debe SOBRESCRIBIR el nombre del proveedor del XML con
+ * este display name (útil para régimen simplificado: XML trae nombre persona
+ * natural, comercio usa nombre fantasía).
  */
-function categorizar(data: { nit: string; concepto: string }): { categoria: string; cuentaPyg: string } {
+function categorizar(data: { nit: string; concepto: string }): {
+  categoria: string;
+  cuentaPyg: string;
+  proveedorDisplay?: string;
+} {
   // 1. NIT exacto
   const nitNorm = String(data.nit || "").replace(/\D+/g, "");
   const reglasPorNit = (reglasCategoria as any).reglas_por_nit as Record<string, ReglaCategoria>;
   if (reglasPorNit[nitNorm]) {
-    return { categoria: reglasPorNit[nitNorm].categoria, cuentaPyg: reglasPorNit[nitNorm].cuenta_pyg };
+    return {
+      categoria: reglasPorNit[nitNorm].categoria,
+      cuentaPyg: reglasPorNit[nitNorm].cuenta_pyg,
+      proveedorDisplay: reglasPorNit[nitNorm].proveedor_display,
+    };
   }
 
   // 2. Keyword en concepto
@@ -2412,7 +2433,10 @@ async function processOne(
     // que parecían consecutivos rotos). Los XMLs siguen disponibles en el ZIP
     // del email Gmail original — si auditor los pide, se descargan de ahí.
 
-    const { categoria, cuentaPyg } = categorizar({ nit: data.nit, concepto: data.concepto });
+    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({ nit: data.nit, concepto: data.concepto });
+    // FIX 2026-06-11: si hay nombre comercial override (régimen simplificado),
+    // sobrescribir el nombre del XML con el comercial.
+    if (proveedorDisplay) data.proveedor = proveedorDisplay;
     // Stub categoria en `data` para que el engine de retenciones pueda leerla
     // cuando decide la tarifa RTF de oficio. ProcessedRow las setea explícitas abajo.
     data.categoria = categoria;
@@ -2707,9 +2731,12 @@ async function processCuentaCobroDocx(
     // Recupera falsos negativos del LLM (CC Mayo 2026, Tatiana, SMB, etc).
     if (!extracted) {
       const subjLow = subject.toLowerCase();
+      // FIX 2026-06-11: ampliado para incluir "nota de cobro" (mismo concepto que
+      // cuenta de cobro, terminología distinta) y variantes "MP", "Tatiana", "MAYO FIRMADA".
       const isCCSubject =
         /cuenta\s*de\s*cobro/i.test(subjLow) ||
-        /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{4}/i.test(subjLow) ||
+        /nota\s*de\s*cobro/i.test(subjLow) ||
+        /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)/i.test(subjLow) ||
         /documentaci[oó]n\s+cuenta\s*de\s*cobro/i.test(subjLow) ||
         /^fwd:\s*documentaci[oó]n\s+smb/i.test(subjLow);
       if (isCCSubject) {
@@ -2815,10 +2842,12 @@ async function processCuentaCobroDocx(
     const driveLink = uploaded.webViewLink || "";
 
     // 9. Append al Sheet
-    const { categoria, cuentaPyg } = categorizar({
+    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({
       nit: extracted.nit,
       concepto: extracted.concepto,
     });
+    // FIX 2026-06-11: nombre comercial override (régimen simplificado)
+    if (proveedorDisplay) extracted.proveedor = proveedorDisplay;
     const row: ProcessedRow = {
       fecha: extracted.fecha,
       proveedor: extracted.proveedor,
@@ -3044,10 +3073,12 @@ async function processGenericPdf(
     const driveLink = uploaded.webViewLink || "";
 
     // 10. Append al Sheet — anota moneda en concepto si != COP
-    const { categoria, cuentaPyg } = categorizar({
+    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({
       nit: extracted.nit,
       concepto: extracted.concepto,
     });
+    // FIX 2026-06-11: nombre comercial override (régimen simplificado)
+    if (proveedorDisplay) extracted.proveedor = proveedorDisplay;
     const conceptoFinal = extracted.moneda !== "COP"
       ? `${extracted.concepto} [${extracted.moneda} ${extracted.total.toLocaleString("en-US")}]`
       : extracted.concepto;

@@ -9,6 +9,7 @@
   },
 
   "reglas_por_nit": {
+    "1040182652": { "proveedor": "Ruby Sulay Ramirez Lopez (persona natural)", "proveedor_display": "Laboratorio Dental Ramírez Ruby", "categoria": "Laboratorio dental", "cuenta_pyg": "5135 - Servicios" },
     "900803892": { "proveedor": "PETROGREEN GROUP S.A.S", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
     "900356681": { "proveedor": "INVERSIONES TRUVE S.A.S.", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },
     "800077848": { "proveedor": "SERVICENTRO PALMAS S.A.S", "categoria": "Combustible y peajes", "cuenta_pyg": "5145 - Mantenimiento (vehículos)" },

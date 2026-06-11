@@ -390,9 +390,11 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
   // Por compat también excluimos `Procesado` (label legacy aún presente en histórico
   // de algunos clientes no migrados).
   const currentYear = new Date().getFullYear();
+  // 2026-06-11: eliminado `-label:Procesado` del query (label legacy removido).
+  // Solo excluimos Facturas/YYYY y Descartado/YYYY.
   const labelExclusion = force
     ? ""
-    : `-label:Procesado -label:Facturas/${currentYear} -label:Descartado/${currentYear} -label:Facturas/${currentYear - 1} -label:Descartado/${currentYear - 1} `;
+    : `-label:Facturas/${currentYear} -label:Descartado/${currentYear} -label:Facturas/${currentYear - 1} -label:Descartado/${currentYear - 1} `;
   // Query: cubre todos los tipos de documentos que sub-pipelines pueden procesar
   // (DIAN ZIP, planillas SS, Word, PDFs). Filename incluye extensión sin punto.
   const searchQuery = `(filename:zip OR filename:pdf OR filename:docx OR filename:autoliquidaciones OR filename:comprobante) ${labelExclusion}${dateFilter}`;
@@ -1520,14 +1522,15 @@ async function markEmailProcessed(gmail: any, messageId: string, labelId: string
  * Aplica label `Descartado/YYYY` al email descartado + remueve INBOX (archiva).
  * Reemplaza el viejo `markEmailProcessed` para emails que NO entraron al Sheet.
  *
- * El label `Procesado` legacy se sigue aplicando durante la ventana de migración
- * para no re-procesar emails históricos aún sin migrar.
+ * FIX 2026-06-11: ELIMINADO el label `Procesado` legacy. El query Gmail ya
+ * excluye `-label:Facturas/YYYY -label:Descartado/YYYY` — Procesado era
+ * redundante. processedLabelId se mantiene en la firma por compat pero se ignora.
  */
 async function applyDescartadoLabel(
   gmail: any,
   messageId: string,
   motivo: string,
-  processedLabelId: string,
+  _processedLabelId: string,  // legacy, ignorado
   year?: number,
 ): Promise<void> {
   const labelName = mapMotivoToLabel(motivo, year);
@@ -1535,10 +1538,8 @@ async function applyDescartadoLabel(
   try {
     descartadoLabelId = await getOrCreateLabel(gmail, labelName);
   } catch (e: any) {
-    // Si falla la creación del label, fallback al viejo markEmailProcessed
-    // (el email queda solo con "Procesado") — preferible a tirar el run.
-    console.warn(`[applyDescartadoLabel] no pude crear label ${labelName}: ${e.message}. Fallback a Procesado.`);
-    await markEmailProcessed(gmail, messageId, processedLabelId);
+    // Si falla la creación del label, no hacemos nada (no fallback a Procesado).
+    console.warn(`[applyDescartadoLabel] no pude crear label ${labelName}: ${e.message}. Email queda en INBOX.`);
     return;
   }
   try {
@@ -1546,7 +1547,7 @@ async function applyDescartadoLabel(
       userId: "me",
       id: messageId,
       requestBody: {
-        addLabelIds: [descartadoLabelId, processedLabelId],
+        addLabelIds: [descartadoLabelId],
         removeLabelIds: ["INBOX"],
       },
     });
@@ -2482,7 +2483,7 @@ async function processOne(
       return { dup: true, motivo: `guard-emergencia: ${data.proveedor} ${data.numero}`, subject };
     }
     pushToCache(tabName, newRow);
-    await markEmailProcessed(gmail, messageId, labelId);
+    // 2026-06-11: ya no aplicamos label "Procesado" (legacy). Solo Facturas/YYYY.
     await applyMonthLabel(gmail, messageId, year, month);
 
     return { ok: true, ...row, messageId };
@@ -2635,8 +2636,7 @@ async function processPlanilla(
     }
     pushToCache(tabName, newRow);
 
-    // 8. Labels: Procesado + Facturas/YYYY-MM (mismo flujo que facturas DIAN)
-    await markEmailProcessed(gmail, messageId, labelProcesadoId);
+    // 8. Labels: Facturas/YYYY (2026-06-11 eliminado Procesado legacy)
     await applyMonthLabel(gmail, messageId, year, month);
 
     return { ok: true, ...row, messageId };
@@ -2872,8 +2872,7 @@ async function processCuentaCobroDocx(
     }
     pushToCache(tabName, newRow);
 
-    // 10. Labels
-    await markEmailProcessed(gmail, messageId, labelProcesadoId);
+    // 10. Labels (2026-06-11 eliminado Procesado legacy)
     await applyMonthLabel(gmail, messageId, year, month);
 
     console.log(`[cuenta-cobro] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} (${extracted.moneda}) confianza=${extracted.confianza.toFixed(2)}`);
@@ -3106,8 +3105,7 @@ async function processGenericPdf(
     }
     pushToCache(tabName, newRow);
 
-    // 11. Labels
-    await markEmailProcessed(gmail, messageId, labelProcesadoId);
+    // 11. Labels (2026-06-11 eliminado Procesado legacy)
     await applyMonthLabel(gmail, messageId, year, month);
 
     console.log(`[${presumedType}] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} ${extracted.moneda} confianza=${extracted.confianza.toFixed(2)}`);

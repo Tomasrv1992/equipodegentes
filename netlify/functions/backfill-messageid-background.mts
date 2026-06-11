@@ -188,22 +188,42 @@ export default async (req: Request) => {
 
   // 4. dryRun → reporte completo
   if (dryRun) {
-    return new Response(
-      JSON.stringify({
-        ok: true,
-        dryRun: true,
-        cliente: clienteSlug,
+    // FIX 2026-06-11: como este endpoint es -background, Netlify NO devuelve el body
+    // al cliente curl. Guardamos el reporte en reconcile_dumps para que un endpoint
+    // sync (inspect-backfill-report) lo lea después. Usamos `kind` en before_state
+    // para distinguir backfill reports de reconcile dumps.
+    const crypto = await import("node:crypto");
+    const reportId = crypto.randomUUID();
+    const report = {
+      kind: "backfill_dryrun_report",
+      ok: true,
+      dryRun: true,
+      cliente: clienteSlug,
+      year,
+      total_candidatos: candidatos.length,
+      total_events_sin_messageid: sinMessageId.length,
+      matches_count: matches.length,
+      sample_matches: matches.slice(0, 30),
+      near_misses_count: nearMisses.length,
+      sample_near_misses: nearMisses.slice(0, 30),
+      cobertura_porcentaje: sinMessageId.length
+        ? Math.round((matches.length / sinMessageId.length) * 100)
+        : 0,
+      timestamp: new Date().toISOString(),
+    };
+    try {
+      await supa.from("reconcile_dumps").insert({
+        id: reportId,
+        cliente_id: clienteId,
         year,
-        total_candidatos: candidatos.length,
-        total_events_sin_messageid: sinMessageId.length,
-        matches_count: matches.length,
-        sample_matches: matches.slice(0, 30),
-        near_misses_count: nearMisses.length,
-        sample_near_misses: nearMisses.slice(0, 30),
-        cobertura_porcentaje: sinMessageId.length
-          ? Math.round((matches.length / sinMessageId.length) * 100)
-          : 0,
-      }, null, 2),
+        before_state: report,
+      });
+      console.log(`[backfill] dryRun report saved id=${reportId}`);
+    } catch (e: any) {
+      console.error(`[backfill] no pude guardar report: ${e.message}`);
+    }
+    return new Response(
+      JSON.stringify(report, null, 2),
       { headers: { "content-type": "application/json" } },
     );
   }

@@ -1,62 +1,59 @@
-# Reporte — sesión autónoma 2026-06-11
+# Reporte — sesión 2026-06-11
 
-> Trabajo realizado sin supervisión, bajo las reglas: commit local permitido si `tsc`+`vitest` pasan, nunca `push`, nunca tocar credenciales/.env, nunca borrar archivos, y ante ambigüedad elegir lo más conservador y seguir.
+> Reglas vigentes: commit local permitido si `tsc --noEmit` (exit 0) y `vitest run` (todo verde); nunca `push`; nunca tocar credenciales/.env; ante ambigüedad, lo más conservador y seguir.
 
 ## TL;DR
 
-- ✅ **TAREA 3** completada: lista de candidatos a limpieza en `docs/LIMPIEZA-CANDIDATOS.md` (commit `5d93f5b`).
-- ⛔ **TAREA 1 y TAREA 2 NO ejecutadas**: en tu mensaje, el contenido de ambas quedó como placeholder sin pegar (`[pegá aquí el PROMPT 1B...]` / `[pegá aquí el PROMPT 2...]`). No tengo las instrucciones reales, así que no las ejecuté (decisión conservadora).
-- 🔄 **Reversión importante**: revertí un borrado de archivos que había hecho en el turno anterior (ver más abajo).
-- 🚫 Nada se pusheó. Todo es local.
+- ✅ **Limpieza ejecutada** (cuando la aprobaste explícitamente) en 3 commits: `a7c67fd`, `2fc2f15`, `1a38c11`.
+- ✅ **TAREA 1 (conciliación Gmail↔BD↔Sheet↔Drive)** completada: commit `7393ae8`.
+- ✅ **TAREA 3 (lista de candidatos)** en `docs/LIMPIEZA-CANDIDATOS.md`: commit `5d93f5b`.
+- ⛔ **TAREA 2 (partir `pipeline.ts`)**: NO ejecutada — su prompt nunca se pegó y es alto riesgo sin tests de caracterización (ver abajo).
+- 🚫 Nada pusheado. Todo local en `main`.
+
+---
+
+## Commits de esta sesión (orden cronológico)
+
+| Hash | Qué |
+|---|---|
+| `8a51a33` | `feat(facturacion): dedup de facturas a nivel BD (migración 0018)` — aprobado explícitamente antes. |
+| `5d93f5b` | `docs(limpieza): listado de candidatos a eliminar` — TAREA 3. |
+| `a7c67fd` | `chore(cleanup): eliminar agentes legacy ... (Grupo 1)` — 5 agentes + 6 funciones (−4662). |
+| `2fc2f15` | `chore(cleanup): eliminar edge function admin-reparador-trigger-cliente (Grupo 2)` — + edición `netlify.toml` admin. |
+| `1a38c11` | `chore(cleanup): borrar PLAYBOOK-AGENTES.md + fix rutas package.json (Grupo 3)`. |
+| `7393ae8` | `feat: conciliacion gmail-bd-sheet-drive` — TAREA 1. |
+
+`tsc --noEmit` (exit 0) + `vitest run` (53 tests verdes) verificados **después de cada commit** de código.
 
 ---
 
 ## Decisiones que tomé solo
 
-### 1. Revertí los borrados de limpieza del turno anterior
-Justo antes de tu mensaje autónomo, yo estaba **ejecutando la limpieza que habías aprobado** (Grupos 1+2+3): ya había borrado 5 carpetas de agentes, 6 funciones netlify, 1 edge function y `PLAYBOOK-AGENTES.md`, y editado `netlify.toml`/`package.json` (todo sin commitear).
+1. **Reversión y luego ejecución de la limpieza.** Tu mensaje "sesión autónoma" llegó *mientras* yo ejecutaba el borrado que habías aprobado un turno antes, y decía "NUNCA borres / SOLO LISTA". Lo más conservador era deshacer: hice `git restore` y dejé la limpieza como documento (`5d93f5b`). Después me pediste **explícitamente** ejecutarla en 3 commits, y ahí sí la apliqué (`a7c67fd`, `2fc2f15`, `1a38c11`), verificando `tsc`+`vitest` tras cada uno.
 
-Tu mensaje nuevo dijo **"NUNCA borres archivos"** y **"TAREA 3 — SOLO LISTA, NO BORRAR — la decisión es mía"**. Eso recategoriza la limpieza. Como tu instrucción más reciente manda y es la más conservadora, **deshice todos esos borrados** con `git restore .` (el repo volvió al commit `8a51a33`). Verifiqué que los 5 agentes y 6 funciones quedaron restaurados y que `tsc`+`vitest` siguen verdes.
+2. **Conciliación — fecha de recepción vs emisión.** Gmail no conoce la fecha de emisión de la factura, así que filtra por **fecha de recepción** del email; BD/Sheet/Drive agrupan por **fecha de emisión**. Las facturas de borde de mes pueden aparecer como discrepancia. Está documentado en el header del endpoint y en las `notas` del reporte. No introduje heurísticas para "adivinar" — la conciliación es 100% determinística.
 
-**Resultado:** no se borró ningún archivo en esta sesión. La limpieza quedó como documento de decisión para vos.
+3. **Drive por conjunto solo si el parseo cubre el 100%.** El número se parsea del filename (`"{numero}. {Proveedor}.pdf"` → substring antes del primer `". "`). Si algún PDF no es parseable, Drive se concilia **solo por conteo** (`diferencia_drive`) para no generar falsos positivos; el reporte informa cuántos PDFs no se pudieron parsear.
 
-### 2. No ejecuté TAREA 1 (Conciliación)
-El cuerpo era el placeholder `[pegá aquí el PROMPT 1B completo...]`. No sé qué conciliar, sobre qué cliente, ni el formato de salida esperado. Ejecutar algo inventado no aporta. **Pendiente de que pegues el PROMPT 1B real.**
+4. **`agent_event` requiere un `agent_run` (FK).** Para emitir `conciliacion_ejecutada` (PASO 3, único write permitido) creo un `agent_run` sintético, igual que los `backfill-*` del repo. Es un write de auditoría inseparable del evento; no toca datos de facturas. Lo anoto por transparencia.
 
-### 3. No ejecuté TAREA 2 (Partir pipeline.ts)
-Dos motivos:
-1. El cuerpo era el placeholder `[pegá aquí el PROMPT 2 completo...]` — no tengo el plan detallado de módulos/orden.
-2. Aunque tuviera el plan, es un refactor de **alto riesgo** y elegí lo conservador: `pipeline.ts` (3.182 líneas) es el corazón de facturación **en producción**, y la suite de tests actual (`dedupe-key`, `reconcile-decide`, `retenciones-engine`, `slugify`, `record-run`) **no cubre** el grueso de ese archivo (gmail/sheet/drive/sub-pipelines). Un refactor "cero cambios de comportamiento" **no sería verificable** con los tests existentes — `tsc` solo valida tipos, no comportamiento. Con vos ausente, una regresión silenciosa quedaría sin detectar.
-
-**Recomendación:** antes de partir `pipeline.ts`, agregar tests de caracterización (parseInvoiceXml, isDuplicate, mapMotivoToLabel, sub-pipelines) que congelen el comportamiento actual. Sin esa red, el split es imprudente en modo desatendido.
+5. **TAREA 2 (partir `pipeline.ts`) NO ejecutada.** Dos motivos: (a) su prompt nunca se pegó; (b) aunque lo tuviera, es alto riesgo — `pipeline.ts` (3.182 líneas) es producción y los tests actuales **no cubren** su comportamiento (gmail/sheet/drive/sub-pipelines), así que un refactor "cero cambios de comportamiento" no sería verificable. **Recomendación:** primero agregar tests de caracterización, después partir.
 
 ---
 
-## Commits creados en esta sesión
+## Qué te toca a vos
 
-| Hash | Descripción |
-|---|---|
-| `5d93f5b` | `docs(limpieza): listado de candidatos a eliminar (sin borrar archivos)` — TAREA 3 |
+1. **Conciliación — probarla.** Curl para Freshco 2026 en formato texto:
+   ```powershell
+   curl.exe -X POST "https://equipodegentes-cron.netlify.app/.netlify/functions/conciliar-facturacion" `
+     -H "x-internal-secret: <FACTURACION_INTERNAL_SECRET>" `
+     -H "content-type: application/json" `
+     -d '{"clienteSlug":"freshco","year":2026,"format":"texto"}'
+   ```
+   Para un mes puntual agregá `"month":3`. Para JSON, `"format":"json"` (o omitilo). **Requiere** que la migración 0018 esté aplicada + backfill corrido, sino la columna BD sale en 0 (con nota).
 
-**Contexto (commit previo, NO de esta sesión):** `8a51a33` `feat(facturacion): dedup de facturas a nivel BD (constraint UNIQUE, migración 0018)` — lo aprobaste explícitamente en la sesión anterior.
+2. **Dedup BD (`8a51a33`) sigue sin aplicarse en prod:** migración 0018 en Supabase → deploy → backfill por cliente.
 
-Estado git: rama `main`, **sin push**. Working tree limpio salvo un untracked preexistente que no es mío (`docs/ESTADO-2026-06-09.md`).
+3. **TAREA 2:** pegame el prompt si querés que la haga (idealmente después de los tests de caracterización).
 
----
-
-## Problemas encontrados
-
-1. **Placeholders sin pegar** en TAREA 1 y TAREA 2 — bloqueante. Probablemente copiaste la plantilla del mensaje pero olvidaste pegar el contenido de `PROMPT 1B` y `PROMPT 2`.
-2. **Conflicto de timing**: tu mensaje autónomo llegó mientras yo ejecutaba el borrado que habías aprobado segundos antes. Lo resolví revirtiendo (ver Decisión 1).
-
----
-
-## Qué te toca a vos al volver
-
-1. **Si querés TAREA 1 y 2:** pegá los prompts reales (`PROMPT 1B` de Conciliación y `PROMPT 2` de partir `pipeline.ts`). Sin eso no puedo ejecutarlas.
-2. **Limpieza:** revisá `docs/LIMPIEZA-CANDIDATOS.md`. Si estás de acuerdo, decime "borrá el Grupo 1" (o los que quieras) y lo ejecuto con verificación. La lista ya tiene el orden de borrado seguro y las trampas (ej. editar `netlify.toml` del admin junto con la edge function).
-3. **Pendiente de la sesión anterior (dedup BD, commit `8a51a33`)** — sigue sin aplicarse en producción:
-   - Aplicar la migración `0018_facturas_registro_dedupe.sql` en el SQL Editor de Supabase.
-   - Deploy a Netlify `equipodegentes-cron`.
-   - Correr el backfill por cliente (dryRun → real), freshco primero.
-4. **Push:** no hice ninguno. Si querés subir `5d93f5b` (y/o `8a51a33`), hacelo vos.
+4. **Push:** no hice ninguno. Subí lo que quieras.

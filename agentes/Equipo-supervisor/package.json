@@ -1,7 +1,0 @@
-{
-  "name": "@equipodegentes/supervisor",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Agente meta: corre después de monitor + reparador + limpiador, valida que el sistema quedó bien (sin duplicados, numeración correcta, Sheet=Drive=events). Si hay gaps residuales, retriggea agentes específicos. Email solo si crítico.",
-  "main": "lib/supervisor.ts"
-}

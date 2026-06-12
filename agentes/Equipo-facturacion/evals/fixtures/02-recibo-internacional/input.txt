@@ -1,0 +1,15 @@
+Notion Labs, Inc.
+Receipt #2026-0042
+Date of issue: March 5, 2026
+
+Bill to:
+customer@example.com
+
+Description                         Qty     Amount
+Notion Plus - Monthly plan          1       $12.00 USD
+
+Subtotal:                                   $12.00 USD
+Total paid:                                 $12.00 USD
+
+Payment method: Visa ending in 4242
+Thank you for your business.

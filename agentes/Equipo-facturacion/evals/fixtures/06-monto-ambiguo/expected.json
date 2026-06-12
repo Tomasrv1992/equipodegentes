@@ -1,0 +1,12 @@
+{
+  "presumedType": "recibo_servicio",
+  "nota_caso": "Caso BORDE: monto '$1.500.000' con punto como separador de MILES (formato colombiano) = 1500000, NO 1.5. Verifica que el extractor no interprete el punto como decimal.",
+  "expected": {
+    "es_factura": true,
+    "numero_documento": "R-889",
+    "proveedor_nit": "900555222",
+    "total": 1500000,
+    "fecha": "2026-02-15",
+    "categoria": "Mantenimiento"
+  }
+}

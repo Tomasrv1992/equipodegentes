@@ -1,0 +1,7 @@
+{
+  "presumedType": "cuenta_cobro",
+  "nota_caso": "Caso BORDE: cuenta de cobro sin total, sin numero y con fecha vaga. El extractor valida (!fecha || !total -> null), asi que SIN total deberia descartarse. Expected es_factura=false. Si el harness lo da true, es un hallazgo (el LLM invento un total).",
+  "expected": {
+    "es_factura": false
+  }
+}

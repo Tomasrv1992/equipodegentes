@@ -1,0 +1,14 @@
+{
+  "presumedType": "cuenta_cobro",
+  "nitCliente": "901117356",
+  "nombreCliente": "Dentilandia",
+  "nota_caso": "Cuenta de cobro de persona natural. El proveedor es QUIEN COBRA (Maria Gladys, C.C. 43076121), NO el cliente Dentilandia. Debe procesarse.",
+  "expected": {
+    "es_factura": true,
+    "numero_documento": "143",
+    "proveedor_nit": "43076121",
+    "total": 1500000,
+    "fecha": "2026-03-10",
+    "categoria": "Servicios"
+  }
+}

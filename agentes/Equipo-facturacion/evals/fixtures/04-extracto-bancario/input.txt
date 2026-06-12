@@ -1,0 +1,16 @@
+BANCOLOMBIA
+Extracto de cuenta de ahorros
+Cuenta No. ****1234
+Periodo: 01/03/2026 al 31/03/2026
+
+Saldo inicial: $5.230.000
+
+Fecha       Descripcion                         Valor
+05/03/2026  Compra PSE Comercio                 -$120.000
+12/03/2026  Transferencia recibida              +$2.000.000
+20/03/2026  Pago tarjeta de credito             -$450.000
+28/03/2026  Retiro cajero automatico            -$200.000
+
+Saldo final: $6.460.000
+
+Este es un resumen de movimientos. No constituye factura.

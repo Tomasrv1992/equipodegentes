@@ -1,0 +1,7 @@
+{
+  "presumedType": "recibo_servicio",
+  "nota_caso": "Extracto bancario (movimientos de cuenta), no es factura. Debe descartarse (es_factura=false).",
+  "expected": {
+    "es_factura": false
+  }
+}

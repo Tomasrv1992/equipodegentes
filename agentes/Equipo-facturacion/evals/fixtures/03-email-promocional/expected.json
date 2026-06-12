@@ -1,0 +1,7 @@
+{
+  "presumedType": "email_body",
+  "nota_caso": "Email promocional, no es factura. Debe descartarse (es_factura=false).",
+  "expected": {
+    "es_factura": false
+  }
+}

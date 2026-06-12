@@ -1,0 +1,12 @@
+{
+  "presumedType": "recibo_internacional",
+  "nota_caso": "Recibo internacional (Notion, USD). Sin NIT colombiano (proveedor_nit vacio). total es el valor original en USD (12); el totalCop se calcula aparte.",
+  "expected": {
+    "es_factura": true,
+    "numero_documento": "2026-0042",
+    "proveedor_nit": "",
+    "total": 12,
+    "fecha": "2026-03-05",
+    "categoria": "Software"
+  }
+}

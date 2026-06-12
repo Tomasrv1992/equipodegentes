@@ -739,7 +739,7 @@ const MES_TABS = [
  *   buildFileBaseName(_, "Sin Proveedor", null)        // sin numero DIAN
  *     → "Sin Proveedor"                                // proveedor sólo (raro)
  */
-function buildFileBaseName(
+export function buildFileBaseName(
   _n: number,
   proveedor: string,
   numeroDIAN?: string | null,
@@ -1682,7 +1682,7 @@ function pick(obj: any, ...paths: string[]): any {
   return null;
 }
 
-function asNumber(v: any): number {
+export function asNumber(v: any): number {
   if (v == null) return 0;
   if (typeof v === "number") return v;
   if (typeof v === "object" && v["#text"] != null) return parseFloat(v["#text"]) || 0;
@@ -1690,7 +1690,7 @@ function asNumber(v: any): number {
   return isNaN(n) ? 0 : n;
 }
 
-function asString(v: any): string {
+export function asString(v: any): string {
   if (v == null) return "";
   if (typeof v === "string") return v;
   if (typeof v === "number") return String(v);
@@ -1725,7 +1725,7 @@ function unwrapAttachedDocument(parsed: any, xmlParser: XMLParser): any | null {
   return xmlParser.parse(innerXml);
 }
 
-function parseInvoiceXml(
+export function parseInvoiceXml(
   xmlPath: string,
   xmlParser: XMLParser,
   nitCliente?: string | null,
@@ -2113,7 +2113,7 @@ async function uploadFile(
  *
  * Cols 15: A=N°(0), B=Fecha(1), C=Proveedor(2), D=NIT(3), E=N°Doc(4), ...
  */
-function isDuplicate(
+export function isDuplicate(
   rows: any[][],
   numero: string,
   nit: string,
@@ -3328,7 +3328,7 @@ async function processGenericPdf(
  *   "DENTILANDIA SAS"       → "dentilandia"
  *   "Tomás Ramírez Villa"   → "tomas ramirez villa"
  */
-function normalizeProveedorName(s: string): string {
+export function normalizeProveedorName(s: string): string {
   if (!s) return "";
   return s
     .normalize("NFD")
@@ -3350,7 +3350,7 @@ function normalizeProveedorName(s: string): string {
  *   2. Nombre del proveedor normalizado matches nombreClienteNorm
  *      (backup cuando LLM no extrae NIT)
  */
-function isSelfEmitted(
+export function isSelfEmitted(
   proveedor: string | undefined,
   nitExtracted: string | undefined,
   nitCliente: string | null,

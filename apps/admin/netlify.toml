@@ -30,10 +30,6 @@
   path = "/api/admin/client-preflight"
 
 [[edge_functions]]
-  function = "admin-reparador-trigger-cliente"
-  path = "/api/admin/reparador-trigger-cliente"
-
-[[edge_functions]]
   function = "admin-rebuild-sheet-cliente"
   path = "/api/admin/rebuild-sheet-cliente"
 

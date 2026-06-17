@@ -9,11 +9,8 @@ import Layout from "./components/Layout";
 import Home from "./routes/home";
 const RunRoute = lazy(() => import("./routes/run"));
 const ClienteRoute = lazy(() => import("./routes/cliente"));
-const AgenteRoute = lazy(() => import("./routes/agente"));
-const AgentesList = lazy(() => import("./routes/agentes"));
 const NuevoCliente = lazy(() => import("./routes/nuevo-cliente"));
 const OnboardingPage = lazy(() => import("./routes/onboarding"));
-const DiagnosticoRoute = lazy(() => import("./routes/diagnostico"));
 const ClientesRoute = lazy(() => import("./routes/clientes"));
 
 function Placeholder({ name }: { name: string }) {
@@ -47,9 +44,6 @@ export default function App() {
                     <Route path="/run/:id" element={<RunRoute />} />
                     <Route path="/clientes" element={<ClientesRoute />} />
                     <Route path="/cliente/:slug" element={<ClienteRoute />} />
-                    <Route path="/agentes" element={<AgentesList />} />
-                    <Route path="/agente/:id" element={<AgenteRoute />} />
-                    <Route path="/diagnostico" element={<DiagnosticoRoute />} />
                     <Route path="/nuevo-cliente" element={<NuevoCliente />} />
                     <Route path="*" element={<Placeholder name="404" />} />
                   </Routes>

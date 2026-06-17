@@ -23,12 +23,6 @@ export default function Layout({ children }: { children: ReactNode }) {
             <NavLink to="/clientes" className={navClass}>
               Clientes
             </NavLink>
-            <NavLink to="/agentes" className={navClass}>
-              Agentes
-            </NavLink>
-            <NavLink to="/diagnostico" className={navClass}>
-              Diagnóstico
-            </NavLink>
           </nav>
 
           <div className="ml-auto flex items-center gap-3">

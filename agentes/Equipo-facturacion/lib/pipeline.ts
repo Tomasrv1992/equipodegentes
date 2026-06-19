@@ -350,6 +350,11 @@ const PROCESSED_LABEL = "Procesado";
  */
 export function mapMotivoToLabel(motivo: string, year?: number): string {
   const y = year ?? new Date().getFullYear();
+  // 2026-06-18: los DUPLICADOS (misma factura reenviada / ya registrada) van a
+  // su propio label `Duplicado/YYYY` para que la diferencia "correos vs facturas"
+  // sea EVIDENCIABLE ante el cliente: correos = Facturas (únicas) + Duplicado
+  // (reenvíos) + Descartado (no-facturas). Los motivos de dup empiezan con "dup".
+  if (/^dup/i.test(String(motivo ?? ""))) return `Duplicado/${y}`;
   return `Descartado/${y}`;
 }
 
@@ -774,13 +779,13 @@ export function buildFileBaseName(
 // "# Documento" reemplaza "N° Factura" — sirve para facturas DIAN y cuentas de cobro.
 // Pestañas con esquema viejo (12 o 16 cols) se reescriben automáticamente.
 const SHEET_HEADERS = [
-  "#", "Fecha", "Proveedor", "NIT", "# Documento",       // A-E
-  "Subtotal", "IVA",                                      // F-G
-  "ReteFuente", "ReteIVA", "ReteICA",                     // H-I-J
-  "Total a Pagar",                                        // K
-  "Concepto", "Categoría", "Cuenta PYG", "Link PDF",      // L-O
+  "Fecha", "Proveedor", "NIT", "# Documento",            // A-D  (col "#" eliminada 2026-06-18)
+  "Subtotal", "IVA",                                      // E-F
+  "ReteFuente", "ReteIVA", "ReteICA",                     // G-H-I
+  "Total a Pagar",                                        // J
+  "Categoría", "Cuenta PYG", "Link PDF",                  // K-M
 ];
-const SHEET_HEADERS_COUNT = SHEET_HEADERS.length; // 15
+const SHEET_HEADERS_COUNT = SHEET_HEADERS.length; // 13
 
 const DASHBOARD_TAB = "Dashboard";
 
@@ -921,11 +926,11 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
   // Los `,` solo se usan dentro del lenguaje QUERY (en el SQL string) que tiene su
   // propia sintaxis SQL. Las funciones nativas (CHOOSE, TEXT, ROUND, SUM, etc) van con `;`.
   const monthChooseStr = MES_TABS.map((m) => `"${m}"`).join(";");
-  // Rango consolidado de las 12 pestañas (para QUERY). 15 cols → A2:O.
-  // Col en QUERY: 1=#, 2=Fecha, 3=Proveedor, 4=NIT, 5=#Doc, 6=Subtotal, 7=IVA,
-  // 8=ReteFuente, 9=ReteIVA, 10=ReteICA, 11=Total a Pagar, 12=Concepto,
-  // 13=Categoría, 14=Cuenta PYG, 15=Link PDF.
-  const allMonthsRange = MES_TABS.map((m) => `'${m}'!A2:O`).join(";");
+  // Rango consolidado de las 12 pestañas (para QUERY). 13 cols → A2:M.
+  // Col en QUERY: 1=Fecha, 2=Proveedor, 3=NIT, 4=#Doc, 5=Subtotal, 6=IVA,
+  // 7=ReteFuente, 8=ReteIVA, 9=ReteICA, 10=Total a Pagar,
+  // 11=Categoría, 12=Cuenta PYG, 13=Link PDF.  (cols "#" y Concepto eliminadas 2026-06-18)
+  const allMonthsRange = MES_TABS.map((m) => `'${m}'!A2:M`).join(";");
 
   const content: any[][] = [
     // Row 1: título grande
@@ -938,9 +943,9 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["Mes", `=PROPER(TEXT(TODAY();"mmmm yyyy"))`, "", "", "", ""],
     // Row 5: Facturas (FIX 2026-06-09: col E = # Documento, no col A que quedó vacía
     // al eliminar consecutivos. Col E está siempre llena en facturas exitosas.)
-    ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!E2:E1000"))`, "", "", "", ""],
+    ["Facturas procesadas", `=COUNTA(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!D2:D1000"))`, "", "", "", ""],
     // Row 6: Monto (Total a Pagar = col K)
-    ["Total a Pagar (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!K2:K1000"))`, "", "", "", ""],
+    ["Total a Pagar (COP)", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!J2:J1000"))`, "", "", "", ""],
     // Row 7: Tiempo
     ["Tiempo ahorrado", `=ROUND(B5*10/60;1)&" h (10 min/factura)"`, "", "", "", ""],
     // Row 8: vacío
@@ -954,8 +959,8 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     // en filas nuevas desde 2026-06-03 (eliminamos consecutivos).
     ...MES_TABS.map((m) => [
       m,
-      `=COUNTA('${m}'!E2:E1000)`,
-      `=SUM('${m}'!K2:K1000)`,
+      `=COUNTA('${m}'!D2:D1000)`,
+      `=SUM('${m}'!J2:J1000)`,
       "", "", "",
     ]),
     // Row 23: Total
@@ -964,9 +969,9 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["", "", "", "", "", ""],
     // Row 25: header sección
     ["TOP 5 PROVEEDORES (todo el año)", "", "", "", "", ""],
-    // Row 26: QUERY — Col3=Proveedor, Col11=Total a Pagar
+    // Row 26: QUERY — Col2=Proveedor, Col10=Total a Pagar (tras eliminar col "#")
     [
-      `=QUERY({${allMonthsRange}};"select Col3, count(Col3), sum(Col11) where Col3 is not null and Col3 <> '' group by Col3 order by count(Col3) desc limit 5 label Col3 'Proveedor', count(Col3) 'Facturas', sum(Col11) 'Total a Pagar'";0)`,
+      `=QUERY({${allMonthsRange}};"select Col2, count(Col2), sum(Col10) where Col2 is not null and Col2 <> '' group by Col2 order by count(Col2) desc limit 5 label Col2 'Proveedor', count(Col2) 'Facturas', sum(Col10) 'Total a Pagar'";0)`,
       "", "", "", "", "",
     ],
     // Rows 27-31 reservadas para el resultado del QUERY (5 filas)
@@ -975,9 +980,9 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     ["", "", "", "", "", ""],
     // Row 33: header sección
     ["TOP 5 CATEGORÍAS (todo el año)", "", "", "", "", ""],
-    // Row 34: QUERY — Col13=Categoría, Col11=Total a Pagar
+    // Row 34: QUERY — Col11=Categoría, Col10=Total a Pagar (tras eliminar cols "#" y Concepto)
     [
-      `=QUERY({${allMonthsRange}};"select Col13, count(Col13), sum(Col11) where Col13 is not null and Col13 <> '' group by Col13 order by count(Col13) desc limit 5 label Col13 'Categoría', count(Col13) 'Facturas', sum(Col11) 'Total a Pagar'";0)`,
+      `=QUERY({${allMonthsRange}};"select Col11, count(Col11), sum(Col10) where Col11 is not null and Col11 <> '' group by Col11 order by count(Col11) desc limit 5 label Col11 'Categoría', count(Col11) 'Facturas', sum(Col10) 'Total a Pagar'";0)`,
       "", "", "", "", "",
     ],
     // Rows 35-38 reservadas para el resultado del QUERY (5 filas + header = 6)
@@ -989,11 +994,11 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     // Row 42: headers tabla
     ["Tipo", "Monto (COP)", "", "", "", ""],
     // Row 43: ReteFuente = SUM de cols H de las 12 pestañas
-    ["ReteFuente", `=${MES_TABS.map((m) => `SUM('${m}'!H:H)`).join("+")}`, "", "", "", ""],
+    ["ReteFuente", `=${MES_TABS.map((m) => `SUM('${m}'!G:G)`).join("+")}`, "", "", "", ""],
     // Row 44: ReteIVA = col I
-    ["ReteIVA", `=${MES_TABS.map((m) => `SUM('${m}'!I:I)`).join("+")}`, "", "", "", ""],
+    ["ReteIVA", `=${MES_TABS.map((m) => `SUM('${m}'!H:H)`).join("+")}`, "", "", "", ""],
     // Row 45: ReteICA = col J
-    ["ReteICA", `=${MES_TABS.map((m) => `SUM('${m}'!J:J)`).join("+")}`, "", "", "", ""],
+    ["ReteICA", `=${MES_TABS.map((m) => `SUM('${m}'!I:I)`).join("+")}`, "", "", "", ""],
     // Row 46: Total retenciones (suma de las 3 anteriores)
     ["Total retenido", `=B43+B44+B45`, "", "", "", ""],
     // Row 47: Bruto (Subtotal + IVA) = Total a Pagar + Retenciones
@@ -1005,11 +1010,11 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
     // Row 50: headers
     ["Tipo", "Monto (COP)", "", "", "", ""],
     // Row 51: ReteFuente del mes (col H)
-    ["ReteFuente del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!H:H"))`, "", "", "", ""],
+    ["ReteFuente del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!G:G"))`, "", "", "", ""],
     // Row 52: ReteIVA del mes (col I)
-    ["ReteIVA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!I:I"))`, "", "", "", ""],
+    ["ReteIVA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!H:H"))`, "", "", "", ""],
     // Row 53: ReteICA del mes (col J)
-    ["ReteICA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!J:J"))`, "", "", "", ""],
+    ["ReteICA del mes", `=SUM(INDIRECT(CHOOSE(MONTH(TODAY());${monthChooseStr})&"!I:I"))`, "", "", "", ""],
     // Row 54: Total retenciones del mes (suma de las 3 anteriores)
     ["Total retenido mes", `=B51+B52+B53`, "", "", "", ""],
     // Row 55: Bruto facturado mes (Total a Pagar del mes + retenciones del mes)
@@ -2126,17 +2131,18 @@ export function isDuplicate(
   const proveedorNorm = proveedor ? normalizeProveedorName(proveedor) : "";
 
   return rows.some((r) => {
-    const rowNum = String(r[4] || "").trim();
+    // Tras eliminar la col "#": D=#Documento (idx 3), C=NIT (idx 2), B=Proveedor (idx 1).
+    const rowNum = String(r[3] || "").trim();
     if (rowNum !== numTrim) return false;
     // Mismo número — validar que sea el mismo proveedor:
-    const rowNit = String(r[3] || "").replace(/\D+/g, "");
+    const rowNit = String(r[2] || "").replace(/\D+/g, "");
     if (nitNorm && rowNit) {
       // Ambos NITs presentes: comparar NIT
       return rowNit === nitNorm;
     }
     // Alguno sin NIT: comparar por nombre normalizado del proveedor
     if (proveedorNorm) {
-      const rowProveedor = normalizeProveedorName(String(r[2] || ""));
+      const rowProveedor = normalizeProveedorName(String(r[1] || ""));
       return rowProveedor === proveedorNorm;
     }
     // Sin NIT ni proveedor → ser conservador y considerar duplicado si num idéntico
@@ -2148,33 +2154,50 @@ async function appendToSheet(
   sheets: any,
   sheetId: string,
   tabRange: string,
-  _consecutivo: number,
+  targetRow: number | null,
   d: ProcessedRow
 ): Promise<any[]> {
-  // 15 cols: A=#, B=Fecha, C=Proveedor, D=NIT, E=#Documento, F=Subtotal,
-  //          G=IVA, H=ReteFuente, I=ReteIVA, J=ReteICA, K=Total a Pagar,
-  //          L=Concepto, M=Categoría, N=Cuenta PYG, O=Link PDF.
+  // 13 cols A:M (col "#" y "Concepto" eliminadas 2026-06-18):
+  //   A=Fecha, B=Proveedor, C=NIT, D=# Documento, E=Subtotal, F=IVA,
+  //   G=ReteFuente, H=ReteIVA, I=ReteICA, J=Total a Pagar, K=Categoría,
+  //   L=Cuenta PYG, M=Link PDF.
   // Total a Pagar = Subtotal + IVA - retenciones (lo que se paga REAL al proveedor).
-  //
-  // 2026-06-03: col A queda VACÍA (consecutivos eliminados — el filename Drive
-  // tiene numero DIAN único, el Sheet identifica filas por (proveedor, numero, nit)).
   const rtf = d.reteFuente ?? 0;
   const riva = d.reteIva ?? 0;
   const rica = d.reteIca ?? 0;
   const totalAPagar = (d.subtotal || 0) + (d.iva || 0) - rtf - riva - rica;
   const row = [
-    "", d.fecha, d.proveedor, d.nit, d.numero,                      // A (vacío) - E
-    d.subtotal, d.iva,                                              // F-G
-    rtf, riva, rica,                                                // H-I-J
-    totalAPagar,                                                    // K
-    d.concepto, d.categoria, d.cuentaPyg, d.driveLink,              // L-O
+    d.fecha, d.proveedor, d.nit, d.numero,                         // A-D
+    d.subtotal, d.iva,                                             // E-F
+    rtf, riva, rica,                                               // G-H-I
+    totalAPagar,                                                   // J
+    d.categoria, d.cuentaPyg, d.driveLink,                         // K-M
   ];
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId,
-    range: `${tabRange}!A:O`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: [row] },
-  });
+  // BUG FIX 2026-06-18: NO usar values.append. Con la col A vacía (consecutivos
+  // eliminados 2026-06-03) la detección de "tabla" de append se ancla mal y, según
+  // el rango, SOBRESCRIBE la fila 2 o CORRE las columnas una a la izquierda
+  // (la Fecha caía en A, el VALOR en E en vez del # Documento). Escritura por
+  // POSICIÓN EXPLÍCITA: contamos la col B (Fecha, siempre con dato) y escribimos
+  // en la fila siguiente con values.update → alineación exacta y col A vacía OK.
+  // (CONCURRENCY=1 en el pipeline serializa los appends, así que no hay carrera.)
+  await withSheetRetry(async () => {
+    let next = targetRow;
+    if (next == null) {
+      // Fallback (facturas sin numero, que no pasan por la dedup de safeAppend):
+      // calcular la fila por el conteo de la col B (Fecha, siempre con dato).
+      const cur = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${tabRange}!B:B`,
+      });
+      next = (cur.data.values?.length ?? 0) + 1; // header en fila 1
+    }
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: `${tabRange}!A${next}:M${next}`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [row] },
+    });
+  }, "append-row");
   return row;
 }
 
@@ -2204,6 +2227,7 @@ async function safeAppendToSheet(
   numero: string | undefined | null,
 ): Promise<any[] | null> {
   const numTrim = numero ? String(numero).trim() : "";
+  let nextRow: number | null = null; // fila destino (de la lectura E:E); null = appendToSheet la calcula
   if (numTrim.length > 0) {
     // Retry con backoff exponencial cuando Sheets responde 429 quota.
     // Sin esto, en runs con muchas facturas el guard pre-append dispara
@@ -2215,7 +2239,7 @@ async function safeAppendToSheet(
       try {
         const resp = await sheets.spreadsheets.values.get({
           spreadsheetId: sheetId,
-          range: `${tabRange}!E:E`,
+          range: `${tabRange}!D:D`, // # Documento (col D tras eliminar la col "#")
         });
         const values = (resp.data.values ?? []) as any[][];
         for (let i = 1; i < values.length; i++) {
@@ -2227,6 +2251,9 @@ async function safeAppendToSheet(
             return null;
           }
         }
+        // Reusar esta misma lectura para saber dónde escribir, así appendToSheet
+        // NO hace otra lectura (evita duplicar llamadas y reventar la quota Sheets).
+        nextRow = values.length + 1;
         lastErr = null;
         break; // lectura exitosa → salir del retry loop
       } catch (err: any) {
@@ -2255,7 +2282,7 @@ async function safeAppendToSheet(
       throw new Error(`safeAppend pre-check failed (${tabName}): ${lastErr.message}`);
     }
   }
-  return appendToSheet(sheets, sheetId, tabRange, consecutivo, d);
+  return appendToSheet(sheets, sheetId, tabRange, nextRow, d);
 }
 
 /**
@@ -2885,11 +2912,14 @@ async function processCuentaCobroDocx(
     // Recupera falsos negativos del LLM (CC Mayo 2026, Tatiana, SMB, etc).
     if (!extracted) {
       const subjLow = subject.toLowerCase();
-      // FIX 2026-06-11: ampliado para incluir "nota de cobro" (mismo concepto que
-      // cuenta de cobro, terminología distinta) y variantes "MP", "Tatiana", "MAYO FIRMADA".
+      // FIX 2026-06-11: "nota de cobro" (= cuenta de cobro) y variantes.
+      // FIX 2026-06-18: ampliado para mirar también TEXTO y filename (no solo
+      // subject): cuentas de cobro no-electrónicas que el LLM rechazaba y NO
+      // debían descartarse (son gasto → entran a la contabilidad).
+      const haystackCC = `${subjLow} ${(d.filename ?? "").toLowerCase()} ${text.slice(0, 2000).toLowerCase()}`;
       const isCCSubject =
-        /cuenta\s*de\s*cobro/i.test(subjLow) ||
-        /nota\s*de\s*cobro/i.test(subjLow) ||
+        /cuenta\s*de\s*cobro/i.test(haystackCC) ||
+        /nota\s*de\s*cobro/i.test(haystackCC) ||
         /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)/i.test(subjLow) ||
         /documentaci[oó]n\s+cuenta\s*de\s*cobro/i.test(subjLow) ||
         /^fwd:\s*documentaci[oó]n\s+smb/i.test(subjLow);
@@ -3147,15 +3177,19 @@ async function processGenericPdf(
       nombreCliente: nombreClienteNorm,
     });
 
-    // FIX 2026-06-09: fallback subject CC (mismo pattern que processCuentaCobroDocx).
+    // FIX 2026-06-09 / ampliado 2026-06-18: fallback CC. Antes solo miraba el
+    // subject; ahora también el TEXTO del documento y el filename, porque hay
+    // cuentas de cobro (PDF, no electrónicas) que el LLM rechazaba y NO debían
+    // descartarse — son gasto y deben ingresar a la contabilidad.
     if (!extracted) {
       const subjLow = subject.toLowerCase();
+      const haystackCC = `${subjLow} ${(p.filename ?? "").toLowerCase()} ${text.slice(0, 2000).toLowerCase()}`;
       const isCCSubject =
-        /cuenta\s*de\s*cobro/i.test(subjLow) ||
+        /cuenta\s*de\s*cobro/i.test(haystackCC) ||
         /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{4}/i.test(subjLow) ||
         /documentaci[oó]n\s+cuenta\s*de\s*cobro/i.test(subjLow);
       if (isCCSubject) {
-        console.log(`[pdf-cc-fallback] subject matchea CC, reintentando con forceProcess: ${subject.slice(0, 60)}`);
+        console.log(`[pdf-cc-fallback] CC detectada (subject/texto/filename), reintentando con forceProcess: ${subject.slice(0, 60)}`);
         llmTracker.calls++;
         extracted = await extractInvoiceFromText({
           text, presumedType: "cuenta_cobro", filename: p.filename,

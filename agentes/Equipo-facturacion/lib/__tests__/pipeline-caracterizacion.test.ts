@@ -27,9 +27,11 @@ import {
 
 // ===== mapMotivoToLabel =====
 describe("mapMotivoToLabel", () => {
-  it("devuelve Descartado/<year> ignorando el motivo (hoy el motivo no diferencia)", () => {
-    expect(mapMotivoToLabel("dup-en-sheet", 2026)).toBe("Descartado/2026");
+  it("motivos de duplicado -> Duplicado/<year>; el resto -> Descartado/<year>", () => {
+    expect(mapMotivoToLabel("dup-en-sheet", 2026)).toBe("Duplicado/2026");
+    expect(mapMotivoToLabel("dup-constraint-bd", 2026)).toBe("Duplicado/2026");
     expect(mapMotivoToLabel("cualquier-cosa", 2025)).toBe("Descartado/2025");
+    expect(mapMotivoToLabel("planilla-ss-tercero", 2026)).toBe("Descartado/2026");
   });
 });
 
@@ -51,9 +53,9 @@ describe("normalizeProveedorName", () => {
   });
 });
 
-// ===== isDuplicate (cols: 2=proveedor, 3=nit, 4=numero) =====
+// ===== isDuplicate (esquema sin col "#": 0=Fecha, 1=proveedor, 2=nit, 3=numero) =====
 describe("isDuplicate", () => {
-  const row = (proveedor: string, nit: string, numero: string) => ["", "", proveedor, nit, numero];
+  const row = (proveedor: string, nit: string, numero: string) => ["", proveedor, nit, numero];
 
   it("numero vacio -> false (no se puede deduplicar)", () => {
     expect(isDuplicate([row("Prov", "900", "FE1")], "", "900", "Prov")).toBe(false);

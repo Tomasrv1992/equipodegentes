@@ -136,6 +136,22 @@ export async function extractInvoiceFromText(
       return null;
     }
 
+    // FIX 2026-06-18: Skip NOTAS CRÉDITO / DÉBITO — NO son documentos de cobro
+    // (anulan o ajustan una factura ya emitida). El XML DIAN ya las salta por
+    // tipoDoc, pero las que llegan como PDF pasaban por el LLM y se contaban como
+    // factura (NTC00303 quedó como recibo_servicio conf 0.75). Detección
+    // determinística por texto/subject/numero — no se confía en el LLM.
+    const haystackNc = `${ctx.text} ${ctx.subject ?? ""} ${ctx.filename ?? ""}`.toLowerCase();
+    const numUp = String(json.numero ?? "").trim().toUpperCase();
+    const esNotaCreditoDebito =
+      json.es_nota_credito === true ||
+      /nota\s*(de\s*)?(cr[eé]dito|d[eé]bito)/.test(haystackNc) ||
+      /^NTC|^NDB|^NC\d|^ND\d/.test(numUp);
+    if (esNotaCreditoDebito) {
+      console.log(`[llm-extractor] skip: NOTA CRÉDITO/DÉBITO (numero=${numUp}) — no es documento de cobro`);
+      return null;
+    }
+
     // Validación mínima
     if (!json.fecha || !json.total || json.total <= 0) {
       return null; // no parece factura válida
@@ -243,10 +259,13 @@ EXTRAÉ los siguientes campos en JSON puro (sin markdown, sin comentarios). Si N
 
 ⚠️ CERTIFICADOS DE RETENCIÓN NO son facturas — son comprobantes de retención ya practicada. Si el texto contiene "Certificado de Retención", "Certificado RTE", "Retención en la Fuente practicada", marcá "es_factura": false con "notas": "Certificado de retención, no es factura".
 
+⚠️ NOTAS CRÉDITO / NOTAS DÉBITO NO son documentos de cobro — anulan o ajustan una factura ya emitida. Si el texto contiene "NOTA CRÉDITO", "NOTA DÉBITO", "Nota credito electronica" o el numero empieza por "NTC"/"NC"/"ND", marcá "es_nota_credito": true y "es_factura": false.
+
 Schema esperado:
 {
   "es_factura": true|false,
   "es_certificado_retencion": true|false (opcional, true si es certificado RTE),
+  "es_nota_credito": true|false (opcional, true si es nota crédito/débito),
   "fecha": "YYYY-MM-DD" (fecha de emisión del documento, no del email),
   "proveedor": "nombre razón social del proveedor (QUIEN COBRA, NUNCA el cliente)",
   "nit": "número NIT/Cédula del PROVEEDOR sin puntos ni guiones",

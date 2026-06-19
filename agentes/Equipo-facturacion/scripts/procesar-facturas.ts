@@ -16,6 +16,7 @@ function flag(name: string): string | null {
   return i !== -1 && i + 1 < argv.length ? argv[i + 1] : null;
 }
 const dryRun = argv.includes("--dry-run");
+const force = argv.includes("--force");
 const window = flag("--window") ?? "30d";
 const limitStr = flag("--limit");
 const limit = limitStr ? parseInt(limitStr, 10) : null;
@@ -43,7 +44,7 @@ const cfg: PipelineConfig = {
     sheetId: process.env.INVOICES_SHEET_ID!,
     sheetTab: process.env.INVOICES_SHEET_TAB || "Gastos 2026",
   },
-  options: { dryRun, window, limit },
+  options: { dryRun, window, limit, force },
 };
 
 run(cfg)

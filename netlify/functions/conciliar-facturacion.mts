@@ -273,7 +273,7 @@ async function listGmailMessageIds(gmail: any, labelId: string, q: string): Prom
 async function fetchSheetNumeros(sheets: any, spreadsheetId: string, tabName: string): Promise<string[]> {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `'${tabName.replace(/'/g, "''")}'!E2:E`,
+    range: `'${tabName.replace(/'/g, "''")}'!D2:D`,
   });
   const rows = (res.data.values ?? []) as any[][];
   return rows.map((r) => String(r[0] ?? "").trim()).filter(Boolean);

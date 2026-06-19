@@ -8,7 +8,27 @@
 
 import { createServer } from 'node:http';
 import { exec } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { google } from 'googleapis';
+
+// .env.local vive un nivel arriba de /scripts.
+const ENV_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', '.env.local');
+
+function escribirRefreshToken(token) {
+  let contenido = '';
+  try { contenido = readFileSync(ENV_PATH, 'utf8'); } catch { /* no existe, se crea */ }
+  const linea = `GOOGLE_OAUTH_REFRESH_TOKEN=${token}`;
+  const re = /^[ \t]*GOOGLE_OAUTH_REFRESH_TOKEN[ \t]*=.*$/m;
+  if (re.test(contenido)) {
+    contenido = contenido.replace(re, linea);
+  } else {
+    if (contenido.length && !contenido.endsWith('\n')) contenido += '\n';
+    contenido += linea + '\n';
+  }
+  writeFileSync(ENV_PATH, contenido, 'utf8');
+}
 
 const PORT = 53682;
 const REDIRECT = `http://localhost:${PORT}/callback`;
@@ -72,16 +92,28 @@ const server = createServer(async (req, res) => {
       server.close();
       process.exit(1);
     }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-       .end('<h1>✅ Listo</h1><p>Vuelve a la terminal y copia el refresh token al .env.local</p>');
+    // Escribir el token DIRECTO al .env.local (sin copy-paste manual).
+    let escrito = false;
+    try {
+      escribirRefreshToken(tokens.refresh_token);
+      escrito = true;
+    } catch (e) {
+      console.error('\n⚠️  No pude escribir el .env.local automáticamente:', e.message);
+    }
 
-    console.log('\n✅ Refresh token obtenido. Pega ESTA línea en tu .env.local:\n');
-    console.log('────────────────────────────────────────────────────────');
-    console.log(`GOOGLE_OAUTH_REFRESH_TOKEN=${tokens.refresh_token}`);
-    console.log('────────────────────────────────────────────────────────\n');
-    console.log('Después corre:');
-    console.log('   node --env-file=.env.local scripts/procesar-facturas.mjs --dry-run\n');
-    console.log('para verificar que detecta tus facturas pendientes (sin tocarlas).\n');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+       .end('<h1>✅ Listo</h1><p>Token guardado. Ya puedes cerrar esta pestaña y volver a la terminal.</p>');
+
+    if (escrito) {
+      console.log('\n✅ Refresh token obtenido y GUARDADO automáticamente en:');
+      console.log('   ' + ENV_PATH + '\n');
+      console.log('No tienes que copiar nada. Ya quedó.\n');
+    } else {
+      console.log('\n✅ Refresh token obtenido. Pega ESTA línea en tu .env.local:\n');
+      console.log('────────────────────────────────────────────────────────');
+      console.log(`GOOGLE_OAUTH_REFRESH_TOKEN=${tokens.refresh_token}`);
+      console.log('────────────────────────────────────────────────────────\n');
+    }
 
     server.close();
     process.exit(0);

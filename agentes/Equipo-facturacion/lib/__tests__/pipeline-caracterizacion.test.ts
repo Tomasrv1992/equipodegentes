@@ -18,6 +18,7 @@ import {
   mapMotivoToLabel,
   normalizeProveedorName,
   isDuplicate,
+  nitMatch,
   isSelfEmitted,
   buildFileBaseName,
   asNumber,
@@ -77,6 +78,71 @@ describe("isDuplicate", () => {
   });
   it("mismo numero, sin NIT ni proveedor -> true (conservador)", () => {
     expect(isDuplicate([row("", "", "FE1")], "FE1", "", undefined)).toBe(true);
+  });
+
+  // --- Regresiones 2026-06-19: re-duplicación al reprocesar ---
+  it("ceros a la izquierda: '05' vs '5' (Sheets colapsa RAW) + mismo NIT -> true", () => {
+    // La fila guardada tiene '5' (Sheets convirtió '05'->5); el doc re-extraído trae '05'.
+    expect(isDuplicate([row("Araque", "1152466510", "5")], "05", "1152466510", "Araque")).toBe(true);
+    expect(isDuplicate([row("Prov", "900", "0029")], "29", "900", "Prov")).toBe(true);
+  });
+  it("ceros a la izquierda pero NIT distinto -> false (no colapsar entre proveedores)", () => {
+    // Tres CC distintas con numero '5' (Stefania/Tatiana/Araque) NO deben deduparse.
+    expect(isDuplicate([row("Stefania", "1152201138", "5")], "5", "1152188032", "Tatiana")).toBe(false);
+  });
+  it("NIT con dígito de verificación: '1040182652' vs '10401826529' + mismo numero -> true", () => {
+    expect(isDuplicate([row("Lab", "10401826529", "7654")], "7654", "1040182652", "Lab")).toBe(true);
+    expect(isDuplicate([row("Lab", "1040182652", "7671")], "7671", "10401826529", "Lab")).toBe(true);
+  });
+
+  // --- Dedup por CONTENIDO para CC sin numero (numero no-informativo) ---
+  // Fila completa A:M con total en col J (idx 9).
+  const rowFull = (prov: string, nit: string, numero: string, total: number) =>
+    ["46170", prov, nit, numero, 0, 0, 0, 0, 0, total, "", "", ""];
+
+  it("CC sin numero: misma entidad + mismo total = dup aunque el numero difiera", () => {
+    // Caso real Catalina: fila guardada con numero "46143" (fecha mal extraída);
+    // el reproceso trae "Sin número" → debe detectarse dup por contenido.
+    const rows = [rowFull("CATALINA MANES URIBE", "1152459140", "46143", 2970160)];
+    expect(isDuplicate(rows, "Sin número", "1152459140", "CATALINA MANES URIBE", 2970160)).toBe(true);
+    // Caso real Juan David: "sin número de consecutivo" vs "no especificado".
+    const rows2 = [rowFull("JUAN DAVID MOLINA", "10014693950", "sin número de consecutivo", 225000)];
+    expect(isDuplicate(rows2, "no especificado", "10014693950", "JUAN DAVID MOLINA", 225000)).toBe(true);
+  });
+  it("CC sin numero pero distinto total -> NO dup", () => {
+    const rows = [rowFull("CATALINA", "1152459140", "46143", 2970160)];
+    expect(isDuplicate(rows, "Sin número", "1152459140", "CATALINA", 999999)).toBe(false);
+  });
+  it("dos facturas INFORMATIVAS mismo total distinto numero -> NO dup (no aplica contenido)", () => {
+    // Salvaguarda: el dedup por contenido NO debe colapsar 2 facturas reales con
+    // numero válido distinto aunque coincida el total.
+    const rows = [rowFull("Lab", "900", "FE100", 50000)];
+    expect(isDuplicate(rows, "FE200", "900", "Lab", 50000)).toBe(false);
+  });
+});
+
+// ===== nitMatch (tolerancia al dígito de verificación) =====
+describe("nitMatch", () => {
+  it("igualdad exacta -> true", () => {
+    expect(nitMatch("900123456", "900123456")).toBe(true);
+  });
+  it("base vs base+DV (1 dígito extra al final) -> true", () => {
+    expect(nitMatch("1040182652", "10401826529")).toBe(true);
+    expect(nitMatch("10401826529", "1040182652")).toBe(true);
+    expect(nitMatch("901087252", "9010872521")).toBe(true);
+  });
+  it("difieren en >1 dígito o en el medio -> false", () => {
+    expect(nitMatch("900123456", "111111111")).toBe(false);
+    expect(nitMatch("1040182652", "1040182653")).toBe(false); // misma longitud, último dígito distinto
+    expect(nitMatch("1040182652", "104018265299")).toBe(false); // 2 dígitos extra
+  });
+  it("alguno vacío -> false", () => {
+    expect(nitMatch("", "900123456")).toBe(false);
+    expect(nitMatch("900123456", "")).toBe(false);
+  });
+  it("ignora formato (puntos/guiones) -> compara solo dígitos", () => {
+    expect(nitMatch("900.123.456", "900123456")).toBe(true);
+    expect(nitMatch("900.123.456-7", "900123456")).toBe(true); // base + DV con guión
   });
 });
 

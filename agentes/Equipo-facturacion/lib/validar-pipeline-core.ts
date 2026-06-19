@@ -106,6 +106,34 @@ export function parseNumeroFromFilename(name: string): string | null {
   return numero || null;
 }
 
+const DOC_EXT_RE = /\.(pdf|docx?|xlsx?|xlsm|xml|png|jpe?g)$/i;
+
+/**
+ * Proveedor del filename "{numero}. {Proveedor}.ext" (lo que va DESPUÉS del
+ * primer ". "). Sirve para emparejar Drive⇄Sheet por proveedor cuando el numero
+ * es sintético/libre (CC sin consecutivo) y filename≠numero del Sheet.
+ */
+export function parseProveedorFromFilename(name: string): string {
+  const base = String(name ?? "").replace(DOC_EXT_RE, "");
+  const idx = base.indexOf(". ");
+  if (idx < 0) return "";
+  return base.slice(idx + 2).trim();
+}
+
+/**
+ * Normaliza un nombre de proveedor para CRUCE: sin acentos, mayúsculas, sin
+ * sufijos legales (SAS/LTDA/SA/EU/SCA) ni puntuación. "María Isabel Araque" y
+ * "MARIA ISABEL ARAQUE" → "MARIAISABELARAQUE". Permite enlazar la fila del Sheet
+ * con el PDF de Drive aunque el numero no coincida.
+ */
+export function normProveedorCruce(s: string | null | undefined): string {
+  return String(s ?? "")
+    .normalize("NFD").replace(/[̀-ͯ]/g, "") // quita acentos
+    .toUpperCase()
+    .replace(/\b(S\.?A\.?S\.?|LTDA\.?|S\.?A\.?|E\.?U\.?|S\.?C\.?A\.?)\b/g, "") // sufijos legales
+    .replace(/[^A-Z0-9]+/g, ""); // solo alfanumérico
+}
+
 // ===========================================================================
 // PARSEO DE MONTOS — detecta texto-vs-número y montos mal formateados
 // ===========================================================================
@@ -407,9 +435,16 @@ export interface FilaRef {
  * "no especificado" NO son la misma factura).
  */
 export function esNumeroNoInformativo(numero: string | null | undefined): boolean {
-  const n = normalizeNumero(numero).toUpperCase();
+  // Sin acentos: "SINNÚMERO" → "SINNUMERO" (la Ú rompía el match exacto).
+  const n = normalizeNumero(numero).normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase();
   if (n === "") return true;
-  return /^(NOESPECIFICADO|SINNUMERO|SN|NA|NINGUNO|VARIOS|PENDIENTE)$/.test(n);
+  if (/^(NOESPECIFICADO|SN|NA|NINGUNO|VARIOS|PENDIENTE)$/.test(n)) return true;
+  // "SINNUMERO", "SINNUMERODECONSECUTIVO", "SINNUMERODEFACTURA"… → contains.
+  if (/SINNUMERO/.test(n)) return true;
+  // Numero sintético que asigna el pipeline a CC sin consecutivo (CC-YYYYMM-…):
+  // NO identifica el documento (cada email genera uno distinto) → no es llave.
+  if (/^CC20\d{4}/.test(n)) return true;
+  return false;
 }
 
 export interface GrupoDuplicado {
@@ -478,10 +513,15 @@ export function detectarDuplicados(filas: FilaRef[]): GrupoDuplicado[] {
 
 export interface CruceMesInput {
   tab: string;
-  /** numeros (col D) de las filas con datos del Sheet de ese mes. */
-  sheetNumeros: string[];
-  /** numeros parseados de los filenames de PDFs en Drive YYYY-MM. */
-  driveNumeros: string[];
+  /**
+   * Filas del Sheet de ese mes: numero (col D) + proveedor (col B). `tienePdf`
+   * (col M / Link PDF no vacía) opcional: si es `false`, la fila declara que NO
+   * tiene PDF (caso DIAN XML-only) → NO se reporta como huérfano (es un WARN
+   * link-pdf-ausente que se cuenta aparte). Default true = comportamiento previo.
+   */
+  sheetDocs: { numero: string; proveedor: string; tienePdf?: boolean }[];
+  /** Docs en Drive YYYY-MM: numero + proveedor parseados del filename. */
+  driveDocs: { numero: string; proveedor: string }[];
   /** Conteo de emails con label Facturas/YYYY recibidos en ese mes. */
   gmailFacturasCount: number;
 }
@@ -506,23 +546,63 @@ export interface CruceMesResult {
 export function cruzarMes(input: CruceMesInput): CruceMesResult {
   // Normaliza Y quita ceros a la izquierda para el cruce: el filename de Drive a
   // veces trae "00846" y el Sheet "846" — es la MISMA factura, no un huérfano.
-  const normSet = (xs: string[]) =>
-    new Set(xs.map((x) => numeroSinCerosIzq(normalizeNumero(x))).filter((x) => x !== ""));
-  const sheet = normSet(input.sheetNumeros);
-  const drive = normSet(input.driveNumeros);
+  const normNum = (x: string) => numeroSinCerosIzq(normalizeNumero(x));
+  const sheetNumSet = new Set(input.sheetDocs.map((d) => normNum(d.numero)).filter((x) => x !== ""));
+  const driveNumSet = new Set(input.driveDocs.map((d) => normNum(d.numero)).filter((x) => x !== ""));
 
-  const sheet_sin_drive = [...sheet].filter((n) => !drive.has(n)).sort();
-  const drive_sin_sheet = [...drive].filter((n) => !sheet.has(n)).sort();
-  const gmail_vs_sheet = input.gmailFacturasCount - sheet.size;
+  // --- Fase 1: emparejar por NUMERO normalizado (sin ceros a la izquierda) ---
+  let sheetLeft = input.sheetDocs.filter((d) => {
+    const n = normNum(d.numero);
+    return n === "" || !driveNumSet.has(n);
+  });
+  let driveLeft = input.driveDocs.filter((d) => {
+    const n = normNum(d.numero);
+    return n === "" || !sheetNumSet.has(n);
+  });
+
+  // --- Fase 2: emparejar leftovers por PROVEEDOR cuando es 1:1 ---
+  // Las CC sin consecutivo reciben un numero sintético en el Sheet (CC-YYYYMM-…)
+  // mientras el filename de Drive conserva el texto original ("sin número de
+  // consecutivo. Alvaro.pdf") → mismo doc, numero distinto. Si un proveedor tiene
+  // EXACTAMENTE un leftover en cada lado, son el mismo documento. Es conservador:
+  // una pérdida real (ej. FD30000529 XML-only sin PDF) NO tiene leftover de Drive
+  // con su proveedor → sigue marcada como huérfana.
+  const countProv = (docs: { proveedor: string }[]) => {
+    const m = new Map<string, number>();
+    for (const d of docs) {
+      const p = normProveedorCruce(d.proveedor);
+      if (p) m.set(p, (m.get(p) ?? 0) + 1);
+    }
+    return m;
+  };
+  const sCount = countProv(sheetLeft);
+  const dCount = countProv(driveLeft);
+  const matchedProv = new Set<string>();
+  for (const [p, c] of sCount) {
+    if (p && c === 1 && dCount.get(p) === 1) matchedProv.add(p);
+  }
+  if (matchedProv.size) {
+    sheetLeft = sheetLeft.filter((d) => !matchedProv.has(normProveedorCruce(d.proveedor)));
+    driveLeft = driveLeft.filter((d) => !matchedProv.has(normProveedorCruce(d.proveedor)));
+  }
+
+  // Reporte de huérfanos: numeros normalizados que quedaron sin pareja. Las filas
+  // que declaran NO tener PDF (col M vacía → tienePdf===false) NO son huérfanas:
+  // es el caso DIAN XML-only, ya señalado como WARN link-pdf-ausente aparte.
+  const sheet_sin_drive = [
+    ...new Set(sheetLeft.filter((d) => d.tienePdf !== false).map((d) => normNum(d.numero)).filter((x) => x !== "")),
+  ].sort();
+  const drive_sin_sheet = [...new Set(driveLeft.map((d) => normNum(d.numero)).filter((x) => x !== ""))].sort();
+  const gmail_vs_sheet = input.gmailFacturasCount - sheetNumSet.size;
 
   return {
     tab: input.tab,
-    conteos: { gmail: input.gmailFacturasCount, sheet: sheet.size, drive: drive.size },
+    conteos: { gmail: input.gmailFacturasCount, sheet: sheetNumSet.size, drive: driveNumSet.size },
     sheet_sin_drive,
     drive_sin_sheet,
     gmail_vs_sheet,
-    // ok exige paridad EXACTA de conjuntos Sheet<->Drive. Gmail es informativo
-    // (borde de mes) → no tumba el ok, pero se reporta.
+    // ok exige paridad de conjuntos Sheet<->Drive (tras match por numero y por
+    // proveedor). Gmail es informativo (borde de mes) → no tumba el ok.
     ok: sheet_sin_drive.length === 0 && drive_sin_sheet.length === 0,
   };
 }

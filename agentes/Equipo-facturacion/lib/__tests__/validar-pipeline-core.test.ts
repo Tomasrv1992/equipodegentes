@@ -11,6 +11,8 @@ import {
   cruzarMes,
   veredictoFinal,
   parseNumeroFromFilename,
+  parseProveedorFromFilename,
+  normProveedorCruce,
   type FilaRef,
 } from "../validar-pipeline-core";
 
@@ -217,11 +219,16 @@ describe("claveDedup + detectarDuplicados", () => {
 });
 
 describe("cruzarMes — Sheet ⇄ Drive por conjunto", () => {
+  // Helpers: proveedor por defecto prefijado por lado (S-/D-) para que NO haya
+  // match por proveedor accidental entre lados en los casos de cruce por numero.
+  const S = (numero: string, proveedor = `S-${numero}`) => ({ numero, proveedor });
+  const D = (numero: string, proveedor = `D-${numero}`) => ({ numero, proveedor });
+
   it("Sheet = Drive (mismos numeros normalizados) -> ok", () => {
     const r = cruzarMes({
       tab: "Enero",
-      sheetNumeros: ["FE 001", "FE002"],
-      driveNumeros: ["FE001", "FE 002"],
+      sheetDocs: [S("FE 001"), S("FE002")],
+      driveDocs: [D("FE001"), D("FE 002")],
       gmailFacturasCount: 2,
     });
     expect(r.ok).toBe(true);
@@ -232,8 +239,8 @@ describe("cruzarMes — Sheet ⇄ Drive por conjunto", () => {
   it("fila en Sheet sin PDF en Drive -> sheet_sin_drive, ok false", () => {
     const r = cruzarMes({
       tab: "Enero",
-      sheetNumeros: ["FE001", "FE002"],
-      driveNumeros: ["FE001"],
+      sheetDocs: [S("FE001"), S("FE002")],
+      driveDocs: [D("FE001")],
       gmailFacturasCount: 2,
     });
     expect(r.ok).toBe(false);
@@ -243,8 +250,8 @@ describe("cruzarMes — Sheet ⇄ Drive por conjunto", () => {
   it("ceros a la izquierda NO generan huérfano: Sheet '846' = Drive '00846'", () => {
     const r = cruzarMes({
       tab: "Enero",
-      sheetNumeros: ["846", "FE001"],
-      driveNumeros: ["00846", "FE001"],
+      sheetDocs: [S("846"), S("FE001")],
+      driveDocs: [D("00846"), D("FE001")],
       gmailFacturasCount: 2,
     });
     expect(r.ok).toBe(true);
@@ -255,19 +262,66 @@ describe("cruzarMes — Sheet ⇄ Drive por conjunto", () => {
   it("PDF en Drive sin fila en Sheet -> drive_sin_sheet, ok false", () => {
     const r = cruzarMes({
       tab: "Enero",
-      sheetNumeros: ["FE001"],
-      driveNumeros: ["FE001", "FE999"],
+      sheetDocs: [S("FE001")],
+      driveDocs: [D("FE001"), D("FE999")],
       gmailFacturasCount: 1,
     });
     expect(r.ok).toBe(false);
     expect(r.drive_sin_sheet).toEqual(["FE999"]);
   });
 
+  // --- Match por proveedor (CC con numero sintético: filename ≠ numero Sheet) ---
+  it("CC con numero sintético se empareja por proveedor 1:1 -> ok, sin huérfano", () => {
+    // Sheet usa "CC-202605-19e18514"; Drive conserva "sin número de consecutivo".
+    const r = cruzarMes({
+      tab: "Mayo",
+      sheetDocs: [S("FE001", "Lab Ramírez"), S("CC-202605-19e18514", "Alvaro Hernán Ruiz Oviedo")],
+      driveDocs: [D("FE001", "Lab Ramírez"), D("sin número de consecutivo", "Alvaro Hernan Ruiz Oviedo")],
+      gmailFacturasCount: 2,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.sheet_sin_drive).toEqual([]);
+    expect(r.drive_sin_sheet).toEqual([]);
+  });
+
+  it("NO empareja por proveedor si el mismo proveedor tiene 2 leftovers (ambiguo) -> huérfano", () => {
+    const r = cruzarMes({
+      tab: "Mayo",
+      sheetDocs: [S("A", "Mismo Prov"), S("B", "Mismo Prov")],
+      driveDocs: [D("C", "Mismo Prov")],
+      gmailFacturasCount: 2,
+    });
+    expect(r.ok).toBe(false); // 2 en Sheet vs 1 en Drive del mismo prov: no se asume pareja
+  });
+
+  it("pérdida real (proveedor sin contraparte en Drive) sigue marcada -> huérfano", () => {
+    // FD30000529 XML-only: fila en Sheet, NINGÚN archivo de ese proveedor en Drive.
+    const r = cruzarMes({
+      tab: "Marzo",
+      sheetDocs: [S("FE001", "Otro Prov"), S("FD30000529", "Clínica XML Only")],
+      driveDocs: [D("FE001", "Otro Prov")],
+      gmailFacturasCount: 2,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.sheet_sin_drive).toEqual(["FD30000529"]);
+  });
+
+  it("fila DIAN XML-only (tienePdf:false) NO es huérfano -> ok (es WARN aparte)", () => {
+    const r = cruzarMes({
+      tab: "Marzo",
+      sheetDocs: [S("FE001"), { numero: "FD30000529", proveedor: "Clínica XML Only", tienePdf: false }],
+      driveDocs: [D("FE001")],
+      gmailFacturasCount: 2,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.sheet_sin_drive).toEqual([]);
+  });
+
   it("Gmail != Sheet NO tumba ok (borde de mes) pero se reporta", () => {
     const r = cruzarMes({
       tab: "Enero",
-      sheetNumeros: ["FE001"],
-      driveNumeros: ["FE001"],
+      sheetDocs: [S("FE001")],
+      driveDocs: [D("FE001")],
       gmailFacturasCount: 3,
     });
     expect(r.ok).toBe(true);
@@ -280,7 +334,7 @@ describe("veredictoFinal", () => {
     const v = veredictoFinal({
       problemasFila: [{ rowNumber: 2, codigo: "link-pdf-ausente", severidad: "WARN", mensaje: "" }],
       duplicados: [],
-      crucesMes: [cruzarMes({ tab: "Enero", sheetNumeros: ["A"], driveNumeros: ["A"], gmailFacturasCount: 1 })],
+      crucesMes: [cruzarMes({ tab: "Enero", sheetDocs: [{ numero: "A", proveedor: "PA" }], driveDocs: [{ numero: "A", proveedor: "PA" }], gmailFacturasCount: 1 })],
       descartesSospechosos: 0,
     });
     expect(v.ok).toBe(true);
@@ -309,7 +363,7 @@ describe("veredictoFinal", () => {
   });
 
   it("mes con huerfanos -> ok false", () => {
-    const cruce = cruzarMes({ tab: "Enero", sheetNumeros: ["A", "B"], driveNumeros: ["A"], gmailFacturasCount: 2 });
+    const cruce = cruzarMes({ tab: "Enero", sheetDocs: [{ numero: "A", proveedor: "PA" }, { numero: "B", proveedor: "PB" }], driveDocs: [{ numero: "A", proveedor: "PA" }], gmailFacturasCount: 2 });
     const v = veredictoFinal({ problemasFila: [], duplicados: [], crucesMes: [cruce], descartesSospechosos: 0 });
     expect(v.ok).toBe(false);
     expect(v.meses_con_huerfanos).toBe(1);
@@ -330,5 +384,28 @@ describe("parseNumeroFromFilename", () => {
     ["", null],
   ])("%s -> %s", (input, expected) => {
     expect(parseNumeroFromFilename(input)).toBe(expected);
+  });
+});
+
+describe("parseProveedorFromFilename", () => {
+  it.each([
+    ["FEL428843. Seguros De Vida.pdf", "Seguros De Vida"],
+    ["sin número de consecutivo. Alvaro Hernan Ruiz Oviedo.pdf", "Alvaro Hernan Ruiz Oviedo"],
+    ["CUENTA DE COBRO MAYO 2026. Catalina Manes Uribe.docx", "Catalina Manes Uribe"],
+    ["Sin Separador.pdf", ""],
+  ])("%s -> %s", (input, expected) => {
+    expect(parseProveedorFromFilename(input)).toBe(expected);
+  });
+});
+
+describe("normProveedorCruce", () => {
+  it("ignora acentos, mayúsculas y sufijos legales", () => {
+    expect(normProveedorCruce("María Isabel Araque")).toBe(normProveedorCruce("MARIA ISABEL ARAQUE"));
+    expect(normProveedorCruce("B2chat SAS")).toBe(normProveedorCruce("B2CHAT S.A.S"));
+    expect(normProveedorCruce("Alvaro Hernán Ruiz Oviedo")).toBe(normProveedorCruce("Alvaro Hernan Ruiz Oviedo"));
+  });
+  it("vacío -> vacío", () => {
+    expect(normProveedorCruce("")).toBe("");
+    expect(normProveedorCruce(null)).toBe("");
   });
 });

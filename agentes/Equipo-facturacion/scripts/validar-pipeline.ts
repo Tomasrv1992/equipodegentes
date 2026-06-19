@@ -30,6 +30,7 @@ import {
   cruzarMes,
   veredictoFinal,
   parseNumeroFromFilename,
+  parseProveedorFromFilename,
   type FilaProblema,
   type FilaRef,
   type CruceMesResult,
@@ -163,32 +164,34 @@ async function main() {
     }
     if (filas.length) filasPorMes[tab] = filas.length;
 
-    const sheetNumeros: string[] = [];
+    const sheetDocs: { numero: string; proveedor: string; tienePdf: boolean }[] = [];
     for (const { row, rowNumber } of filas) {
       // VALIDACIÓN por fila (alineación, campos, montos, aritmética).
       problemasFila.push(...validarFila(row, rowNumber).map((p) => ({ ...p, contexto: { ...p.contexto, tab } })));
       const numero = String(row?.[COL.NUMERO] ?? "").trim();
-      sheetNumeros.push(numero);
+      const proveedor = String(row?.[COL.PROVEEDOR] ?? "").trim();
+      const tienePdf = String(row?.[COL.LINK_PDF] ?? "").trim() !== "";
+      sheetDocs.push({ numero, proveedor, tienePdf });
       todasLasFilas.push({
         tab,
         rowNumber,
         numero,
         nit: String(row?.[COL.NIT] ?? "").trim(),
-        proveedor: String(row?.[COL.PROVEEDOR] ?? "").trim(),
+        proveedor,
         fecha: String(row?.[COL.FECHA] ?? "").trim(),
       });
     }
 
     // ===== CHECKPOINT: CRUCE Sheet ⇄ Drive ⇄ Gmail por mes =====
     const driveNames = await driveFilenamesMes(drive, folderId, year, m);
-    const driveNumeros = driveNames
-      .map(parseNumeroFromFilename)
-      .filter((x): x is string => !!x);
+    const driveDocs = driveNames
+      .map((n) => ({ numero: parseNumeroFromFilename(n) ?? "", proveedor: parseProveedorFromFilename(n) }))
+      .filter((d) => d.numero !== "" || d.proveedor !== "");
     cruces.push(
       cruzarMes({
         tab,
-        sheetNumeros,
-        driveNumeros,
+        sheetDocs,
+        driveDocs,
         gmailFacturasCount: gmailFacturas[tab] ?? 0,
       }),
     );

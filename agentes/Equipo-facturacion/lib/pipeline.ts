@@ -21,6 +21,10 @@ import {
   calcularDedupeKey,
 } from "../../../shared/agents-runtime/src/facturas-registro";
 import { clienteIdBySlug } from "../../../shared/agents-runtime/src/agent-events";
+// normalizeNumero: dedup robusto del # Documento ("FE-2742"="FE2742", "FE 001"="FE001").
+// numeroSinCerosIzq: colapsa ceros a la izquierda ("05"="5", "0029"="29") — Google Sheets
+// guarda "05" como número 5 (RAW), así que el dedup DEBE comparar sin ceros a la izquierda.
+import { normalizeNumero, numeroSinCerosIzq, esNumeroNoInformativo } from "./validar-pipeline-core";
 
 // ===== Tipos =====
 
@@ -1239,6 +1243,11 @@ async function ensureSheetSetup(sheets: any, sheetId: string): Promise<void> {
  * Tomás está al tanto de que los datos viejos se borran — la idea es re-disparar
  * con force=true después del deploy y todo se regenera con el formato nuevo.
  */
+// Cache del schema-guard: el header se valida 1 sola vez por pestaña por proceso
+// (getOrCreateMonthTab se llama por cada email → sin cache haría 1 lectura/email →
+// revienta quota Sheets y produce falsos schema-mismatch).
+const schemaValidatedTabs = new Set<string>();
+
 async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number): Promise<string> {
   const tabName = MES_TABS[month - 1];
   if (!tabName) throw new Error(`Mes inválido: ${month}`);
@@ -1254,9 +1263,49 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
     // manualmente para detectar duplicados → borró 134 facturas de Abril).
     // Ahora solo migra si tiene MENOS columnas que el esquema (legacy).
     if (existingCols >= SHEET_HEADERS_COUNT) {
-      return tabName; // OK como está (puede tener cols extras del usuario)
+      // 2026-06-19 (Patch 4 — schema-guard): tolerar cols extras NO basta. Una
+      // pestaña con esquema VIEJO (15-16 cols, con "#"/"Concepto") tiene >= 13 cols
+      // pero sus filas están corridas respecto al esquema actual A:M → isDuplicate
+      // leería la columna equivocada y RE-DUPLICARÍA todo el histórico (incidente
+      // Freshco). Verificamos el HEADER real: si NO coincide con SHEET_HEADERS,
+      // ABORTAMOS este cliente (no migramos silenciosamente ni duplicamos).
+      // Cache: el header se valida 1 sola vez por pestaña por proceso (sin esto,
+      // getOrCreateMonthTab lee el header por CADA email → revienta quota Sheets
+      // → lecturas vacías/fallidas → falso schema-mismatch que aborta el mes).
+      if (schemaValidatedTabs.has(tabName)) return tabName;
+      // Comprobación ROBUSTA del esquema (tolerante a acentos NFC/NFD): el
+      // discriminador entre el esquema actual (13-col, # Documento en col D) y el
+      // viejo (15-16 col con "#"/"Concepto", donde col D = NIT y A = "#") es que
+      // la col A SEA "#" o la col D NO contenga "documento". Comparar el header
+      // completo carácter a carácter daba falsos negativos por la "í" de Categoría.
+      // SOLO abortamos si CONFIRMAMOS esquema viejo (lectura no vacía y claramente
+      // vieja). Lectura vacía o fallida (quota/transitorio) → NO bloquear.
+      let confirmedOldSchema = false;
+      try {
+        const hdr = await sheets.spreadsheets.values.get({
+          spreadsheetId: sheetId,
+          range: `'${tabName.replace(/'/g, "''")}'!A1:D1`,
+        });
+        const got = ((hdr.data.values?.[0] ?? []) as any[]).map((c) => String(c ?? "").trim());
+        if (got.length > 0) {
+          const colA = (got[0] ?? "").replace(/\s+/g, "");
+          const colD = (got[3] ?? "").toLowerCase();
+          confirmedOldSchema = colA === "#" || !/documento/.test(colD);
+        }
+      } catch {
+        confirmedOldSchema = false; // lectura transitoria fallida → no bloquear
+      }
+      if (confirmedOldSchema) {
+        throw new Error(
+          `[schema-mismatch] '${tabName}' tiene ${existingCols} cols pero el HEADER no coincide ` +
+          `con el esquema A:M (13 cols). NO se procesa este cliente para EVITAR re-duplicación ` +
+          `masiva (incidente Freshco). Migrar/recrear la pestaña manualmente.`,
+        );
+      }
+      schemaValidatedTabs.add(tabName); // header OK → no re-leer en este proceso
+      return tabName; // OK: header correcto (puede tener cols extras a la derecha)
     }
-    // Esquema viejo (12 cols o menos) → DROP y recrear con esquema nuevo (15 cols).
+    // Esquema viejo (menos columnas que el actual) → DROP y recrear con esquema nuevo.
     console.log(`[migrate-tab] ${tabName}: ${existingCols} cols → drop + recreate (${SHEET_HEADERS_COUNT} cols)`);
     try {
       await sheets.spreadsheets.batchUpdate({
@@ -1340,10 +1389,13 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
               fields: "userEnteredFormat(horizontalAlignment,verticalAlignment)",
             },
           },
-          // 3) Cols F-K (Subtotal, IVA, las 3 retenciones, Total a Pagar): formato moneda COP
+          // 3) Cols E-J (Subtotal, IVA, las 3 retenciones, Total a Pagar): formato moneda COP.
+          // Esquema 13-col A:M (2026-06-18): E=Subtotal(4)…J=Total(9). startColumnIndex=4,
+          // endColumnIndex=10 (exclusive). Antes apuntaba a F-K (5-11) del esquema viejo →
+          // dejaba Subtotal sin formato y Categoría formateada como dinero.
           {
             repeatCell: {
-              range: { sheetId: newTabId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 5, endColumnIndex: 11 },
+              range: { sheetId: newTabId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 4, endColumnIndex: 10 },
               cell: {
                 userEnteredFormat: { numberFormat: { type: "CURRENCY", pattern: "\"$\"#,##0" } },
               },
@@ -1366,6 +1418,7 @@ async function getOrCreateMonthTab(sheets: any, sheetId: string, month: number):
     });
   }
 
+  schemaValidatedTabs.add(tabName); // recién creado con header correcto → no re-validar
   return tabName;
 }
 
@@ -1925,8 +1978,10 @@ function extractRetenciones(invoice: any): {
           out.reteIca += amount;
           break;
         default:
-          // Código desconocido: por convención sumamos a ReteFuente (es el más común)
-          out.reteFuente += amount;
+          // 2026-06-19: código desconocido NO se mezcla en ReteFuente (antes inflaba
+          // la col G y engañaba el Dashboard fiscal — p.ej. un ReteICA en nodo no
+          // estándar contado como ReteFuente). Se loguea para revisión manual.
+          console.warn(`[retencion-desconocida] TaxScheme code="${code}" amount=${amount} — NO clasificada (revisar).`);
       }
     }
   }
@@ -2120,6 +2175,22 @@ async function uploadFile(
 // ===== Sheets =====
 
 /**
+ * Compara dos NITs (solo dígitos) tolerando el dígito de verificación (DV).
+ * En Colombia el NIT base puede venir solo ("1040182652") o con su DV pegado
+ * ("10401826529"). Aceptamos igualdad exacta o que el más largo sea el más corto
+ * + 1 dígito final (el DV). Evita re-duplicar la misma factura cuando la
+ * extracción alterna entre incluir o no el DV.
+ */
+export function nitMatch(a: string, b: string): boolean {
+  const da = String(a || "").replace(/\D+/g, "");
+  const db = String(b || "").replace(/\D+/g, "");
+  if (!da || !db) return false;
+  if (da === db) return true;
+  const [short, long] = da.length <= db.length ? [da, db] : [db, da];
+  return long.length === short.length + 1 && long.startsWith(short);
+}
+
+/**
  * Detecta si una factura ya está en el Sheet.
  *
  * La REGLA DE NEGOCIO según Tomás:
@@ -2133,37 +2204,59 @@ async function uploadFile(
  *   2. Si alguno sin NIT → fallback por (numero, proveedor normalizado)
  *      (caso típico: planillas SS sin NIT, cuentas de cobro persona natural)
  *
- * Cols 15: A=N°(0), B=Fecha(1), C=Proveedor(2), D=NIT(3), E=N°Doc(4), ...
+ * Esquema 13-col A:M: A=Fecha(0), B=Proveedor(1), C=NIT(2), D=#Documento(3), ...
  */
 export function isDuplicate(
   rows: any[][],
   numero: string,
   nit: string,
   proveedor?: string,
+  total?: number | null,
 ): boolean {
   if (!numero) return false;
   const numTrim = String(numero).trim();
   if (numTrim.length < 1) return false;
+  // 2026-06-19 (Patch 3 + fix ceros-izq): comparar por numero NORMALIZADO (sin
+  // espacios/guiones/puntos) para atrapar "FE-2742" vs "FE2742". ADEMÁS colapsamos
+  // ceros a la izquierda ("05"="5", "0029"="29"): Google Sheets guarda el numero
+  // "05" como número 5 (RAW), así que al releer vuelve "5" y un match exacto re-
+  // duplicaría la fila en cada corrida. El colapso es SEGURO porque el match está
+  // gateado por NIT/proveedor (mismo proveedor no emite "5" y "05" como docs distintos).
+  const numNorm = numeroSinCerosIzq(normalizeNumero(numTrim));
   const nitNorm = String(nit || "").replace(/\D+/g, "");
   const proveedorNorm = proveedor ? normalizeProveedorName(proveedor) : "";
+  const numNoInfo = esNumeroNoInformativo(numTrim);
+  const totalNum = total == null ? null : Math.round(Number(total));
+
+  // Misma ENTIDAD (proveedor): NIT con tolerancia a DV, o nombre normalizado.
+  const sameEntity = (r: any[]): boolean => {
+    const rowNit = String(r[2] || "").replace(/\D+/g, "");
+    if (nitNorm && rowNit) return nitMatch(nitNorm, rowNit);
+    if (proveedorNorm) return normalizeProveedorName(String(r[1] || "")) === proveedorNorm;
+    return true; // sin NIT ni proveedor en ningún lado → conservador
+  };
 
   return rows.some((r) => {
-    // Tras eliminar la col "#": D=#Documento (idx 3), C=NIT (idx 2), B=Proveedor (idx 1).
-    const rowNum = String(r[3] || "").trim();
-    if (rowNum !== numTrim) return false;
-    // Mismo número — validar que sea el mismo proveedor:
-    const rowNit = String(r[2] || "").replace(/\D+/g, "");
-    if (nitNorm && rowNit) {
-      // Ambos NITs presentes: comparar NIT
-      return rowNit === nitNorm;
+    // Tras eliminar la col "#": A=Fecha(0), B=Proveedor(1), C=NIT(2), D=#Doc(3), J=Total(9).
+    const rowNumNorm = numeroSinCerosIzq(normalizeNumero(String(r[3] || "")));
+    const rowNoInfo = esNumeroNoInformativo(String(r[3] || ""));
+
+    // Caso A — ambos numeros INFORMATIVOS: dedup por numero + misma entidad.
+    if (!numNoInfo && !rowNoInfo) {
+      return rowNumNorm === numNorm && sameEntity(r);
     }
-    // Alguno sin NIT: comparar por nombre normalizado del proveedor
-    if (proveedorNorm) {
-      const rowProveedor = normalizeProveedorName(String(r[1] || ""));
-      return rowProveedor === proveedorNorm;
+
+    // Caso B — alguno SIN numero informativo (CC/recibo sin consecutivo): el numero
+    // no sirve como llave (cada email/extracción inventa un placeholder distinto:
+    // "sin número", "no especificado", una fecha, "CC-YYYYMM-…"). Dedup por
+    // CONTENIDO: misma entidad + mismo total. La pestaña es MENSUAL, así que el
+    // mes acota la fecha; mismo proveedor + mismo total exacto dentro del mes = la
+    // misma CC. Sin total disponible caemos al match por numero (conservador).
+    if (totalNum != null && totalNum > 0) {
+      const rowTotal = Math.round(Number(r[9] ?? NaN));
+      return sameEntity(r) && Number.isFinite(rowTotal) && rowTotal === totalNum;
     }
-    // Sin NIT ni proveedor → ser conservador y considerar duplicado si num idéntico
-    return true;
+    return rowNumNorm === numNorm && sameEntity(r);
   });
 }
 
@@ -2254,19 +2347,24 @@ async function safeAppendToSheet(
     let lastErr: any = null;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
+        // Leer A:M UNFORMATTED para dedupear con la MISMA lógica que isDuplicate:
+        //  - numero sin ceros-izq + NIT (con DV) / proveedor → "05" vs "5", DV, etc.
+        //  - para CC sin consecutivo (numero no informativo) dedup por CONTENIDO
+        //    (entidad + total), por eso necesitamos col J como NÚMERO (no "$2.970.160").
         const resp = await sheets.spreadsheets.values.get({
           spreadsheetId: sheetId,
-          range: `${tabRange}!D:D`, // # Documento (col D tras eliminar la col "#")
+          range: `${tabRange}!A:M`,
+          valueRenderOption: "UNFORMATTED_VALUE",
         });
         const values = (resp.data.values ?? []) as any[][];
-        for (let i = 1; i < values.length; i++) {
-          const existing = String(values[i]?.[0] ?? "").trim();
-          if (existing === numTrim) {
-            console.log(
-              `[safeAppend] DUP pre-append detectado en ${tabName}: numero="${numTrim}" ya está en fila ${i + 1}. Skip append.`,
-            );
-            return null;
-          }
+        // Total tal cual se guarda en col J (Total a Pagar = subtotal+iva-retenciones).
+        const totalAPagar =
+          (d.subtotal || 0) + (d.iva || 0) - (d.reteFuente ?? 0) - (d.reteIva ?? 0) - (d.reteIca ?? 0);
+        if (isDuplicate(values, numTrim, String(d.nit ?? ""), d.proveedor, totalAPagar)) {
+          console.log(
+            `[safeAppend] DUP pre-append detectado en ${tabName}: numero="${numTrim}" nit="${d.nit ?? ""}" total=${totalAPagar} ya está en el Sheet. Skip append.`,
+          );
+          return null;
         }
         // Reusar esta misma lectura para saber dónde escribir, así appendToSheet
         // NO hace otra lectura (evita duplicar llamadas y reventar la quota Sheets).

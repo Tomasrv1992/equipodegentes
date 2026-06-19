@@ -19,6 +19,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { InvoiceData } from "./pipeline";
 import { acquireLlmToken } from "../../../shared/agents-runtime/src/llm-rate-limiter";
+// parseMonto: el LLM a veces devuelve montos como string COP ("1.234.567" / "$1.234,56");
+// Number() de eso da NaN. parseMonto normaliza separadores de miles/decimales COP.
+import { parseMonto } from "./validar-pipeline-core";
 
 export type DocumentSource = "cuenta_cobro" | "recibo_internacional" | "recibo_servicio" | "email_body";
 
@@ -153,8 +156,9 @@ export async function extractInvoiceFromText(
     }
 
     // Validación mínima
-    if (!json.fecha || !json.total || json.total <= 0) {
-      return null; // no parece factura válida
+    const totalParsed = parseMonto(json.total).valor;
+    if (!json.fecha || totalParsed == null || totalParsed <= 0) {
+      return null; // no parece factura válida (total ausente/no numérico/<=0)
     }
 
     // Validación self-emitted: si el NIT extraído coincide con el del cliente,
@@ -176,13 +180,13 @@ export async function extractInvoiceFromText(
       nit: nitExtraido,
       numero: String(json.numero || "").trim(),
       cufe: "", // no aplica para no-DIAN
-      subtotal: Number(json.subtotal) || Number(json.total),
-      iva: Number(json.iva) || 0,
-      total: Number(json.total),
+      subtotal: parseMonto(json.subtotal).valor ?? parseMonto(json.total).valor ?? 0,
+      iva: parseMonto(json.iva).valor ?? 0,
+      total: parseMonto(json.total).valor ?? 0,
       concepto: String(json.concepto || "").trim(),
       tipo: ctx.presumedType,
       moneda: String(json.moneda || "COP").toUpperCase(),
-      totalCop: Number(json.total_cop) || Number(json.total),
+      totalCop: parseMonto(json.total_cop).valor ?? parseMonto(json.total).valor ?? 0,
       confianza: Math.min(1, Math.max(0, Number(json.confianza) || 0.7)),
       notas: json.notas ? String(json.notas).trim() : undefined,
     };

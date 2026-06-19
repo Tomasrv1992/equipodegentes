@@ -3,7 +3,7 @@
  *
  * Compara Sheet vs Gmail (label "Procesado") y detecta:
  *   - Duplicación masiva (filas > emails procesados × 1.1)
- *   - Filas con col E (# Documento) vacía → riesgo de no-dedup
+ *   - Filas con col D (# Documento) vacía → riesgo de no-dedup
  *   - Numeros de documento repetidos en la misma pestaña
  *   - Mismo numero+proveedor en pestañas distintas (mismo mes)
  *
@@ -27,8 +27,13 @@ const MES_TABS = [
   "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ];
 
-const COL_NUMERO = 4;      // E (0-based)
-const COL_PROVEEDOR = 2;   // C (0-based)
+// Esquema A:M (13 cols) tras eliminar "#" y "Concepto" (2026-06-18).
+// BUG FIX 2026-06-18: estos índices estaban en E(4)/C(2) del esquema VIEJO; tras
+// el cambio de esquema el # Documento quedó en col D (idx 3) y Proveedor en col B
+// (idx 1). Con los índices viejos auditoria leía Subtotal como "numero" y NIT como
+// "proveedor" → reportaba basura (parte de por qué "la base no sirve").
+const COL_NUMERO = 3;      // D (0-based) — # Documento
+const COL_PROVEEDOR = 1;   // B (0-based) — Proveedor
 const PROCESSED_LABEL = "Procesado";
 
 interface NumeroDuplicado {
@@ -209,7 +214,7 @@ async function main() {
   }
   if (filasSinNumero > 0) {
     alertas.push(
-      `${filasSinNumero} filas SIN # Documento (col E vacía) — riesgo de no-dedup.`,
+      `${filasSinNumero} filas SIN # Documento (col D vacía) — riesgo de no-dedup.`,
     );
   }
   if (duplicados.length > 0) {

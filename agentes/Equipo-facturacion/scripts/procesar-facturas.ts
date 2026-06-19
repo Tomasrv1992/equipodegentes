@@ -20,6 +20,8 @@ const force = argv.includes("--force");
 const window = flag("--window") ?? "30d";
 const limitStr = flag("--limit");
 const limit = limitStr ? parseInt(limitStr, 10) : null;
+const monthStr = flag("--month");
+const monthFilter = monthStr ? parseInt(monthStr, 10) : undefined;
 
 const required = [
   "GOOGLE_CLIENT_ID",
@@ -44,7 +46,7 @@ const cfg: PipelineConfig = {
     sheetId: process.env.INVOICES_SHEET_ID!,
     sheetTab: process.env.INVOICES_SHEET_TAB || "Gastos 2026",
   },
-  options: { dryRun, window, limit, force },
+  options: { dryRun, window, limit, force, monthFilter },
 };
 
 run(cfg)

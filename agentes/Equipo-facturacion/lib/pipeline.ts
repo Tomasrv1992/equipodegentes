@@ -499,7 +499,7 @@ export async function run(cfg: PipelineConfig): Promise<PipelineResult> {
     try {
       const res = await sheets.spreadsheets.values.get({
         spreadsheetId: g.sheetId,
-        range: `${tabRange}!A:O`, // 15 cols nueva estructura (retenciones entre IVA y Total)
+        range: `${tabRange}!A:M`, // 13 cols nueva estructura (cols "#" y "Concepto" eliminadas 2026-06-18)
       });
       const rows = res.data.values || [];
       sheetRowsCache.set(tabName, rows);
@@ -1513,6 +1513,23 @@ function findDocxParts(payload: any) {
 }
 
 /**
+ * Detecta adjuntos Excel (.xlsx/.xls/.xlsm) — cuentas de cobro que algunos
+ * proveedores mandan como hoja de cálculo en vez de Word. SIEMPRE son gasto
+ * (cuenta de cobro) → se procesan como cuenta_cobro.
+ */
+function findXlsxParts(payload: any) {
+  const out: Array<{ filename: string; attachmentId: string }> = [];
+  function walk(part: any) {
+    if (part.filename && /\.(xlsx|xls|xlsm)$/i.test(part.filename) && part.body?.attachmentId) {
+      out.push({ filename: part.filename, attachmentId: part.body.attachmentId });
+    }
+    if (part.parts) part.parts.forEach(walk);
+  }
+  if (payload) walk(payload);
+  return out;
+}
+
+/**
  * Quick check: hay algún PDF que NO sea planilla SS?
  * Usado para decidir si aplicar pre-filtros antes de descargar.
  */
@@ -2372,22 +2389,36 @@ async function processOne(
   const zips = findZipParts(msg.payload);
   const planillas = findPlanillaPdfs(msg.payload);
   const docxs = findDocxParts(msg.payload);
+  const xlsxs = findXlsxParts(msg.payload);
 
-  // Sub-pipeline planillas: si NO hay ZIPs pero SÍ hay autoliquidaciones/comprobantes,
-  // tratar como planilla seguridad social. Va al folder del mes con fila en Sheet
-  // (categoría "Seguridad Social", total=0 — Tomás edita manual).
-  if (zips.length === 0 && planillas.length > 0) {
-    return await processPlanilla(
-      messageId, labelId, gmail, drive, sheets, g, planillas, subject, msg,
-      loadSheetRows, pushToCache, getNextConsecutivo,
-      nitCliente, // FIX 2026-05-27: pasar nitCliente para filtrar planillas terceros
-      clienteUuid, // guarda BD (migración 0018)
-    );
+  // 2026-06-18 (decisión Tomás): las PLANILLAS de seguridad social NO se procesan.
+  // Son de la persona natural que está haciendo el cobro (freelancer), NO un gasto
+  // de Dentilandia. Si el correo trae una CUENTA DE COBRO (docx/pdf/xlsx), se
+  // procesa la CC y la planilla se ignora (cae a los handlers de abajo, que
+  // excluyen las planillas). Si el correo trae SOLO planilla(s), se descarta acá.
+  const hayCuentaCobro =
+    docxs.length > 0 || xlsxs.length > 0 || hasNonPlanillaPdf(msg.payload, planillas);
+  if (zips.length === 0 && planillas.length > 0 && !hayCuentaCobro) {
+    await applyDescartadoLabel(gmail, messageId, "planilla-ignorada", labelId);
+    return {
+      skip: true,
+      reason: "planilla-ignorada (seguridad social de tercero, no es gasto de Dentilandia)",
+      subject,
+    };
   }
 
-  // PRE-FILTRO A+B (sender/subject) — aplica a flows que llaman LLM (.docx + PDF).
+  // PRE-FILTRO A+B (sender/subject) — aplica a flows que llaman LLM (.docx + .xlsx + PDF).
   // Si el sender o subject indican que NO es factura, skip sin cargar el adjunto.
-  if (zips.length === 0 && (docxs.length > 0 || hasNonPlanillaPdf(msg.payload, planillas))) {
+  // OVERRIDE CC-POSITIVO (2026-06-18): si el subject indica CUENTA DE COBRO, NO
+  // se aplica el pre-filtro de subject (una CC SIEMPRE es gasto → SIEMPRE entra).
+  // El pre-filtro de SENDER sí se respeta (un sender de marketing/redes no manda CC).
+  const subjLowPF = subject.toLowerCase();
+  const subjectIndicaCC =
+    /cuenta\s*de\s*cobro/.test(subjLowPF) ||
+    /nota\s*de\s*cobro/.test(subjLowPF) ||
+    /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)/.test(subjLowPF) ||
+    /documentaci[oó]n\s+cuenta\s*de\s*cobro/.test(subjLowPF);
+  if (zips.length === 0 && (docxs.length > 0 || xlsxs.length > 0 || hasNonPlanillaPdf(msg.payload, planillas))) {
     const { isLikelyNonInvoiceSender, isLikelyNonInvoiceSubject } = await import("./llm-pre-filters");
     if (isLikelyNonInvoiceSender(sender)) {
       llmTracker.preFilteredOut++;
@@ -2398,7 +2429,9 @@ async function processOne(
         subject,
       };
     }
-    if (isLikelyNonInvoiceSubject(subject)) {
+    // OVERRIDE CC-POSITIVO: si el subject dice "cuenta de cobro", NO lo botamos
+    // por el pre-filtro de subject (sería un falso negativo de un gasto real).
+    if (!subjectIndicaCC && isLikelyNonInvoiceSubject(subject)) {
       llmTracker.preFilteredOut++;
       await applyDescartadoLabel(gmail, messageId, "pre-filter-subject", labelId);
       return {
@@ -2409,11 +2442,26 @@ async function processOne(
     }
   }
 
-  // Sub-pipeline cuenta de cobro Word: si NO hay ZIPs ni planillas, pero SÍ hay .docx,
-  // tratar como cuenta de cobro. Extrae texto con mammoth + LLM Claude para datos.
+  // Sub-pipeline cuenta de cobro Word (.docx): tiene PRIORIDAD sobre Excel.
+  // 2026-06-19: muchos correos traen la CC real en .docx + un Excel auxiliar
+  // (RETEFUENTE / liquidación) que NO es la CC. Si procesáramos el xlsx primero,
+  // tomaríamos el Excel de retención, lo rechazaríamos y perderíamos la CC en docx.
+  // Por eso docx va PRIMERO; el xlsx solo se procesa si NO hay docx.
   if (zips.length === 0 && docxs.length > 0) {
     return await processCuentaCobroDocx(
       messageId, labelId, gmail, drive, sheets, g, docxs, subject, msg,
+      loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
+      getNextConsecutivo,
+      clienteUuid, // guarda BD (migración 0018)
+    );
+  }
+
+  // Sub-pipeline CUENTA DE COBRO EN EXCEL (.xlsx): solo si NO hay docx (el Excel
+  // es el único documento de cobro). Un email puede traer la CC en Excel + planilla
+  // PDF (que se ignora).
+  if (zips.length === 0 && xlsxs.length > 0) {
+    return await processCuentaCobroXlsx(
+      messageId, labelId, gmail, drive, sheets, g, xlsxs, subject, msg,
       loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
       getNextConsecutivo,
       clienteUuid, // guarda BD (migración 0018)
@@ -2949,14 +2997,16 @@ async function processCuentaCobroDocx(
       };
     }
 
-    // BLOQUE I — Validación preventiva exigente para cuentas de cobro
+    // BLOQUE I — Validación LAXA (cuenta de cobro). Una CC SIEMPRE es gasto:
+    // no la descartamos por faltar NIT (persona natural) ni por numero informal.
+    // Solo exige proveedor + fecha + total>0. Ver validarDocumentoCobro.
     {
-      const { validarFacturaCompleta } = await import("./validations");
-      const v = validarFacturaCompleta({
+      const { validarDocumentoCobro } = await import("./validations");
+      const v = validarDocumentoCobro({
         numero: extracted.numero,
         fecha: extracted.fecha,
         nit: extracted.nit,
-        total: extracted.total,
+        total: extracted.totalCop,
         proveedor: extracted.proveedor,
       });
       if (!v.esValida) {
@@ -2968,6 +3018,14 @@ async function processCuentaCobroDocx(
           subject,
         };
       }
+    }
+
+    // Si la CC no trae numero formal, sintetizamos uno estable (no rompe dedup:
+    // la guarda de BD usa el gmail messageId como dedupeKey cuando no hay CUFE).
+    // Formato: "CC-<MMM>-<8charsMsgId>" → legible y único por email.
+    if (!extracted.numero || String(extracted.numero).trim().length === 0) {
+      const mesIso = (extracted.fecha || "").slice(0, 7).replace("-", "");
+      extracted.numero = `CC-${mesIso}-${messageId.slice(0, 8)}`;
     }
 
     // Skip si el documento es una cuenta de cobro EMITIDA por el propio cliente.
@@ -3083,6 +3141,220 @@ async function processCuentaCobroDocx(
     await applyMonthLabel(gmail, messageId, year, month);
 
     console.log(`[cuenta-cobro] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} (${extracted.moneda}) confianza=${extracted.confianza.toFixed(2)}`);
+
+    return { ok: true, ...row, messageId };
+  } finally {
+    cleanupTmp(tmpPaths);
+  }
+}
+
+/**
+ * Sub-pipeline CUENTA DE COBRO EN EXCEL (.xlsx/.xls/.xlsm).
+ *
+ * Algunos proveedores (personas naturales / contratistas) mandan la cuenta de
+ * cobro como hoja de cálculo en vez de Word. SIEMPRE es gasto → SIEMPRE entra.
+ *
+ * Flujo idéntico a processCuentaCobroDocx pero:
+ *   - extrae texto con extractTextFromXlsx (SheetJS → CSV de todas las hojas)
+ *   - presumedType = "cuenta_cobro" + forceProcess=true (Excel ≈ siempre CC,
+ *     el LLM a veces no reconoce la pinta tabular como "factura").
+ *   - validación LAXA (validarDocumentoCobro): NIT/numero opcionales.
+ *   - sube el .xlsx a Drive + registra en Sheet.
+ */
+async function processCuentaCobroXlsx(
+  messageId: string,
+  labelProcesadoId: string,
+  gmail: any,
+  drive: any,
+  sheets: any,
+  g: PipelineConfig["google"],
+  xlsxs: Array<{ filename: string; attachmentId: string }>,
+  subject: string,
+  msg: any,
+  loadSheetRows: (tabName: string) => Promise<any[][]>,
+  pushToCache: (tabName: string, row: any[]) => void,
+  llmTracker: LlmTracker,
+  nitCliente: string | null,
+  nombreClienteNorm: string | null,
+  getNextConsecutivo: (tabName: string) => Promise<number>,
+  clienteUuid: string | null,
+): Promise<ProcessOneResult> {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return { skip: true, reason: "xlsx-sin-api-key (configurar ANTHROPIC_API_KEY)", subject };
+  }
+
+  const tmpPaths: string[] = [];
+  try {
+    // 1. Descargar el primer Excel (asumimos 1 cuenta de cobro por email)
+    const x = xlsxs[0];
+    const xlsxPath = await downloadAttachment(gmail, messageId, x.attachmentId, x.filename);
+    tmpPaths.push(xlsxPath);
+
+    // 2. Extraer texto (todas las hojas → CSV legible para el LLM)
+    const { extractTextFromXlsx } = await import("./doc-parsers");
+    const text = await extractTextFromXlsx(xlsxPath);
+    if (!text || text.length < 30) {
+      return { skip: true, reason: "xlsx-sin-texto-extraible", subject };
+    }
+
+    // PRE-FILTRO C: indicadores de factura. La planilla SS NO llega acá (es PDF),
+    // así que un Excel con indicadores casi siempre es CC legítima.
+    const { hasInvoiceIndicators } = await import("./llm-pre-filters");
+    if (!hasInvoiceIndicators(text)) {
+      llmTracker.preFilteredOut++;
+      await applyDescartadoLabel(gmail, messageId, "xlsx-no-es-factura", labelProcesadoId);
+      return { skip: true, reason: "xlsx-sin-indicadores-factura", subject };
+    }
+
+    // 3. LLM como cuenta_cobro con forceProcess=true (override CC-positivo:
+    // un Excel con indicadores de cobro SIEMPRE se intenta contabilizar).
+    const { extractInvoiceFromText } = await import("./llm-extractor");
+    const sender = getHeader(msg, "From") || "";
+    const dateHeader = getHeader(msg, "Date") || "";
+    llmTracker.calls++;
+    const extracted = await extractInvoiceFromText({
+      text,
+      presumedType: "cuenta_cobro",
+      filename: x.filename,
+      sender,
+      subject,
+      emailDate: dateHeader,
+      nitCliente,
+      nombreCliente: nombreClienteNorm,
+      forceProcess: true, // Excel ≈ siempre CC → no descartar por es_factura:false
+    });
+
+    if (!extracted) {
+      return { skip: true, reason: "xlsx-no-es-factura (LLM)", subject };
+    }
+
+    // Umbral laxo (forceProcess siempre on → 0.2). Notas crédito/certificados ya
+    // los filtró el extractor (guard determinístico) aunque forceProcess esté on.
+    const minConf = 0.2;
+    if (extracted.confianza < minConf) {
+      return {
+        skip: true,
+        reason: `xlsx-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
+        subject,
+      };
+    }
+
+    // BLOQUE I — Validación LAXA (cuenta de cobro).
+    {
+      const { validarDocumentoCobro } = await import("./validations");
+      const v = validarDocumentoCobro({
+        numero: extracted.numero,
+        fecha: extracted.fecha,
+        nit: extracted.nit,
+        total: extracted.totalCop,
+        proveedor: extracted.proveedor,
+      });
+      if (!v.esValida) {
+        await applyDescartadoLabel(gmail, messageId, "xlsx-invalida", labelProcesadoId);
+        console.log(`[skip-validacion-xlsx] cuenta-cobro inválida: ${v.motivos.join("; ")}`);
+        return { skip: true, reason: `xlsx-invalida: ${v.motivos.join("; ")}`, subject };
+      }
+    }
+
+    // Sintetizar numero estable si la CC en Excel no trae consecutivo.
+    if (!extracted.numero || String(extracted.numero).trim().length === 0) {
+      const mesIso = (extracted.fecha || "").slice(0, 7).replace("-", "");
+      extracted.numero = `CC-${mesIso}-${messageId.slice(0, 8)}`;
+    }
+
+    // Skip auto-emitida (cliente = emisor).
+    if (isSelfEmitted(extracted.proveedor, extracted.nit, nitCliente, nombreClienteNorm)) {
+      console.log(`[skip-self-emitted-xlsx] proveedor="${extracted.proveedor}" nit="${extracted.nit}" → cliente=emisor`);
+      await applyDescartadoLabel(gmail, messageId, "xlsx-self-emitted", labelProcesadoId);
+      return { skip: true, reason: "xlsx-self-emitted (cliente es emisor)", subject };
+    }
+
+    // 4. Year/month + skip pre-año-actual
+    const issue = new Date(extracted.fecha + "T00:00:00");
+    const year = issue.getFullYear();
+    const month = issue.getMonth() + 1;
+    const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
+    if (year < minYear) {
+      await applyDescartadoLabel(gmail, messageId, "fecha-año-anterior", labelProcesadoId);
+      return { skip: true, reason: `xlsx-fecha-año-anterior (${extracted.fecha} < ${minYear})`, subject };
+    }
+
+    // 5. Tab + folder del mes
+    const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
+    const tabRange = `'${tabName.replace(/'/g, "''")}'`;
+    const folderId = await getOrCreateMonthFolder(drive, g.driveFolderId, year, month);
+
+    // 6. Dedup por NIT+número en el Sheet
+    const sheetRows = await loadSheetRows(tabName);
+    if (extracted.numero && isDuplicate(sheetRows, extracted.numero, extracted.nit, extracted.proveedor)) {
+      await applyDescartadoLabel(gmail, messageId, "dup-en-sheet", labelProcesadoId);
+      return { dup: true, motivo: `${extracted.proveedor} ${extracted.numero} (ya en ${tabName})`, subject };
+    }
+
+    // GUARDA DE BD (migración 0018) — antes de Drive/Sheet. CC sin CUFE → dedupeKey=messageId.
+    const regBD = await intentarRegistroBD(clienteUuid, messageId, {
+      cufe: null,
+      numero: extracted.numero,
+      fecha: extracted.fecha,
+      nit: extracted.nit,
+      total: extracted.totalCop,
+    });
+    if (regBD.bloqueada) {
+      await applyDescartadoLabel(gmail, messageId, "dup-constraint-bd", labelProcesadoId);
+      return {
+        dup: true,
+        motivo: "constraint_unique_bd",
+        subject,
+        bloqueadaBd: true,
+        dedupeKey: regBD.dedupeKey,
+        messageId,
+      };
+    }
+
+    // 7. Consecutivo atómico
+    const consecutivo = await getNextConsecutivo(tabName);
+
+    // Override nombre comercial ANTES del filename
+    const { categoria, cuentaPyg, proveedorDisplay } = categorizar({
+      nit: extracted.nit,
+      concepto: extracted.concepto,
+    });
+    if (proveedorDisplay) extracted.proveedor = proveedorDisplay;
+
+    // 8. Subir el .xlsx a Drive (conserva extensión original del adjunto)
+    const ext = /\.(xls|xlsm)$/i.test(x.filename) ? x.filename.slice(x.filename.lastIndexOf(".")) : ".xlsx";
+    const baseName = buildFileBaseName(consecutivo, extracted.proveedor, extracted.numero);
+    const xlsxUniqueKey = `gmail:${messageId}:${x.filename}`;
+    const uploaded = await uploadFile(drive, xlsxPath, folderId, `${baseName}${ext}`, xlsxUniqueKey);
+    const driveLink = uploaded.webViewLink || "";
+
+    // 9. Append al Sheet
+    const row: ProcessedRow = {
+      fecha: extracted.fecha,
+      proveedor: extracted.proveedor,
+      nit: extracted.nit,
+      numero: extracted.numero,
+      cufe: "",
+      subtotal: extracted.subtotal,
+      iva: extracted.iva,
+      total: extracted.totalCop,
+      concepto: extracted.concepto + (extracted.moneda !== "COP" ? ` (${extracted.moneda})` : ""),
+      driveLink,
+      subject,
+      categoria,
+      cuentaPyg,
+      tipo: "cuenta_cobro",
+      consecutivo,
+    };
+    const newRow = await safeAppendToSheet(sheets, g.sheetId, tabRange, tabName, consecutivo, row, extracted.numero);
+    if (!newRow) {
+      await applyDescartadoLabel(gmail, messageId, "dup-guard-emergencia", labelProcesadoId);
+      return { dup: true, motivo: `guard-emergencia: ${extracted.proveedor} ${extracted.numero}`, subject };
+    }
+    pushToCache(tabName, newRow);
+
+    await applyMonthLabel(gmail, messageId, year, month);
+    console.log(`[cuenta-cobro-xlsx] ${extracted.proveedor} #${extracted.numero} ${extracted.totalCop} (${extracted.moneda}) confianza=${extracted.confianza.toFixed(2)}`);
 
     return { ok: true, ...row, messageId };
   } finally {
@@ -3212,24 +3484,42 @@ async function processGenericPdf(
       };
     }
 
-    // BLOQUE I — Validación preventiva exigente para PDFs
+    // BLOQUE I — Validación preventiva. Si el PDF terminó tratándose como
+    // CUENTA DE COBRO (el LLM lo extrajo con tipo cuenta_cobro o el fallback CC
+    // lo rescató con _forced), usamos la validación LAXA (proveedor+fecha+total>0,
+    // NIT/numero opcionales). Para recibos internacionales/servicios seguimos
+    // exigentes (validarFacturaCompleta).
     {
-      const { validarFacturaCompleta } = await import("./validations");
-      const v = validarFacturaCompleta({
+      // 2026-06-19 (decisión Tomás: las cuentas de cobro se contabilizan en
+      // cualquier formato): TODO el camino no-DIAN (PDF genérico) es GASTO —
+      // cuenta de cobro / recibo de servicio / internacional. Un numero informal
+      // o ausente NO debe botar un gasto real → SIEMPRE validación LAXA
+      // (proveedor + fecha + total>0; NIT/numero opcionales). Lo que no es gasto
+      // ya lo filtraron antes: pre-filtros sender/subject, es_factura del LLM, y
+      // los guards determinísticos (nota crédito, certificado, self-emitted).
+      const esCC = true;
+      const { validarDocumentoCobro } = await import("./validations");
+      const v = validarDocumentoCobro({
         numero: extracted.numero,
         fecha: extracted.fecha,
         nit: extracted.nit,
-        total: extracted.total,
+        total: extracted.totalCop,
         proveedor: extracted.proveedor,
       });
       if (!v.esValida) {
         await applyDescartadoLabel(gmail, messageId, "pdf-invalido", labelProcesadoId);
-        console.log(`[skip-validacion-pdf] pdf inválido: ${v.motivos.join("; ")}`);
+        console.log(`[skip-validacion-pdf] pdf inválido (no-DIAN/CC): ${v.motivos.join("; ")}`);
         return {
           skip: true,
           reason: `pdf-invalido: ${v.motivos.join("; ")}`,
           subject,
         };
+      }
+
+      // CC PDF sin numero formal → sintetizar consecutivo estable (igual que docx).
+      if (esCC && (!extracted.numero || String(extracted.numero).trim().length === 0)) {
+        const mesIso = (extracted.fecha || "").slice(0, 7).replace("-", "");
+        extracted.numero = `CC-${mesIso}-${messageId.slice(0, 8)}`;
       }
     }
 

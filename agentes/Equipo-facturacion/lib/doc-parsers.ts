@@ -2,6 +2,7 @@
  * Extractores de texto plano de adjuntos no-DIAN:
  *   - .docx (Word) → mammoth
  *   - .pdf → pdf-parse
+ *   - .xlsx / .xls (Excel) → xlsx (SheetJS)
  *
  * Devuelve string con el contenido textual del archivo, listo para pasar al LLM.
  */
@@ -17,6 +18,45 @@ export async function extractTextFromDocx(filePath: string): Promise<string> {
     return (result.value || "").trim();
   } catch (err: any) {
     console.warn(`extractTextFromDocx: ${filePath} failed: ${err.message}`);
+    return "";
+  }
+}
+
+/**
+ * Extrae texto plano de un .xlsx / .xls (Excel) — cuentas de cobro que algunos
+ * proveedores mandan como hoja de cálculo en vez de Word.
+ *
+ * Estrategia: recorrer TODAS las hojas y volcar cada una a CSV (filas y celdas
+ * legibles para el LLM). Concatenamos las hojas con un separador para que el LLM
+ * tenga el contexto completo. Limitamos por hoja para no inflar el prompt.
+ *
+ * Usa import dinámico de 'xlsx' (SheetJS) para no cargar la librería salvo que
+ * haya un Excel que procesar (mismo patrón que pdf-parse).
+ *
+ * Devuelve "" si falla (libro corrupto, password, etc).
+ */
+export async function extractTextFromXlsx(filePath: string): Promise<string> {
+  try {
+    // Import dinámico: SheetJS es pesado, solo se carga si hay un .xlsx real.
+    // @ts-ignore — xlsx no expone types ESM uniformes; casteo manual.
+    const XLSX = (await import("xlsx")).default ?? (await import("xlsx"));
+    const buffer = fs.readFileSync(filePath);
+    const wb = XLSX.read(buffer, { type: "buffer" });
+    const partes: string[] = [];
+    for (const sheetName of wb.SheetNames) {
+      const ws = wb.Sheets[sheetName];
+      if (!ws) continue;
+      // sheet_to_csv preserva la estructura tabular (filas/columnas) que es
+      // justo lo que una cuenta de cobro en Excel necesita para que el LLM
+      // ubique proveedor / NIT / valor.
+      const csv = XLSX.utils.sheet_to_csv(ws, { blankrows: false });
+      const trimmed = (csv || "").trim();
+      if (trimmed.length === 0) continue;
+      partes.push(`### Hoja: ${sheetName}\n${trimmed.slice(0, 8000)}`);
+    }
+    return partes.join("\n\n").trim();
+  } catch (err: any) {
+    console.warn(`extractTextFromXlsx: ${filePath} failed: ${err.message}`);
     return "";
   }
 }
@@ -77,12 +117,13 @@ export async function extractTextFromPdf(filePath: string): Promise<string> {
  * Detecta el tipo de adjunto por extensión.
  * Usado por el pipeline para decidir qué sub-pipeline aplicar.
  */
-export function attachmentType(filename: string): "docx" | "pdf" | "zip" | "xml" | "other" {
+export function attachmentType(filename: string): "docx" | "pdf" | "zip" | "xml" | "xlsx" | "other" {
   const lower = filename.toLowerCase();
-  if (lower.endsWith(".docx")) return "docx";
+  if (lower.endsWith(".docx") || lower.endsWith(".doc")) return "docx";
   if (lower.endsWith(".pdf")) return "pdf";
   if (lower.endsWith(".zip")) return "zip";
   if (lower.endsWith(".xml")) return "xml";
+  if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.endsWith(".xlsm")) return "xlsx";
   return "other";
 }
 

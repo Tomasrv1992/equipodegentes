@@ -182,3 +182,97 @@ export function validarFacturaCompleta(input: {
     motivos,
   };
 }
+
+/**
+ * Valida el número de una CUENTA DE COBRO (reglas LAXAS).
+ *
+ * A diferencia de `esNumeroFacturaValido` (factura DIAN, exigente), una cuenta
+ * de cobro de persona natural frecuentemente:
+ *   - NO tiene consecutivo formal ("" / ausente) → VÁLIDO (se sintetiza después).
+ *   - Tiene un consecutivo informal corto ("1", "143") → VÁLIDO.
+ *
+ * Pero SÍ rechazamos basura explícita (notación científica de Excel, palabras
+ * de prueba, "mayo de 2026"), igual que en facturas. La diferencia es que acá
+ * el VACÍO y la LONGITUD CORTA están permitidos.
+ */
+export function esNumeroDocumentoCobroValido(numero: unknown): boolean {
+  if (!numero) return true; // numero opcional en cuenta de cobro
+  const n = String(numero).trim();
+  if (n.length === 0) return true;
+  if (n.length > 50) return false;
+  // Notación científica de Excel (ej "0,00E+00")
+  if (/^[\d.,]+E[+\-]?\d+$/i.test(n)) return false;
+  // Palabras que indican prueba/error
+  if (/\b(PRUEBA|TEST|EJEMPLO|BORRAR|REVISAR|ERROR|TODO)\b/i.test(n)) return false;
+  // Nombre de mes en lugar de número ("mayo de 2026")
+  if (/^(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s/i.test(n)) {
+    return false;
+  }
+  // NOTA: a diferencia de facturas, NO exigimos length>=3 ni que tenga dígitos.
+  // Un numero como "A" o "uno" es informal pero no es basura sistémica.
+  return true;
+}
+
+/**
+ * Validación LAXA pero segura para documentos de cobro (cuenta_cobro en
+ * cualquier formato: docx, pdf, xlsx).
+ *
+ * Filosofía: una cuenta de cobro SIEMPRE es un gasto y SIEMPRE debe entrar a la
+ * contabilidad. No la descartamos por faltar campos OPCIONALES (NIT ausente en
+ * persona natural, numero informal). Lo INNEGOCIABLE para que sea un gasto
+ * contabilizable es:
+ *   1. proveedor (quién cobra) presente.
+ *   2. fecha válida (para ubicarla en el mes correcto).
+ *   3. total > 0 (un cobro de $0 no es un gasto).
+ *
+ * NIT y numero son OPCIONALES — si vienen, se valida que no sean basura; si no,
+ * se acepta. Esto NO abre la puerta a spam: los pre-filtros (sender/subject/
+ * indicadores) + la decisión del LLM (`es_factura`) + el guard de auto-emitido
+ * (self-emitted) ya filtran lo que no es cobro ANTES de llegar acá.
+ */
+export function validarDocumentoCobro(input: {
+  numero: unknown;
+  fecha: unknown;
+  nit: unknown;
+  total?: unknown;
+  proveedor?: unknown;
+}): ValidacionResultado {
+  const motivos: string[] = [];
+
+  // numero OPCIONAL (laxo): solo rechaza basura explícita, no vacío/corto.
+  if (!esNumeroDocumentoCobroValido(input.numero)) {
+    motivos.push(`numero: basura ("${input.numero}")`);
+  }
+
+  // fecha INNEGOCIABLE (para ubicar el mes correcto).
+  const razonFecha = razonFechaInvalida(input.fecha);
+  if (razonFecha) motivos.push(`fecha: ${razonFecha}`);
+
+  // nit OPCIONAL: esNitValido ya devuelve true para vacío; solo formato si viene.
+  if (!esNitValido(input.nit)) {
+    motivos.push(`nit: formato inválido ("${input.nit}")`);
+  }
+
+  // proveedor INNEGOCIABLE: sin quién cobra, no es gasto contabilizable.
+  if (!input.proveedor || String(input.proveedor).trim().length < 2) {
+    motivos.push(`proveedor: vacío o muy corto`);
+  }
+
+  // total INNEGOCIABLE: > 0 y no sospechoso.
+  if (input.total === undefined || input.total === null || input.total === "") {
+    motivos.push(`monto: ausente (una cuenta de cobro siempre tiene valor)`);
+  } else {
+    const n = Number(input.total);
+    if (isNaN(n) || n <= 0) {
+      motivos.push(`monto: debe ser > 0 (recibido: "${input.total}")`);
+    } else {
+      const monto = montoSospechoso(input.total);
+      if (monto.esSospechoso) motivos.push(`monto: ${monto.razon}`);
+    }
+  }
+
+  return {
+    esValida: motivos.length === 0,
+    motivos,
+  };
+}

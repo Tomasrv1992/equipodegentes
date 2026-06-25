@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agente de Facturación — Resumen del servicio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --ink:        oklch(0.24 0.025 255);   /* slate profundo casi tinta */
+    --ink-soft:   oklch(0.45 0.02 255);
+    --paper:      oklch(0.985 0.008 85);   /* blanco cálido (papel) */
+    --paper-2:    oklch(0.965 0.01 85);
+    --line:       oklch(0.88 0.01 255);
+    --emerald:    oklch(0.60 0.12 165);    /* conciliado / dinero ok */
+    --emerald-bg: oklch(0.95 0.04 165);
+    --amber:      oklch(0.72 0.12 70);     /* acento puntual */
+    --shadow:     0 1px 2px oklch(0.24 0.025 255 / 0.04), 0 8px 24px oklch(0.24 0.025 255 / 0.06);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+
+  body {
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    color: var(--ink);
+    background: var(--paper);
+    line-height: 1.65;
+    background-image:
+      radial-gradient(ellipse at 12% -5%, oklch(0.95 0.04 165 / 0.5), transparent 45%),
+      radial-gradient(ellipse at 95% 8%, oklch(0.93 0.05 70 / 0.35), transparent 40%),
+      radial-gradient(oklch(0.24 0.025 255 / 0.5) 0.5px, transparent 0.5px);
+    background-size: 100% 100%, 100% 100%, 22px 22px;
+    background-attachment: fixed;
+  }
+
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: clamp(28px, 5vw, 64px) clamp(20px, 5vw, 56px) 48px;
+  }
+
+  /* ---------- tipografía ---------- */
+  .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--emerald);
+    font-weight: 600;
+  }
+  h1 {
+    font-size: clamp(2.4rem, 6vw, 4rem);
+    font-weight: 800;
+    letter-spacing: -0.04em;
+    line-height: 1.02;
+    margin: 14px 0 16px;
+  }
+  h1 .hl { color: var(--emerald); }
+  .lead {
+    font-size: clamp(1.05rem, 2.2vw, 1.3rem);
+    font-weight: 400;
+    color: var(--ink-soft);
+    max-width: 38ch;
+  }
+  h2 {
+    font-size: clamp(1.35rem, 3vw, 1.9rem);
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    line-height: 1.1;
+  }
+  .section-tag {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    font-weight: 500;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  section { margin-top: clamp(40px, 7vw, 72px); }
+
+  /* ---------- header ---------- */
+  header { position: relative; }
+  .brandbar {
+    display: flex; align-items: center; gap: 10px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.8rem; font-weight: 600; color: var(--ink);
+    letter-spacing: 0.02em;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--emerald); box-shadow: 0 0 0 4px var(--emerald-bg); }
+
+  /* ---------- problema ---------- */
+  .pains { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 22px; }
+  .pain {
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 20px 18px;
+  }
+  .pain .ic { font-size: 1.4rem; }
+  .pain p { font-size: 0.92rem; color: var(--ink-soft); margin-top: 8px; }
+  .pain strong { color: var(--ink); font-weight: 700; display: block; margin-top: 10px; font-size: 0.98rem; }
+
+  /* ---------- flujo ---------- */
+  .flow { margin-top: 26px; position: relative; }
+  .step {
+    display: grid;
+    grid-template-columns: 64px 1fr;
+    gap: 20px;
+    padding: 18px 0;
+    position: relative;
+  }
+  .step:not(:last-child)::after {
+    content: ""; position: absolute;
+    left: 31px; top: 56px; bottom: -6px; width: 2px;
+    background: linear-gradient(var(--line), var(--line));
+  }
+  .step .num {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.05rem; font-weight: 600;
+    width: 48px; height: 48px; border-radius: 12px;
+    display: grid; place-items: center;
+    background: var(--ink); color: var(--paper);
+    box-shadow: var(--shadow);
+    z-index: 1;
+  }
+  .step h3 { font-size: 1.08rem; font-weight: 700; letter-spacing: -0.01em; }
+  .step p { font-size: 0.95rem; color: var(--ink-soft); margin-top: 3px; }
+
+  /* ---------- formatos ---------- */
+  .formats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 22px; }
+  .fcard {
+    background: var(--paper-2); border: 1px solid var(--line);
+    border-radius: 14px; padding: 18px;
+  }
+  .fcard h4 { font-size: 0.98rem; font-weight: 700; margin-bottom: 8px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem; font-weight: 500;
+    padding: 4px 9px; border-radius: 7px;
+    background: var(--paper); border: 1px solid var(--line); color: var(--ink-soft);
+  }
+
+  /* ---------- métricas ---------- */
+  .metrics {
+    background: var(--ink);
+    border-radius: 22px;
+    padding: clamp(26px, 4vw, 40px);
+    color: var(--paper);
+    box-shadow: var(--shadow);
+    position: relative; overflow: hidden;
+  }
+  .metrics::before {
+    content: ""; position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 85% 0%, oklch(0.60 0.12 165 / 0.35), transparent 55%);
+  }
+  .metrics .section-tag { color: oklch(0.8 0.03 165); position: relative; }
+  .mgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; margin-top: 20px; position: relative; }
+  .metric .big {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: clamp(2.2rem, 5vw, 3.1rem);
+    font-weight: 600; line-height: 1;
+    letter-spacing: -0.03em;
+    color: oklch(0.92 0.06 165);
+  }
+  .metric .lbl { font-size: 0.86rem; color: oklch(0.82 0.01 255); margin-top: 8px; font-weight: 400; }
+
+  .proof {
+    margin-top: 24px; position: relative;
+    display: flex; align-items: center; gap: 12px;
+    font-size: 0.9rem; color: oklch(0.88 0.01 255);
+    padding-top: 20px; border-top: 1px solid oklch(0.4 0.02 255);
+  }
+  .proof .badge {
+    font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; font-weight: 600;
+    color: var(--ink); background: oklch(0.92 0.06 165);
+    padding: 5px 10px; border-radius: 7px; white-space: nowrap;
+  }
+
+  /* ---------- beneficios + cierre ---------- */
+  .benefits { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 28px; margin-top: 22px; }
+  .benefit { display: flex; gap: 12px; align-items: flex-start; }
+  .benefit .check {
+    flex: none; width: 22px; height: 22px; border-radius: 6px;
+    background: var(--emerald-bg); color: var(--emerald);
+    display: grid; place-items: center; font-weight: 800; font-size: 0.8rem; margin-top: 2px;
+  }
+  .benefit p { font-size: 0.96rem; }
+  .benefit strong { font-weight: 700; }
+
+  .cta {
+    margin-top: clamp(40px, 6vw, 64px);
+    background: var(--emerald-bg);
+    border: 1px solid oklch(0.82 0.07 165);
+    border-radius: 20px;
+    padding: clamp(26px, 4vw, 38px);
+    text-align: center;
+  }
+  .cta h2 { color: oklch(0.34 0.07 165); }
+  .cta p { color: oklch(0.42 0.05 165); margin-top: 8px; font-size: 1.02rem; }
+  .who {
+    display: inline-flex; gap: 8px; flex-wrap: wrap; justify-content: center;
+    margin-top: 18px;
+  }
+  .who span {
+    font-family: 'IBM Plex Mono', monospace; font-size: 0.74rem; font-weight: 500;
+    background: var(--paper); border: 1px solid oklch(0.82 0.07 165);
+    color: oklch(0.38 0.06 165); padding: 6px 12px; border-radius: 999px;
+  }
+
+  footer {
+    margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line);
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+    font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; color: var(--ink-soft);
+  }
+
+  /* ---------- motion ---------- */
+  .reveal { opacity: 0; transform: translateY(14px); animation: rise 0.7s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  section:nth-of-type(1) .reveal { animation-delay: 0.05s; }
+  section:nth-of-type(2) .reveal { animation-delay: 0.1s; }
+  header .reveal:nth-child(2) { animation-delay: 0.08s; }
+  header .reveal:nth-child(3) { animation-delay: 0.16s; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { animation: none; opacity: 1; transform: none; }
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 720px) {
+    .pains, .formats, .mgrid, .benefits { grid-template-columns: 1fr; }
+    .mgrid { grid-template-columns: 1fr 1fr; gap: 18px; }
+  }
+
+  /* ---------- print / PDF ---------- */
+  @media print {
+    body { background: #fff; }
+    .page { max-width: none; padding: 0; }
+    .metrics, .cta, .pain, .fcard { box-shadow: none; }
+    section { break-inside: avoid; }
+    .reveal { opacity: 1; transform: none; animation: none; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- HEADER -->
+  <header>
+    <div class="brandbar reveal"><span class="dot"></span> AGENTE DE FACTURACIÓN</div>
+    <h1 class="reveal">Ningún gasto se<br /><span class="hl">pierde en el correo.</span></h1>
+    <p class="lead reveal">Captura, organiza y concilia <strong>todos</strong> los documentos de gasto de tu empresa —
+      facturas DIAN, cuentas de cobro y recibos de plataformas— de forma automática y auditable.</p>
+  </header>
+
+  <!-- PROBLEMA -->
+  <section>
+    <span class="section-tag reveal">El problema</span>
+    <h2 class="reveal">Los gastos llegan dispersos y conciliarlos a mano cuesta plata.</h2>
+    <div class="pains">
+      <div class="pain reveal">
+        <div class="ic">📥</div>
+        <strong>Llegan por todos lados</strong>
+        <p>ZIP de la DIAN, cuentas de cobro en Word/Excel, recibos de Meta, Google, Anthropic… mezclados en el correo.</p>
+      </div>
+      <div class="pain reveal">
+        <div class="ic">🕳️</div>
+        <strong>Se pierden gastos</strong>
+        <p>Lo que no se registra no se deduce. IVA y retenciones mal cargadas = más impuestos y soportes incompletos.</p>
+      </div>
+      <div class="pain reveal">
+        <div class="ic">⏳</div>
+        <strong>Horas de digitación</strong>
+        <p>Descargar, renombrar, copiar a un Excel, archivar el PDF… repetido cada día, factura por factura.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- CÓMO FUNCIONA -->
+  <section>
+    <span class="section-tag reveal">Cómo funciona</span>
+    <h2 class="reveal">De tu bandeja de entrada a un registro contable conciliado.</h2>
+    <div class="flow">
+      <div class="step reveal">
+        <div class="num">01</div>
+        <div><h3>Lee el correo, todos los días</h3>
+        <p>Vigila un buzón dedicado y detecta cada documento de gasto sin que nadie tenga que reenviar nada.</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num">02</div>
+        <div><h3>Identifica y clasifica</h3>
+        <p>Distingue facturas DIAN, cuentas de cobro y recibos de plataforma. Descarta lo que no es gasto (notas crédito, planillas ajenas).</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num">03</div>
+        <div><h3>Extrae los datos con IA</h3>
+        <p>Proveedor, NIT, número, subtotal, IVA, retenciones y total — en cualquier formato: PDF, Word, Excel o XML.</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num">04</div>
+        <div><h3>Archiva y registra</h3>
+        <p>Guarda el soporte en Drive organizado por mes y lo escribe en un Sheet con su categoría contable (PUC).</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num">05</div>
+        <div><h3>Concilia automáticamente</h3>
+        <p>Verifica que <em>correos = registro = soportes</em>. Detecta duplicados y reenvíos, sin contar dos veces la misma factura.</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num">06</div>
+        <div><h3>Deja todo auditable</h3>
+        <p>Cada documento, etiquetado y trazable. Si algo no cuadra, lo señala con evidencia para el cliente y el contador.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FORMATOS -->
+  <section>
+    <span class="section-tag reveal">Captura cualquier gasto</span>
+    <h2 class="reveal">Multi-formato y multi-fuente.</h2>
+    <div class="formats">
+      <div class="fcard reveal">
+        <h4>📄 Facturas electrónicas</h4>
+        <div class="chips"><span class="chip">DIAN .zip</span><span class="chip">XML / UBL</span><span class="chip">PDF</span></div>
+      </div>
+      <div class="fcard reveal">
+        <h4>🧾 Cuentas de cobro</h4>
+        <div class="chips"><span class="chip">Word</span><span class="chip">Excel</span><span class="chip">PDF</span><span class="chip">sin consecutivo</span></div>
+      </div>
+      <div class="fcard reveal">
+        <h4>💳 Recibos de plataformas</h4>
+        <div class="chips"><span class="chip">Meta</span><span class="chip">Google</span><span class="chip">Anthropic</span><span class="chip">Stripe</span><span class="chip">AWS</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- MÉTRICAS -->
+  <section>
+    <div class="metrics reveal">
+      <span class="section-tag">Resultados</span>
+      <div class="mgrid">
+        <div class="metric"><div class="big">100%</div><div class="lbl">de los gastos del correo capturados</div></div>
+        <div class="metric"><div class="big">0</div><div class="lbl">duplicados en el registro</div></div>
+        <div class="metric"><div class="big">3 en 1</div><div class="lbl">Gmail = Sheet = Drive conciliados</div></div>
+        <div class="metric"><div class="big">24/7</div><div class="lbl">corre solo, sin digitación manual</div></div>
+      </div>
+      <div class="proof">
+        <span class="badge">PILOTO REAL</span>
+        <span>6 meses procesados de punta a punta — <strong>0 descuadres, 0 duplicados</strong>, soportes y registro cuadrando al 100%.</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- BENEFICIOS -->
+  <section>
+    <span class="section-tag reveal">Por qué importa</span>
+    <h2 class="reveal">Menos impuestos pagados de más, cero soportes perdidos.</h2>
+    <div class="benefits">
+      <div class="benefit reveal"><div class="check">✓</div><p><strong>Capturas todo gasto deducible</strong> — nada se queda enterrado en el correo.</p></div>
+      <div class="benefit reveal"><div class="check">✓</div><p><strong>IVA y retenciones bien cargadas</strong> desde el documento original.</p></div>
+      <div class="benefit reveal"><div class="check">✓</div><p><strong>Soportes listos para el contador y la DIAN</strong>, organizados por mes.</p></div>
+      <div class="benefit reveal"><div class="check">✓</div><p><strong>Conciliación verificable</strong> — evidencia clara si algo no cuadra.</p></div>
+      <div class="benefit reveal"><div class="check">✓</div><p><strong>Horas de trabajo manual eliminadas</strong> cada mes.</p></div>
+      <div class="benefit reveal"><div class="check">✓</div><p><strong>Sin cambiar tu operación</strong> — solo un buzón dedicado.</p></div>
+    </div>
+  </section>
+
+  <!-- CIERRE -->
+  <section>
+    <div class="cta reveal">
+      <h2>Tus gastos, capturados y conciliados — sin que muevas un dedo.</h2>
+      <p>Ideal para PYMEs, consultorías y contadores en Colombia.</p>
+      <div class="who">
+        <span>PYMEs</span><span>Consultorías</span><span>Contadores</span><span>Clínicas</span><span>Agencias</span>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>AGENTE DE FACTURACIÓN · automatización de gastos</span>
+    <span>conciliación verificada · Gmail · Drive · Sheets</span>
+  </footer>
+
+</div>
+</body>
+</html>

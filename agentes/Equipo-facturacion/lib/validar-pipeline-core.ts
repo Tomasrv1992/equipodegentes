@@ -447,6 +447,43 @@ export function esNumeroNoInformativo(numero: string | null | undefined): boolea
   return false;
 }
 
+/**
+ * CHEQUEO DE COMPLETITUD: clasifica un correo CON documento adjunto que NO llegó
+ * al Sheet (sin etiqueta Facturas, o en Descartado) para detectar facturas que el
+ * pipeline perdió. Cierra el punto ciego: el cruce Sheet⇄Drive solo ve lo que SÍ
+ * se procesó; esto mira lo que NUNCA entró.
+ *
+ * Usa el formato de asunto DIAN reenviado "NIT;proveedor;numero;tipo;...":
+ *   - "ruido"        → CV, vacante, seguridad social sola, bitácora… (no es gasto)
+ *   - "nota-credito" → NTC/NC/NCC/CNE/ND (bien excluida, no es factura nueva)
+ *   - "ya-en-sheet"  → su numero ya está registrado (ok)
+ *   - "falta"        → numero DIAN que NO está en el Sheet → FACTURA PERDIDA
+ *   - "revisar"      → sin numero parseable en el asunto → requiere ojo humano
+ */
+export function clasificarDocSinProcesar(
+  subject: string,
+  sheetNumeros: Set<string>,
+): { tipo: "ruido" | "nota-credito" | "ya-en-sheet" | "falta" | "revisar"; numero: string } {
+  const noise =
+    /hoja de vida|vacante|auxiliar|odontolog|aspirante|seguridad social|planilla|afiliaci|bitacora|bitácora|curriculum|postulaci|orden atenci|truly nolen|certificado lavado|riesgo psicosocial|aptitud laboral/i;
+  if (noise.test(subject)) return { tipo: "ruido", numero: "" };
+  const parts = subject.replace(/^fwd:\s*/i, "").split(";");
+  if (parts.length < 3 || !/^\d{6,}$/.test(parts[0].trim())) {
+    return { tipo: "revisar", numero: "" };
+  }
+  const numero = parts[2].trim();
+  // El 4º campo del asunto DIAN es el InvoiceTypeCode: 91=nota crédito, 92=débito,
+  // 95/96=ajuste → NO son factura nueva (bien excluidas, no son "falta").
+  const tipoDoc = (parts[3] ?? "").trim();
+  if (/^(91|92|95|96)$/.test(tipoDoc)) return { tipo: "nota-credito", numero };
+  if (/^(NTC|NC|NCC|CNE|ND)\d/i.test(numero)) return { tipo: "nota-credito", numero };
+  const numNorm = numeroSinCerosIzq(normalizeNumero(numero));
+  if (!numNorm) return { tipo: "revisar", numero };
+  return sheetNumeros.has(numNorm)
+    ? { tipo: "ya-en-sheet", numero }
+    : { tipo: "falta", numero };
+}
+
 export interface GrupoDuplicado {
   key: string; // numeroNorm|nitNorm (o |provNorm si falta NIT)
   numeroNorm: string;
@@ -617,6 +654,12 @@ export interface VeredictoInput {
   crucesMes: CruceMesResult[];
   /** Descartes sospechosos (remitentes-gasto botados) detectados aparte. */
   descartesSospechosos: number;
+  /**
+   * COMPLETITUD: facturas DIAN (por numero del asunto) que están en el correo
+   * pero NO en el Sheet (perdidas por el pipeline). > 0 ⇒ FALLA: hay gasto sin
+   * capturar. Default 0 para compatibilidad con llamadas viejas/tests.
+   */
+  facturasSinProcesar?: number;
 }
 
 export interface Veredicto {
@@ -627,13 +670,14 @@ export interface Veredicto {
   duplicados: number;
   meses_con_huerfanos: number;
   descartes_sospechosos: number;
+  facturas_sin_procesar: number;
   /** Resumen 1-línea por severidad agregando todo. */
   resumen: string;
 }
 
 /**
- * Veredicto global: ok=true SOLO si 0 HALT, 0 duplicados, 0 huérfanos de mes.
- * WARN y descartes sospechosos NO tumban ok pero se cuentan y reportan.
+ * Veredicto global: ok=true SOLO si 0 HALT, 0 duplicados, 0 huérfanos de mes y
+ * 0 facturas sin procesar (completitud). WARN y descartes sospechosos NO tumban ok.
  */
 export function veredictoFinal(input: VeredictoInput): Veredicto {
   const halts = input.problemasFila.filter((p) => p.severidad === "HALT").length;
@@ -641,10 +685,13 @@ export function veredictoFinal(input: VeredictoInput): Veredicto {
   const logs = input.problemasFila.filter((p) => p.severidad === "LOG").length;
   const duplicados = input.duplicados.length;
   const meses_con_huerfanos = input.crucesMes.filter((c) => !c.ok).length;
-  const ok = halts === 0 && duplicados === 0 && meses_con_huerfanos === 0;
+  const facturas_sin_procesar = input.facturasSinProcesar ?? 0;
+  const ok =
+    halts === 0 && duplicados === 0 && meses_con_huerfanos === 0 && facturas_sin_procesar === 0;
   const resumen =
     `${ok ? "OK" : "FALLA"} · ${halts} HALT · ${warns} WARN · ${duplicados} duplicados · ` +
-    `${meses_con_huerfanos} meses con huérfanos · ${input.descartesSospechosos} descartes sospechosos`;
+    `${meses_con_huerfanos} meses con huérfanos · ${facturas_sin_procesar} facturas sin procesar · ` +
+    `${input.descartesSospechosos} descartes sospechosos`;
   return {
     ok,
     halts,
@@ -653,6 +700,7 @@ export function veredictoFinal(input: VeredictoInput): Veredicto {
     duplicados,
     meses_con_huerfanos,
     descartes_sospechosos: input.descartesSospechosos,
+    facturas_sin_procesar,
     resumen,
   };
 }

@@ -1604,6 +1604,56 @@ function hasNonPlanillaPdf(payload: any, planillas: Array<{ filename: string }>)
 }
 
 /**
+ * Regla de negocio (Tomás 2026-06-19): un correo que trae PLANILLA de seguridad
+ * social adjunta + un FORMATO DE RETENCIÓN (retefuente) es, con altísima certeza,
+ * una CUENTA DE COBRO de persona natural (la SS y la retención son los soportes
+ * del cobro). Cuando esto se cumple, NO debemos descartar el documento de cobro
+ * por un falso-negativo del LLM ("no es factura") → forzamos su procesamiento.
+ */
+export function tieneSoportesCuentaCobro(payload: any, planillas: Array<{ filename: string }>): boolean {
+  if (!planillas.length) return false;
+  const names: string[] = [];
+  (function walk(p: any) {
+    if (!p) return;
+    if (p.filename) names.push(String(p.filename));
+    if (p.parts) p.parts.forEach(walk);
+  })(payload);
+  // retención: "retefuente", "rte fte", "retención". (autoliquidación = la SS, ya
+  // detectada por planillas; acá buscamos el formato de retención que la acompaña.)
+  return names.some((n) => /retef|rte\s*fte|retenci[oó]n/i.test(n));
+}
+
+/**
+ * Resuelve el periodo (año/mes) de una CUENTA DE COBRO tolerando fechas de
+ * plantilla. Si la fecha extraída quedó en un año < minYear (típico: el freelancer
+ * reusó la plantilla del año pasado) PERO el correo se recibió en minYear o después,
+ * usamos la fecha del email — la CC pertenece al periodo en que se envió. Devuelve
+ * null sólo si ni la extracción ni el email alcanzan minYear (es realmente vieja).
+ */
+export function resolverFechaCC(
+  fechaExtraida: string,
+  dateHeader: string,
+  minYear: number,
+): { fecha: string; year: number; month: number } | null {
+  const parse = (s: string) => {
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  };
+  const ext = parse(`${fechaExtraida}T00:00:00`);
+  if (ext && ext.getFullYear() >= minYear) {
+    return { fecha: fechaExtraida, year: ext.getFullYear(), month: ext.getMonth() + 1 };
+  }
+  const email = parse(dateHeader);
+  if (email && email.getFullYear() >= minYear) {
+    const y = email.getFullYear();
+    const m = email.getMonth() + 1;
+    const fecha = `${y}-${String(m).padStart(2, "0")}-${String(email.getDate()).padStart(2, "0")}`;
+    return { fecha, year: y, month: m };
+  }
+  return null;
+}
+
+/**
  * Detecta PDFs adjuntos genéricos (no DIAN ZIP, no planilla SS).
  * Usado para recibos internacionales (Stripe, AWS) y servicios locales no-DIAN.
  */
@@ -1815,17 +1865,20 @@ export function parseInvoiceXml(
   }
   if (!invoice) return null;
 
-  // Filtro tipo de documento DIAN:
-  //   01 = Factura electrónica (procesar)
-  //   02 = Documento equivalente
-  //   05 = Nota de retención / certificado RTE (NO es factura, skip)
-  //   07 = Comprobante de retención (skip)
-  //   91 = Nota crédito (skip — no es factura nueva)
-  //   92 = Nota débito (skip)
-  // Solo procesamos type 01 y 02 que son facturas reales de compra.
+  // Filtro tipo de documento DIAN (InvoiceTypeCode dentro de <Invoice>):
+  //   01/02 = Factura de Venta/Exportación; 03/04 = Factura por contingencia;
+  //   20 y otros = documentos equivalentes / soporte de compra → TODOS son gasto.
+  //   SOLO se rechazan los que NO son factura de compra: 05/07 retención-comprobante,
+  //   91 nota crédito, 92 nota débito, 95/96 notas de ajuste.
+  // 2026-06-19 (fix auditoría): antes whitelist {01,02} → botaba contingencia
+  // (03/04: ÉXITO, D1) y documentos equivalentes (20: PROTOKIMICA) como
+  // "no-es-factura-dian" (facturas perdidas). Las notas crédito reales vienen con
+  // raíz CreditNote/DebitNote (ya filtradas por !parsed.Invoice arriba); el
+  // blacklist por InvoiceTypeCode es la segunda barrera por si vinieran como Invoice.
+  const TIPOS_NO_FACTURA = new Set(["05", "07", "91", "92", "95", "96"]);
   const tipoDoc = asString(pick(invoice, "InvoiceTypeCode") ?? "");
-  if (tipoDoc && tipoDoc !== "01" && tipoDoc !== "02") {
-    console.log(`[skip-tipo-doc] tipoDoc=${tipoDoc} (no es factura, es retención/nota crédito/débito)`);
+  if (tipoDoc && TIPOS_NO_FACTURA.has(tipoDoc)) {
+    console.log(`[skip-tipo-doc] tipoDoc=${tipoDoc} (no es factura de compra: retención/nota crédito/débito/ajuste)`);
     return null;
   }
 
@@ -2488,6 +2541,9 @@ async function processOne(
   const planillas = findPlanillaPdfs(msg.payload);
   const docxs = findDocxParts(msg.payload);
   const xlsxs = findXlsxParts(msg.payload);
+  // Regla SS+retención = cuenta de cobro (Tomás): si se cumple, forzamos el
+  // procesamiento del documento de cobro aunque el LLM dude (evita falsos negativos).
+  const forzarCC = tieneSoportesCuentaCobro(msg.payload, planillas);
 
   // 2026-06-18 (decisión Tomás): las PLANILLAS de seguridad social NO se procesan.
   // Son de la persona natural que está haciendo el cobro (freelancer), NO un gasto
@@ -2551,6 +2607,7 @@ async function processOne(
       loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
       getNextConsecutivo,
       clienteUuid, // guarda BD (migración 0018)
+      forzarCC,
     );
   }
 
@@ -2563,6 +2620,7 @@ async function processOne(
       loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
       getNextConsecutivo,
       clienteUuid, // guarda BD (migración 0018)
+      forzarCC,
     );
   }
 
@@ -2577,11 +2635,15 @@ async function processOne(
         loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
         getNextConsecutivo,
         clienteUuid, // guarda BD (migración 0018)
+        forzarCC,
       );
     }
   }
 
-  if (zips.length === 0) return { skip: true, reason: "sin-zip", subject };
+  if (zips.length === 0) {
+    await applyDescartadoLabel(gmail, messageId, "sin-zip", labelId);
+    return { skip: true, reason: "sin-zip", subject };
+  }
 
   // Tracking de tmp paths para cleanup garantizado en finally.
   const tmpPaths: string[] = [];
@@ -2596,11 +2658,25 @@ async function processOne(
       extracted = extractZip(zipPath);
       tmpPaths.push(extracted.tmpDir);
     } catch (e: any) {
-      // ZIPs con password / corruptos no son facturas DIAN procesables — skip silencioso
+      // ZIPs con password / corruptos no son facturas DIAN procesables.
+      await applyDescartadoLabel(gmail, messageId, "zip-no-procesable", labelId);
       return { skip: true, reason: `zip-no-procesable: ${e.message}`, subject };
     }
     const { pdfPath, xmlPaths } = extracted;
     if (!xmlPaths.length) {
+      // ZIP sin XML pero CON PDF: es una factura cuya representación gráfica es el
+      // PDF (caso real: FES-*.pdf de personas naturales/servicios). NO descartar —
+      // reusar el flujo de PDF genérico (LLM) con el PDF local del ZIP.
+      if (pdfPath) {
+        return await processGenericPdf(
+          messageId, labelId, gmail, drive, sheets, g, [], subject, msg,
+          loadSheetRows, pushToCache, llmTracker, nitCliente, nombreClienteNorm,
+          getNextConsecutivo, clienteUuid,
+          forzarCC,
+          { path: pdfPath, filename: path.basename(pdfPath) },
+        );
+      }
+      await applyDescartadoLabel(gmail, messageId, "zip-sin-xml", labelId);
       return { skip: true, reason: "zip-sin-xml", subject };
     }
 
@@ -2616,7 +2692,10 @@ async function processOne(
         /* probar el siguiente XML */
       }
     }
-    if (!data) return { skip: true, reason: "no-es-factura-dian", subject };
+    if (!data) {
+      await applyDescartadoLabel(gmail, messageId, "no-es-factura-dian", labelId);
+      return { skip: true, reason: "no-es-factura-dian", subject };
+    }
 
     // FIX C 2026-05-19: si parseInvoiceXml no extrajo numero (XML malformado o
     // ZIP corrupto), marcamos el email como procesado y salimos. Sin numero
@@ -2653,7 +2732,13 @@ async function processOne(
     }
 
     // year/month derivados del IssueDate del XML (no del header del email).
-    const issue = data.fecha ? new Date(data.fecha) : new Date();
+    // BUG FIX 2026-06-19: `new Date("2026-01-01")` parsea como UTC medianoche →
+    // en Bogotá (UTC-5) cae al DÍA ANTERIOR → toda factura del día 1 caía al mes
+    // anterior, y las del 1-ene se perdían (año anterior → filtro minYear). Forzamos
+    // parseo LOCAL tomando solo YYYY-MM-DD + "T00:00:00".
+    const issue = data.fecha
+      ? new Date(`${String(data.fecha).slice(0, 10)}T00:00:00`)
+      : new Date();
     const year = issue.getFullYear();
     const month = issue.getMonth() + 1;
 
@@ -2998,6 +3083,7 @@ async function processCuentaCobroDocx(
   nombreClienteNorm: string | null,
   getNextConsecutivo: (tabName: string) => Promise<number>,
   clienteUuid: string | null,
+  forzarCC: boolean = false, // SS+retención=CC: forzar aunque el LLM dude
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -3069,8 +3155,10 @@ async function processCuentaCobroDocx(
         /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)/i.test(subjLow) ||
         /documentaci[oó]n\s+cuenta\s*de\s*cobro/i.test(subjLow) ||
         /^fwd:\s*documentaci[oó]n\s+smb/i.test(subjLow);
-      if (isCCSubject) {
-        console.log(`[cc-fallback] subject matchea CC pattern, reintentando con forceProcess: ${subject.slice(0, 60)}`);
+      // forzarCC: regla SS+retención=CC (Tomás) → es una CC segura aunque el
+      // subject no lo diga y el LLM dude. NO la perdemos.
+      if (isCCSubject || forzarCC) {
+        console.log(`[cc-fallback] ${forzarCC ? "SS+retención" : "subject"} indica CC, reintentando con forceProcess: ${subject.slice(0, 60)}`);
         llmTracker.calls++;
         extracted = await extractInvoiceFromText({
           text, presumedType: "cuenta_cobro", filename: d.filename,
@@ -3099,7 +3187,13 @@ async function processCuentaCobroDocx(
     // no la descartamos por faltar NIT (persona natural) ni por numero informal.
     // Solo exige proveedor + fecha + total>0. Ver validarDocumentoCobro.
     {
-      const { validarDocumentoCobro } = await import("./validations");
+      const { validarDocumentoCobro, esNumeroDocumentoCobroValido } = await import("./validations");
+      // numero basura ("0,00E+00", "PRUEBA", "mayo de 2026") en una CC NO es razón
+      // para descartar (es opcional) → lo limpiamos y se sintetiza abajo.
+      if (extracted.numero && !esNumeroDocumentoCobroValido(extracted.numero)) {
+        console.log(`[cc-numero-basura] numero inválido "${extracted.numero}" → se sintetizará`);
+        extracted.numero = "";
+      }
       const v = validarDocumentoCobro({
         numero: extracted.numero,
         fecha: extracted.fecha,
@@ -3136,14 +3230,11 @@ async function processCuentaCobroDocx(
       return { skip: true, reason: "docx-self-emitted (cliente es emisor)", subject };
     }
 
-    // 4. Year/month del documento
-    const issue = new Date(extracted.fecha + "T00:00:00");
-    const year = issue.getFullYear();
-    const month = issue.getMonth() + 1;
-
-    // Skip pre-año-actual (mismo guard que facturas DIAN)
+    // 4. Year/month del documento. CC con fecha de plantilla del año pasado pero
+    // recibida este año → usar la fecha del email (resolverFechaCC).
     const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
-    if (year < minYear) {
+    const fechaCC = resolverFechaCC(extracted.fecha, dateHeader, minYear);
+    if (!fechaCC) {
       await applyDescartadoLabel(gmail, messageId, "fecha-año-anterior", labelProcesadoId);
       return {
         skip: true,
@@ -3151,6 +3242,9 @@ async function processCuentaCobroDocx(
         subject,
       };
     }
+    extracted.fecha = fechaCC.fecha;
+    const year = fechaCC.year;
+    const month = fechaCC.month;
 
     // 5. Tab del mes + folder del mes
     const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
@@ -3276,6 +3370,7 @@ async function processCuentaCobroXlsx(
   nombreClienteNorm: string | null,
   getNextConsecutivo: (tabName: string) => Promise<number>,
   clienteUuid: string | null,
+  forzarCC: boolean = false, // SS+retención=CC: forzar aunque el LLM dude
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return { skip: true, reason: "xlsx-sin-api-key (configurar ANTHROPIC_API_KEY)", subject };
@@ -3339,7 +3434,12 @@ async function processCuentaCobroXlsx(
 
     // BLOQUE I — Validación LAXA (cuenta de cobro).
     {
-      const { validarDocumentoCobro } = await import("./validations");
+      const { validarDocumentoCobro, esNumeroDocumentoCobroValido } = await import("./validations");
+      // numero basura en una CC NO descarta (es opcional) → limpiar y sintetizar.
+      if (extracted.numero && !esNumeroDocumentoCobroValido(extracted.numero)) {
+        console.log(`[cc-numero-basura] xlsx numero inválido "${extracted.numero}" → se sintetizará`);
+        extracted.numero = "";
+      }
       const v = validarDocumentoCobro({
         numero: extracted.numero,
         fecha: extracted.fecha,
@@ -3367,15 +3467,16 @@ async function processCuentaCobroXlsx(
       return { skip: true, reason: "xlsx-self-emitted (cliente es emisor)", subject };
     }
 
-    // 4. Year/month + skip pre-año-actual
-    const issue = new Date(extracted.fecha + "T00:00:00");
-    const year = issue.getFullYear();
-    const month = issue.getMonth() + 1;
+    // 4. Year/month + skip pre-año-actual (CC con fecha de plantilla → fecha email)
     const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
-    if (year < minYear) {
+    const fechaCC = resolverFechaCC(extracted.fecha, dateHeader, minYear);
+    if (!fechaCC) {
       await applyDescartadoLabel(gmail, messageId, "fecha-año-anterior", labelProcesadoId);
       return { skip: true, reason: `xlsx-fecha-año-anterior (${extracted.fecha} < ${minYear})`, subject };
     }
+    extracted.fecha = fechaCC.fecha;
+    const year = fechaCC.year;
+    const month = fechaCC.month;
 
     // 5. Tab + folder del mes
     const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);
@@ -3490,6 +3591,13 @@ async function processGenericPdf(
   nombreClienteNorm: string | null,
   getNextConsecutivo: (tabName: string) => Promise<number>,
   clienteUuid: string | null,
+  // Regla SS+retención=CC (Tomás): si true, este PDF es una cuenta de cobro segura
+  // → forzar procesamiento aunque el LLM dude.
+  forzarCC: boolean = false,
+  // 2026-06-19: PDF YA en disco (ej. el PDF dentro de un ZIP DIAN sin XML). Si se
+  // pasa, se usa en vez de descargar pdfs[0]. Su cleanup lo hace el caller (el
+  // tmpDir del ZIP), por eso NO se agrega a tmpPaths de esta función.
+  localPdf?: { path: string; filename: string } | null,
 ): Promise<ProcessOneResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
     return {
@@ -3504,10 +3612,17 @@ async function processGenericPdf(
     const sender = getHeader(msg, "From") || "";
     const dateHeader = getHeader(msg, "Date") || "";
 
-    // 1. Descargar primer PDF
-    const p = pdfs[0];
-    const pdfPath = await downloadAttachment(gmail, messageId, p.attachmentId, p.filename);
-    tmpPaths.push(pdfPath);
+    // 1. Obtener el PDF: local (del ZIP) o descargando el primer adjunto.
+    const p: { filename: string } = localPdf
+      ? { filename: localPdf.filename }
+      : { filename: pdfs[0].filename };
+    let pdfPath: string;
+    if (localPdf) {
+      pdfPath = localPdf.path; // cleanup lo hace el caller (tmpDir del ZIP)
+    } else {
+      pdfPath = await downloadAttachment(gmail, messageId, pdfs[0].attachmentId, pdfs[0].filename);
+      tmpPaths.push(pdfPath);
+    }
 
     // 2. Extraer texto
     const { extractTextFromPdf, isLikelyInternationalSender } = await import("./doc-parsers");
@@ -3558,8 +3673,9 @@ async function processGenericPdf(
         /cuenta\s*de\s*cobro/i.test(haystackCC) ||
         /\bcc\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{4}/i.test(subjLow) ||
         /documentaci[oó]n\s+cuenta\s*de\s*cobro/i.test(subjLow);
-      if (isCCSubject) {
-        console.log(`[pdf-cc-fallback] CC detectada (subject/texto/filename), reintentando con forceProcess: ${subject.slice(0, 60)}`);
+      // forzarCC: regla SS+retención=CC (Tomás) → CC segura aunque el LLM dude.
+      if (isCCSubject || forzarCC) {
+        console.log(`[pdf-cc-fallback] ${forzarCC ? "SS+retención" : "CC detectada"}, reintentando con forceProcess: ${subject.slice(0, 60)}`);
         llmTracker.calls++;
         extracted = await extractInvoiceFromText({
           text, presumedType: "cuenta_cobro", filename: p.filename,
@@ -3596,7 +3712,12 @@ async function processGenericPdf(
       // ya lo filtraron antes: pre-filtros sender/subject, es_factura del LLM, y
       // los guards determinísticos (nota crédito, certificado, self-emitted).
       const esCC = true;
-      const { validarDocumentoCobro } = await import("./validations");
+      const { validarDocumentoCobro, esNumeroDocumentoCobroValido } = await import("./validations");
+      // numero basura en una CC NO descarta (es opcional) → limpiar y sintetizar.
+      if (extracted.numero && !esNumeroDocumentoCobroValido(extracted.numero)) {
+        console.log(`[cc-numero-basura] pdf numero inválido "${extracted.numero}" → se sintetizará`);
+        extracted.numero = "";
+      }
       const v = validarDocumentoCobro({
         numero: extracted.numero,
         fecha: extracted.fecha,
@@ -3629,12 +3750,10 @@ async function processGenericPdf(
       return { skip: true, reason: "pdf-self-emitted (cliente es emisor)", subject };
     }
 
-    // 5. Year/month + skip pre-año-actual
-    const issue = new Date(extracted.fecha + "T00:00:00");
-    const year = issue.getFullYear();
-    const month = issue.getMonth() + 1;
+    // 5. Year/month + skip pre-año-actual (CC con fecha de plantilla → fecha email)
     const minYear = parseInt(process.env.MIN_INVOICE_YEAR ?? "") || new Date().getFullYear();
-    if (year < minYear) {
+    const fechaCC = resolverFechaCC(extracted.fecha, dateHeader, minYear);
+    if (!fechaCC) {
       await applyDescartadoLabel(gmail, messageId, "fecha-año-anterior", labelProcesadoId);
       return {
         skip: true,
@@ -3642,6 +3761,9 @@ async function processGenericPdf(
         subject,
       };
     }
+    extracted.fecha = fechaCC.fecha;
+    const year = fechaCC.year;
+    const month = fechaCC.month;
 
     // 6. Tab + folder del mes
     const tabName = await getOrCreateMonthTab(sheets, g.sheetId, month);

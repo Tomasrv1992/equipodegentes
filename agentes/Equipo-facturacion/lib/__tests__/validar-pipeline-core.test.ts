@@ -13,6 +13,7 @@ import {
   parseNumeroFromFilename,
   parseProveedorFromFilename,
   normProveedorCruce,
+  clasificarDocSinProcesar,
   type FilaRef,
 } from "../validar-pipeline-core";
 
@@ -329,7 +330,41 @@ describe("cruzarMes — Sheet ⇄ Drive por conjunto", () => {
   });
 });
 
+describe("clasificarDocSinProcesar (completitud)", () => {
+  const sheet = new Set(["7654", "FE100"]);
+  it("CV / seguridad social sola -> ruido", () => {
+    expect(clasificarDocSinProcesar("Fwd: Hoja de vida auxiliar", sheet).tipo).toBe("ruido");
+    expect(clasificarDocSinProcesar("Fwd: SEGURIDAD SOCIAL Lina Maria", sheet).tipo).toBe("ruido");
+  });
+  it("nota crédito (NTC/NC) -> nota-credito (bien excluida)", () => {
+    expect(clasificarDocSinProcesar("Fwd: 1040182652;Ruby;NTC00309;91;Ruby", sheet).tipo).toBe("nota-credito");
+  });
+  it("tipo DIAN 91/92 en el asunto (numero plano) -> nota-credito", () => {
+    // Caso real JEISY: numero "97" plano pero tipo 91 = nota crédito.
+    expect(clasificarDocSinProcesar("Fwd: 1152685817;JEISY;97;91;JEISY", sheet).tipo).toBe("nota-credito");
+    expect(clasificarDocSinProcesar("Fwd: 900123456;PROV;123;92;PROV", sheet).tipo).toBe("nota-credito");
+  });
+  it("numero ya en el Sheet -> ya-en-sheet", () => {
+    expect(clasificarDocSinProcesar("Fwd: 1040182652;Ruby;7654;01;Ruby", sheet).tipo).toBe("ya-en-sheet");
+  });
+  it("factura DIAN cuyo numero NO está en el Sheet -> falta", () => {
+    const r = clasificarDocSinProcesar("Fwd: 890900608;EXITO;WE53314;03;EXITO", sheet);
+    expect(r.tipo).toBe("falta");
+    expect(r.numero).toBe("WE53314");
+  });
+  it("sin formato DIAN en el asunto -> revisar (CC no-DIAN, predial…)", () => {
+    expect(clasificarDocSinProcesar("Fwd: CC Junio 2026 Maria Araque", sheet).tipo).toBe("revisar");
+  });
+});
+
 describe("veredictoFinal", () => {
+  it("facturas sin procesar > 0 -> ok false (gasto perdido)", () => {
+    const v = veredictoFinal({
+      problemasFila: [], duplicados: [], crucesMes: [], descartesSospechosos: 0, facturasSinProcesar: 3,
+    });
+    expect(v.ok).toBe(false);
+    expect(v.facturas_sin_procesar).toBe(3);
+  });
   it("0 HALT, 0 duplicados, 0 huerfanos -> ok true", () => {
     const v = veredictoFinal({
       problemasFila: [{ rowNumber: 2, codigo: "link-pdf-ausente", severidad: "WARN", mensaje: "" }],

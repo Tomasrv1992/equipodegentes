@@ -24,6 +24,8 @@ import {
   asNumber,
   asString,
   parseInvoiceXml,
+  resolverFechaCC,
+  tieneSoportesCuentaCobro,
 } from "../pipeline";
 
 // ===== mapMotivoToLabel =====
@@ -118,6 +120,44 @@ describe("isDuplicate", () => {
     // numero válido distinto aunque coincida el total.
     const rows = [rowFull("Lab", "900", "FE100", 50000)];
     expect(isDuplicate(rows, "FE200", "900", "Lab", 50000)).toBe(false);
+  });
+});
+
+// ===== resolverFechaCC (fecha de plantilla → fecha del email) =====
+describe("resolverFechaCC", () => {
+  it("fecha extraída del año actual -> se conserva", () => {
+    const r = resolverFechaCC("2026-05-10", "Wed, 14 May 2026 10:00:00 -0500", 2026);
+    expect(r).toEqual({ fecha: "2026-05-10", year: 2026, month: 5 });
+  });
+  it("fecha extraída del año pasado pero email de este año -> usa fecha del email", () => {
+    // Caso real "cuenta de cobro mayo 2026": plantilla con 2025-05-28, recibido may-2026.
+    const r = resolverFechaCC("2025-05-28", "Wed, 14 May 2026 10:00:00 -0500", 2026);
+    expect(r).not.toBeNull();
+    expect(r!.year).toBe(2026);
+    expect(r!.month).toBe(5);
+    expect(r!.fecha).toBe("2026-05-14");
+  });
+  it("extracción Y email del año pasado -> null (es realmente vieja)", () => {
+    expect(resolverFechaCC("2025-05-28", "Wed, 14 May 2025 10:00:00 -0500", 2026)).toBeNull();
+  });
+});
+
+// ===== tieneSoportesCuentaCobro (regla SS + retención = cuenta de cobro) =====
+describe("tieneSoportesCuentaCobro", () => {
+  const payload = (...filenames: string[]) => ({
+    parts: filenames.map((filename) => ({ filename, body: { attachmentId: "x" } })),
+  });
+  it("planilla SS + formato de retención -> true (es cuenta de cobro)", () => {
+    const p = payload("Autoliquidacion.pdf", "Retefuente may.xlsx", "Dentilandia.docx");
+    expect(tieneSoportesCuentaCobro(p, [{ filename: "Autoliquidacion.pdf" }])).toBe(true);
+  });
+  it("sin planilla -> false (no aplica la regla)", () => {
+    const p = payload("Retefuente.xlsx");
+    expect(tieneSoportesCuentaCobro(p, [])).toBe(false);
+  });
+  it("planilla SS pero sin formato de retención -> false", () => {
+    const p = payload("Autoliquidacion.pdf", "Comprobante.pdf");
+    expect(tieneSoportesCuentaCobro(p, [{ filename: "Autoliquidacion.pdf" }])).toBe(false);
   });
 });
 
@@ -288,5 +328,41 @@ describe("parseInvoiceXml", () => {
   it("supplier NIT === nitCliente -> null (auto-factura: el cliente es el emisor)", () => {
     const p = writeTmpXml(facturaXml("01", "901117356"));
     expect(parseInvoiceXml(p, PARSER, "901117356")).toBeNull();
+  });
+
+  // --- Regresión 2026-06-19: facturas por contingencia (tipo 03/04) ---
+  // ÉXITO, D1 y otros emiten facturas con InvoiceTypeCode 03/04 (contingencia).
+  // SON facturas de venta reales (gastos). El parser solo aceptaba 01/02 y las
+  // botaba como "no-es-factura-dian" → 17 facturas perdidas en la auditoría.
+  it("tipo 03 (factura por contingencia facturador) -> SÍ es factura", () => {
+    const data = parseInvoiceXml(writeTmpXml(facturaXml("03")), PARSER);
+    expect(data).not.toBeNull();
+    expect(data!.numero).toBe("FE12345");
+    expect(data!.total).toBe(119000);
+  });
+  it("tipo 04 (factura por contingencia DIAN) -> SÍ es factura", () => {
+    expect(parseInvoiceXml(writeTmpXml(facturaXml("04")), PARSER)).not.toBeNull();
+  });
+  it("tipo 20 (documento equivalente, ej. PROTOKIMICA) -> SÍ es gasto", () => {
+    expect(parseInvoiceXml(writeTmpXml(facturaXml("20")), PARSER)).not.toBeNull();
+  });
+  it("tipo 92 (nota débito) -> null (no es factura de compra)", () => {
+    expect(parseInvoiceXml(writeTmpXml(facturaXml("92")), PARSER)).toBeNull();
+  });
+  it("AttachedDocument que envuelve una factura tipo 03 -> se desenvuelve y procesa", () => {
+    // Caso real ÉXITO/D1: el XML del ZIP es un AttachedDocument con el Invoice
+    // (tipo 03) embebido en CDATA dentro de Description.
+    const attached = `<?xml version="1.0" encoding="UTF-8"?>
+<AttachedDocument>
+  <cac:Attachment>
+    <cac:ExternalReference>
+      <cbc:Description><![CDATA[${facturaXml("03")}]]></cbc:Description>
+    </cac:ExternalReference>
+  </cac:Attachment>
+</AttachedDocument>`;
+    const data = parseInvoiceXml(writeTmpXml(attached), PARSER);
+    expect(data).not.toBeNull();
+    expect(data!.numero).toBe("FE12345");
+    expect(data!.total).toBe(119000);
   });
 });

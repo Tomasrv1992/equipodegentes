@@ -31,6 +31,9 @@ import {
   veredictoFinal,
   parseNumeroFromFilename,
   parseProveedorFromFilename,
+  clasificarDocSinProcesar,
+  normalizeNumero,
+  numeroSinCerosIzq,
   type FilaProblema,
   type FilaRef,
   type CruceMesResult,
@@ -63,6 +66,29 @@ async function countQ(gmail: any, q: string): Promise<number> {
     pt = r.data.nextPageToken;
   } while (pt);
   return t;
+}
+
+/** Lista los messageIds que matchean la query (paginado). */
+async function listIds(gmail: any, q: string): Promise<string[]> {
+  const out: string[] = [];
+  let pt: string | undefined;
+  do {
+    const r: any = await gmail.users.messages.list({ userId: "me", q, maxResults: 500, pageToken: pt });
+    (r.data.messages ?? []).forEach((m: any) => out.push(m.id));
+    pt = r.data.nextPageToken;
+  } while (pt);
+  return out;
+}
+
+/** Subject de un mensaje (metadata, barato). */
+async function getSubject(gmail: any, id: string): Promise<string> {
+  const m: any = await gmail.users.messages.get({
+    userId: "me",
+    id,
+    format: "metadata",
+    metadataHeaders: ["Subject"],
+  });
+  return m.data.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "";
 }
 
 /** Conteo de label Facturas/<año> por mes (recepción). */
@@ -204,8 +230,49 @@ async function main() {
   const fromFilter = DOMINIOS_GASTO.map((d) => `from:${d}`).join(" OR ");
   const descartesSospechosos = await countQ(gmail, `label:Descartado/${year} (${fromFilter})`);
 
+  // ===== CHECKPOINT: COMPLETITUD (correos con documento que NO llegaron al Sheet) =====
+  // Cierra el punto ciego del cruce Sheet⇄Drive: detecta facturas DIAN que están en
+  // el correo (por el numero del asunto) pero NUNCA entraron al Sheet (perdidas por
+  // el pipeline: parser, descarte erróneo, etc.).
+  const sheetNumeros = new Set<string>();
+  for (const f of todasLasFilas) {
+    const n = numeroSinCerosIzq(normalizeNumero(f.numero));
+    if (n) sheetNumeros.add(n);
+  }
+  const docF = "(filename:zip OR filename:pdf OR filename:docx OR filename:xlsx OR filename:xml)";
+  // SILENCIOSAS: correos con documento SIN ninguna etiqueta → el pipeline nunca
+  // decidió sobre ellas. Una factura DIAN acá = pérdida silenciosa = FALLA dura.
+  const faltantesSilenciosas: { numero: string; subject: string }[] = [];
+  // DESCARTADAS con # de factura: el pipeline las descartó explícitamente. Algunas
+  // son legítimas (factura de diciembre del año pasado en el borde) → se reportan
+  // para REVISIÓN humana, no tumban el veredicto automáticamente.
+  const descartadasConFactura: { numero: string; subject: string }[] = [];
+  let completRevisar = 0;
+  const procesarQuery = async (q: string, bucket: { numero: string; subject: string }[]) => {
+    for (const id of await listIds(gmail, q)) {
+      const subject = await getSubject(gmail, id);
+      const c = clasificarDocSinProcesar(subject, sheetNumeros);
+      if (c.tipo === "falta") bucket.push({ numero: c.numero, subject: subject.slice(0, 55) });
+      else if (c.tipo === "revisar") completRevisar++;
+    }
+  };
+  await procesarQuery(
+    `after:${year}/01/01 before:${year + 1}/01/01 has:attachment ${docF} -label:Facturas/${year} -label:Descartado/${year} -label:Duplicado/${year}`,
+    faltantesSilenciosas,
+  );
+  await procesarQuery(`label:Descartado/${year} has:attachment ${docF}`, descartadasConFactura);
+
   // ===== SALIDA: veredicto =====
-  const veredicto = veredictoFinal({ problemasFila, duplicados, crucesMes: cruces, descartesSospechosos });
+  // Solo las SILENCIOSAS tumban el veredicto (pérdida real, indetectable de otra
+  // forma). Las descartadas-con-factura son lista de revisión (descartes legítimos
+  // como facturas de año anterior existen).
+  const veredicto = veredictoFinal({
+    problemasFila,
+    duplicados,
+    crucesMes: cruces,
+    descartesSospechosos,
+    facturasSinProcesar: faltantesSilenciosas.length,
+  });
 
   if (asJson) {
     console.log(JSON.stringify({
@@ -241,6 +308,24 @@ async function main() {
     }
     L("");
   }
+
+  // COMPLETITUD: facturas en el correo que NO llegaron al Sheet (lo que el cruce
+  // Sheet⇄Drive no podía ver). Esto automatiza la auditoría manual.
+  L(`--- COMPLETITUD: facturas en correo NO procesadas ---`);
+  L(`  Pérdidas SILENCIOSAS (sin etiqueta) — TUMBAN el veredicto: ${faltantesSilenciosas.length}`);
+  if (faltantesSilenciosas.length) {
+    for (const f of faltantesSilenciosas.slice(0, 40)) L(`     ❌ FALTA: ${f.numero}  ·  ${f.subject}`);
+  } else {
+    L(`     ✓ ninguna factura quedó sin procesar de forma silenciosa`);
+  }
+  if (descartadasConFactura.length) {
+    L(`  Descartadas con # de factura (REVISAR — pueden ser legítimas, ej. año anterior): ${descartadasConFactura.length}`);
+    for (const f of descartadasConFactura.slice(0, 40)) L(`     ⚠ ${f.numero}  ·  ${f.subject}`);
+  }
+  if (completRevisar) {
+    L(`  (${completRevisar} correo(s) con documento sin numero DIAN parseable → revisar manual: CC no-DIAN, predial, etc.)`);
+  }
+  L("");
 
   // Gmail vs Sheet (informativo, borde de mes).
   const desbalanceGmail = cruces.filter((c) => c.gmail_vs_sheet !== 0 && (c.conteos.gmail || c.conteos.sheet));

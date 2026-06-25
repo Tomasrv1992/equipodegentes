@@ -3104,6 +3104,7 @@ async function processCuentaCobroDocx(
     const { extractTextFromDocx } = await import("./doc-parsers");
     const text = await extractTextFromDocx(docxPath);
     if (!text || text.length < 30) {
+      await applyDescartadoLabel(gmail, messageId, "docx-sin-texto", labelProcesadoId);
       return { skip: true, reason: "docx-sin-texto-extraible", subject };
     }
 
@@ -3169,6 +3170,7 @@ async function processCuentaCobroDocx(
     }
 
     if (!extracted) {
+      await applyDescartadoLabel(gmail, messageId, "docx-no-es-factura", labelProcesadoId);
       return { skip: true, reason: "docx-no-es-factura (LLM)", subject };
     }
 
@@ -3176,6 +3178,7 @@ async function processCuentaCobroDocx(
     // 0.4 default. Falsos positivos requieren documento Y subject ambos engañosos.
     const minConf = (extracted as any)._forced ? 0.2 : 0.4;
     if (extracted.confianza < minConf) {
+      await applyDescartadoLabel(gmail, messageId, "docx-baja-confianza", labelProcesadoId);
       return {
         skip: true,
         reason: `docx-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
@@ -3387,6 +3390,7 @@ async function processCuentaCobroXlsx(
     const { extractTextFromXlsx } = await import("./doc-parsers");
     const text = await extractTextFromXlsx(xlsxPath);
     if (!text || text.length < 30) {
+      await applyDescartadoLabel(gmail, messageId, "xlsx-sin-texto", labelProcesadoId);
       return { skip: true, reason: "xlsx-sin-texto-extraible", subject };
     }
 
@@ -3418,6 +3422,7 @@ async function processCuentaCobroXlsx(
     });
 
     if (!extracted) {
+      await applyDescartadoLabel(gmail, messageId, "xlsx-no-es-factura", labelProcesadoId);
       return { skip: true, reason: "xlsx-no-es-factura (LLM)", subject };
     }
 
@@ -3425,6 +3430,7 @@ async function processCuentaCobroXlsx(
     // los filtró el extractor (guard determinístico) aunque forceProcess esté on.
     const minConf = 0.2;
     if (extracted.confianza < minConf) {
+      await applyDescartadoLabel(gmail, messageId, "xlsx-baja-confianza", labelProcesadoId);
       return {
         skip: true,
         reason: `xlsx-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
@@ -3628,6 +3634,7 @@ async function processGenericPdf(
     const { extractTextFromPdf, isLikelyInternationalSender } = await import("./doc-parsers");
     const text = await extractTextFromPdf(pdfPath);
     if (!text || text.length < 30) {
+      await applyDescartadoLabel(gmail, messageId, "pdf-sin-texto", labelProcesadoId);
       return { skip: true, reason: "pdf-sin-texto-extraible", subject };
     }
 
@@ -3686,11 +3693,13 @@ async function processGenericPdf(
     }
 
     if (!extracted) {
+      await applyDescartadoLabel(gmail, messageId, "pdf-no-es-factura", labelProcesadoId);
       return { skip: true, reason: `pdf-no-es-factura (LLM: ${presumedType})`, subject };
     }
     // Umbral condicional 0.2/0.4 según _forced
     const minConfPdf = (extracted as any)._forced ? 0.2 : 0.4;
     if (extracted.confianza < minConfPdf) {
+      await applyDescartadoLabel(gmail, messageId, "pdf-baja-confianza", labelProcesadoId);
       return {
         skip: true,
         reason: `pdf-baja-confianza (${extracted.confianza.toFixed(2)}): ${extracted.notas ?? ""}`,
